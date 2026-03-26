@@ -12,6 +12,7 @@ import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from .audiovault import AudioVaultClient, LoginError
@@ -22,6 +23,18 @@ logger = logging.getLogger(__name__)
 
 # Prevent concurrent describealign runs (CPU/RAM heavy).
 _lock = threading.Lock()
+
+# Shared AudioVault session — created once and reused across all requests.
+_client: Optional[AudioVaultClient] = None
+_client_lock = threading.Lock()
+
+
+def _get_client(config: Config) -> AudioVaultClient:
+    global _client
+    with _client_lock:
+        if _client is None:
+            _client = AudioVaultClient(config.email, config.password)
+    return _client
 
 _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
@@ -167,12 +180,7 @@ def _sonarr(config: Config, env: dict[str, str]) -> bool:
         logger.error("Could not parse season/episode: %r / %r", season_str, episode_str)
         return False
 
-    try:
-        client = AudioVaultClient(config.email, config.password)
-    except LoginError as exc:
-        logger.error("AudioVault login failed: %s", exc)
-        return False
-
+    client = _get_client(config)
     return process_episode(client, config, video_path, series_title, season, episode)
 
 
@@ -190,12 +198,7 @@ def _radarr(config: Config, env: dict[str, str]) -> bool:
         logger.error("Video file does not exist: %s", video_path)
         return False
 
-    try:
-        client = AudioVaultClient(config.email, config.password)
-    except LoginError as exc:
-        logger.error("AudioVault login failed: %s", exc)
-        return False
-
+    client = _get_client(config)
     return process_movie(client, config, video_path, movie_title, movie_year)
 
 
@@ -222,12 +225,7 @@ def _retry_episode(title: str, path_str: str, season_str: str, episode_str: str)
         logger.error("Could not parse season/episode: %r / %r", season_str, episode_str)
         return
 
-    try:
-        client = AudioVaultClient(config.email, config.password)
-    except LoginError as exc:
-        logger.error("AudioVault login failed: %s", exc)
-        return
-
+    client = _get_client(config)
     with _lock:
         process_episode(client, config, video_path, title, season, episode)
 
@@ -244,12 +242,7 @@ def _retry_movie(title: str, path_str: str, year_str: str) -> None:
         logger.error("Video file does not exist: %s", video_path)
         return
 
-    try:
-        client = AudioVaultClient(config.email, config.password)
-    except LoginError as exc:
-        logger.error("AudioVault login failed: %s", exc)
-        return
-
+    client = _get_client(config)
     with _lock:
         process_movie(client, config, video_path, title, year_str)
 
@@ -261,11 +254,7 @@ def _retry_dir(title: str, scan_dir: Path, season_filter: int | None) -> None:
         logger.error("%s", exc)
         return
 
-    try:
-        client = AudioVaultClient(config.email, config.password)
-    except LoginError as exc:
-        logger.error("AudioVault login failed: %s", exc)
-        return
+    client = _get_client(config)
 
     video_files = sorted(
         f for f in scan_dir.rglob("*")

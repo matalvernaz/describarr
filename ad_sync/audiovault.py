@@ -33,15 +33,17 @@ class AudioVaultClient:
     """Authenticated session for AudioVault."""
 
     def __init__(self, email: str, password: str) -> None:
+        self._email = email
+        self._password = password
         self._session = requests.Session()
         self._session.headers.update(_HEADERS)
-        self._login(email, password)
+        self._login()
 
     # ------------------------------------------------------------------
     # Auth
     # ------------------------------------------------------------------
 
-    def _login(self, email: str, password: str) -> None:
+    def _login(self) -> None:
         # Fetch the login page to collect the Laravel CSRF token.
         resp = self._session.get(f"{BASE_URL}/login", timeout=30)
         resp.raise_for_status()
@@ -53,8 +55,8 @@ class AudioVaultClient:
 
         payload = {
             "_token": token_input["value"],
-            "email": email,
-            "password": password,
+            "email": self._email,
+            "password": self._password,
             "remember": "on",
         }
 
@@ -73,6 +75,13 @@ class AudioVaultClient:
             )
 
         logger.info("Logged in to AudioVault successfully.")
+
+    def _relogin(self) -> None:
+        """Re-create the session and log in again after a session expiry."""
+        logger.info("Session expired — re-logging in to AudioVault.")
+        self._session = requests.Session()
+        self._session.headers.update(_HEADERS)
+        self._login()
 
     # ------------------------------------------------------------------
     # Search
@@ -93,6 +102,14 @@ class AudioVaultClient:
             timeout=30,
         )
         resp.raise_for_status()
+        if resp.url.rstrip("/").endswith("/login"):
+            self._relogin()
+            resp = self._session.get(
+                f"{BASE_URL}{path}",
+                params={"search": query},
+                timeout=30,
+            )
+            resp.raise_for_status()
         return _parse_results_table(resp.text)
 
     # ------------------------------------------------------------------
