@@ -120,10 +120,9 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
         combined.unlink(missing_ok=True)
         return False
 
-    # Move the combined file next to the original video.
-    dest = video_path.parent / combined.name
-    shutil.move(str(combined), dest)
-    logger.info("Success (%.1f%%): saved to %s", score, dest)
+    # Replace the original video with the combined file.
+    shutil.move(str(combined), video_path)
+    logger.info("Success (%.1f%%): replaced %s", score, video_path)
     return True
 
 

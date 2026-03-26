@@ -29,6 +29,12 @@ logger = logging.getLogger("ad-sync")
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        from .server import serve
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 8686
+        serve(port)
+        return
+
     # --test-auth lets users verify credentials without a real media event.
     if "--test-auth" in sys.argv:
         _test_auth()

@@ -7,48 +7,23 @@ When Sonarr or Radarr imports a new file, ad-sync:
 1. Searches AudioVault for a matching audio description track.
 2. Downloads the file (caching season ZIPs so they are only fetched once per season).
 3. Runs [describealign](https://github.com/julbean/describealign) to align and combine the audio description with the video.
-4. Keeps the combined file only if the alignment score is **65 % or above**; otherwise the audio description is discarded without touching the original video.
-
-The combined file is placed alongside the original in the same directory, prefixed with `ad_`.
+4. If the alignment score is **65 % or above**, replaces the original file in-place with the combined version. Otherwise the audio description is discarded and the original is untouched.
 
 ---
 
 ## Requirements
 
-- Python 3.10 or later
-- [describealign](https://github.com/julbean/describealign) (`pip install describealign`)
 - An AudioVault account (<https://audiovault.net/register>)
 - Sonarr v3+ and/or Radarr v3+
+- Docker (recommended) **or** Python 3.10+ with `ffmpeg` installed
 
 ---
 
-## Installation
+## Setup — Docker (recommended)
 
-```bash
-pip install git+https://github.com/matalvernaz/ad-sync.git
-```
+This is the recommended approach if Sonarr/Radarr run in Docker, since the Custom Script executes inside each container and needs access to the same Python environment.
 
-Or clone and install locally:
-
-```bash
-git clone https://github.com/matalvernaz/ad-sync.git
-cd ad-sync
-pip install .
-```
-
----
-
-## Configuration
-
-Copy the example config file and fill in your AudioVault credentials:
-
-```bash
-mkdir -p ~/.config/ad-sync
-cp .env.example ~/.config/ad-sync/.env
-nano ~/.config/ad-sync/.env   # or any editor you prefer
-```
-
-The config file looks like this:
+### 1. Create your `.env` file
 
 ```env
 AUDIOVAULT_EMAIL=your@email.com
@@ -56,49 +31,115 @@ AUDIOVAULT_PASSWORD=yourpassword
 
 # Minimum alignment score to keep a combined file (default: 65)
 AD_SYNC_MIN_SCORE=65
-
-# Optional: override the cache directory (default: ~/.cache/ad-sync)
-# AD_SYNC_CACHE_DIR=/path/to/cache
 ```
 
-> **Security note:** Keep this file private (`chmod 600 ~/.config/ad-sync/.env`). It contains your AudioVault password.
+Keep this file private (`chmod 600 .env`).
 
-### Verify your credentials
+### 2. Start the container
+
+Copy `compose.example.yaml` to `compose.yaml`, adjust the volume paths to match what your Sonarr/Radarr containers mount (e.g. `/tv`, `/movies`), and set the network name to the one your arr containers share:
 
 ```bash
-python -m ad_sync --test-auth
+cp compose.example.yaml compose.yaml
+# edit compose.yaml
+docker compose up -d
 ```
 
+The container starts a small webhook server on port 8686 (internal only — no need to expose it).
+
+### 3. Add the hook script to Sonarr and Radarr
+
+Sonarr/Radarr execute Custom Scripts inside their own containers. The easiest place to drop a script that's already visible inside each container is their `config` volume (mounted at `/config`).
+
+Create `/path/to/sonarr/config/ad-sync-hook.sh`:
+
+```sh
+#!/bin/sh
+curl -sf -X POST http://ad-sync:8686/hook \
+  --data-urlencode "sonarr_eventtype=$sonarr_eventtype" \
+  --data-urlencode "sonarr_series_title=$sonarr_series_title" \
+  --data-urlencode "sonarr_episodefile_seasonnumber=$sonarr_episodefile_seasonnumber" \
+  --data-urlencode "sonarr_episodefile_episodenumbers=$sonarr_episodefile_episodenumbers" \
+  --data-urlencode "sonarr_episodefile_path=$sonarr_episodefile_path"
+```
+
+Create `/path/to/radarr/config/ad-sync-hook.sh`:
+
+```sh
+#!/bin/sh
+curl -sf -X POST http://ad-sync:8686/hook \
+  --data-urlencode "radarr_eventtype=$radarr_eventtype" \
+  --data-urlencode "radarr_movie_title=$radarr_movie_title" \
+  --data-urlencode "radarr_movie_year=$radarr_movie_year" \
+  --data-urlencode "radarr_moviefile_path=$radarr_moviefile_path"
+```
+
+Make both executable:
+
+```bash
+chmod +x /path/to/sonarr/config/ad-sync-hook.sh
+chmod +x /path/to/radarr/config/ad-sync-hook.sh
+```
+
+### 4. Configure Sonarr and Radarr
+
+In each app: **Settings → Connect → + → Custom Script**
+
+| Field | Value |
+|---|---|
+| Name | `ad-sync` |
+| On Import | ✅ |
+| On Upgrade | ✅ |
+| Path | `/config/ad-sync-hook.sh` |
+
+Click **Test** — you should see a green tick. Then **Save**.
+
 ---
 
-## Setting up in Sonarr
+## Setup — bare metal / non-Docker
 
-1. Open Sonarr → **Settings → Connect → + (Add Connection)**.
-2. Choose **Custom Script**.
-3. Fill in:
-   - **Name:** `ad-sync`
-   - **On Import:** ✅ enabled
-   - **On Upgrade:** ✅ enabled
-   - **Path:** output of `which ad-sync` (e.g. `/usr/local/bin/ad-sync`)
-4. Click **Test** — you should see a green tick.
-5. Click **Save**.
+If Sonarr and Radarr run directly on the host (not in Docker), you can install ad-sync as a regular Python package and point the Custom Script at the binary.
 
-Sonarr will now call ad-sync every time it imports or upgrades a file.
+### Install
 
----
+```bash
+pip install git+https://github.com/matalvernaz/ad-sync.git
+```
 
-## Setting up in Radarr
+`describealign` is a dependency but its GUI component (wxPython) is not needed and may fail to build on some platforms. If the install fails due to wxPython, install without it:
 
-The steps are identical to Sonarr:
+```bash
+pip install --no-deps describealign
+pip install "ffmpeg-python~=0.2.0" "static-ffmpeg~=3.0" "matplotlib~=3.9" \
+    "numpy<3.0,>=1.21" "scipy~=1.10" "platformdirs~=4.2" \
+    "natsort~=8.4.0" "sortedcontainers~=2.4.0" future
+pip install --no-deps git+https://github.com/matalvernaz/ad-sync.git
+```
 
-1. Open Radarr → **Settings → Connect → + (Add Connection)**.
-2. Choose **Custom Script**.
-3. Fill in:
-   - **Name:** `ad-sync`
-   - **On Import:** ✅ enabled
-   - **On Upgrade:** ✅ enabled
-   - **Path:** output of `which ad-sync`
-4. Click **Test**, then **Save**.
+### Configure
+
+```bash
+mkdir -p ~/.config/ad-sync
+cp .env.example ~/.config/ad-sync/.env
+nano ~/.config/ad-sync/.env
+```
+
+### Verify credentials
+
+```bash
+ad-sync --test-auth
+```
+
+### Set up in Sonarr / Radarr
+
+**Settings → Connect → + → Custom Script**
+
+| Field | Value |
+|---|---|
+| Name | `ad-sync` |
+| On Import | ✅ |
+| On Upgrade | ✅ |
+| Path | output of `which ad-sync` (e.g. `/usr/local/bin/ad-sync`) |
 
 ---
 
@@ -112,7 +153,7 @@ AudioVault distributes audio descriptions for TV shows as ZIP files containing o
 2. Downloads the season ZIP (cached — only downloaded once per season).
 3. Extracts the ZIP and finds the right episode MP3 by episode number.
 4. Runs describealign on the video + MP3.
-5. Checks the alignment score; keeps the combined file if ≥ 65 %.
+5. If the score is ≥ threshold, replaces the original file in-place with the combined version.
 
 ### Movies (Radarr)
 
@@ -120,25 +161,25 @@ AudioVault distributes movie audio descriptions as individual MP3 files. ad-sync
 
 ### Caching
 
-Downloaded season ZIPs are stored in `~/.cache/ad-sync/shows/<series>/` and are never re-downloaded for the same season. A `manifest.json` in each cache directory tracks which URLs have been downloaded.
+Downloaded season ZIPs are stored in `~/.cache/ad-sync/shows/<series>/` (or the Docker container's cache) and are never re-downloaded for the same season.
 
 ---
 
 ## Troubleshooting
 
-**"Login failed"** — Double-check your credentials in `~/.config/ad-sync/.env` and run `python -m ad_sync --test-auth`.
+**"Login failed"** — Double-check your AudioVault credentials and run `ad-sync --test-auth`.
 
 **"No AudioVault results"** — The show or movie may not have an audio description on AudioVault yet.
 
-**"Score X% is below threshold"** — The audio description didn't align well with the video (possibly a different version/cut). The original video is untouched.
+**"Score X% is below threshold"** — The audio description didn't align well with the video (possibly a different version/cut). The original file is untouched.
 
-**describealign not found** — Install it: `pip install describealign`.
+**Green tick on Test but nothing happens on import** — Check that the hook script is executable and that the `ad-sync` container is on the same Docker network as Sonarr/Radarr.
 
 ---
 
 ## Adjusting the score threshold
 
-If you want to accept lower-quality alignments, set `AD_SYNC_MIN_SCORE=50` in your `.env`. The describealign documentation notes that scores below 20 % are likely mismatched files, and scores above 90 % may indicate undescribed media.
+Set `AD_SYNC_MIN_SCORE=50` in your `.env` to accept lower-quality alignments. The describealign documentation notes that scores below 20 % are likely mismatched files and scores above 90 % may indicate undescribed media.
 
 ---
 
