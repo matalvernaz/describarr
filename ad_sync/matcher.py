@@ -54,6 +54,13 @@ def find_season(results: list[dict], title: str, season: int) -> Optional[dict]:
 
     scored.sort(key=lambda x: x[0], reverse=True)
     best_score, best = scored[0]
+
+    if best_score < 0.3:
+        logger.warning(
+            "Best season match %r has low similarity (%.2f) — skipping.", best["name"], best_score
+        )
+        return None
+
     logger.info("Best season match: %r (score %.2f)", best["name"], best_score)
     return best
 
