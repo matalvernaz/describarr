@@ -11,14 +11,17 @@ import json
 import logging
 import re
 import threading
+import time
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from .audiovault import AudioVaultClient, LoginError
+from .audiovault import AudioVaultClient, DailyLimitReached, LoginError
 from .config import Config
-from .workflow import process_episode, process_movie, _safe_dirname
+from .retry_queue import RetryQueue
+from .workflow import drain_retry_queue, process_episode, process_movie, _safe_dirname
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,10 @@ _lock = threading.Lock()
 _client: Optional[AudioVaultClient] = None
 _client_lock = threading.Lock()
 
+# Shared retry queue.
+_retry_queue: Optional[RetryQueue] = None
+_retry_queue_lock = threading.Lock()
+
 
 def _get_client(config: Config) -> AudioVaultClient:
     global _client
@@ -37,6 +44,14 @@ def _get_client(config: Config) -> AudioVaultClient:
             _client = AudioVaultClient(config.email, config.password)
     return _client
 
+
+def _get_retry_queue(config: Config) -> RetryQueue:
+    global _retry_queue
+    with _retry_queue_lock:
+        if _retry_queue is None:
+            _retry_queue = RetryQueue(config.cache_dir / "retry_queue.json")
+    return _retry_queue
+
 _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
 
@@ -44,7 +59,29 @@ _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
 def serve(port: int = 8686) -> None:
     server = HTTPServer(("0.0.0.0", port), _HookHandler)
     logger.info("ad-sync webhook server listening on port %d", port)
+    threading.Thread(target=_midnight_drain_loop, daemon=True).start()
     server.serve_forever()
+
+
+def _midnight_drain_loop() -> None:
+    """Background thread: drain the retry queue shortly after each midnight."""
+    while True:
+        now = datetime.now()
+        next_run = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+        sleep_secs = (next_run - now).total_seconds()
+        logger.info("Retry queue drain scheduled in %.0f seconds.", sleep_secs)
+        time.sleep(sleep_secs)
+        try:
+            config = Config.from_env()
+        except ValueError as exc:
+            logger.error("Cannot drain retry queue: %s", exc)
+            continue
+        queue = _get_retry_queue(config)
+        if not queue.load():
+            continue
+        client = _get_client(config)
+        with _lock:
+            drain_retry_queue(queue, client, config)
 
 
 class _HookHandler(BaseHTTPRequestHandler):
@@ -200,7 +237,11 @@ def _sonarr(config: Config, env: dict[str, str]) -> bool:
         return False
 
     client = _get_client(config)
-    return process_episode(client, config, video_path, series_title, season, episode)
+    try:
+        return process_episode(client, config, video_path, series_title, season, episode)
+    except DailyLimitReached:
+        _get_retry_queue(config).add_episode(series_title, season, episode, str(video_path))
+        return False
 
 
 def _radarr(config: Config, env: dict[str, str]) -> bool:
@@ -218,7 +259,11 @@ def _radarr(config: Config, env: dict[str, str]) -> bool:
         return False
 
     client = _get_client(config)
-    return process_movie(client, config, video_path, movie_title, movie_year)
+    try:
+        return process_movie(client, config, video_path, movie_title, movie_year)
+    except DailyLimitReached:
+        _get_retry_queue(config).add_movie(movie_title, movie_year, str(video_path))
+        return False
 
 
 # ------------------------------------------------------------------

@@ -22,6 +22,7 @@ from .aligner import run as align, parse_score, content_score
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
 from .matcher import extract_episode, find_movie, find_season
+from .retry_queue import RetryQueue
 
 try:
     from . import living_audio as _la
@@ -68,7 +69,7 @@ def process_episode(
         try:
             zip_path = _get_cached(client, candidate["url"], zip_cache_dir, limiter)
         except DailyLimitReached:
-            return False
+            raise
         extract_dir = zip_cache_dir / f"season_{season:02d}" / _safe_dirname(candidate["name"])
         audio_path = extract_episode(zip_path, extract_dir, episode)
         if not audio_path:
@@ -124,7 +125,7 @@ def process_movie(
         try:
             audio_path = _get_cached(client, candidate["url"], movie_cache_dir, limiter)
         except DailyLimitReached:
-            return False
+            raise
         if _align_and_keep(config, video_path, audio_path):
             return True
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
@@ -251,6 +252,57 @@ def _get_cached(
     manifest_path.write_text(json.dumps(manifest, indent=2))
 
     return file_path
+
+
+def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Config) -> None:
+    """
+    Process items that were previously skipped due to the daily download limit.
+
+    Stops as soon as the limit is hit again, leaving remaining items in the
+    queue for the next day.
+    """
+    items = queue.load()
+    if not items:
+        return
+    logger.info("Draining %d queued item(s).", len(items))
+    remaining: list[dict] = []
+    limit_hit = False
+    for item in items:
+        if limit_hit:
+            remaining.append(item)
+            continue
+        video_path = Path(item["video_path"])
+        if not video_path.is_file():
+            logger.warning("Queued file no longer exists, dropping: %s", video_path)
+            continue
+        try:
+            if item["type"] == "episode":
+                process_episode(
+                    client, config, video_path,
+                    item["series_title"], item["season"], item["episode"],
+                )
+            elif item["type"] == "movie":
+                process_movie(
+                    client, config, video_path,
+                    item["movie_title"], item.get("movie_year", ""),
+                )
+        except DailyLimitReached:
+            remaining.append(item)
+            limit_hit = True
+            logger.info(
+                "Daily limit hit during queue drain — %d item(s) remain queued.",
+                len(items) - items.index(item),
+            )
+        except Exception:
+            logger.error(
+                "Unexpected error processing queued item %s — dropping.",
+                item["video_path"], exc_info=True,
+            )
+    if remaining:
+        queue.save(remaining)
+    else:
+        queue.clear()
+        logger.info("Retry queue drained successfully.")
 
 
 def _safe_dirname(name: str) -> str:

@@ -16,9 +16,10 @@ import os
 import sys
 from pathlib import Path
 
-from .audiovault import AudioVaultClient, LoginError
+from .audiovault import AudioVaultClient, DailyLimitReached, LoginError
 from .config import Config
-from .workflow import process_episode, process_movie
+from .retry_queue import RetryQueue
+from .workflow import drain_retry_queue, process_episode, process_movie
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,10 +56,19 @@ def main() -> None:
         logger.info("Test event received — configuration looks good.")
         sys.exit(0)
 
+    try:
+        client = AudioVaultClient(config.email, config.password)
+    except LoginError as exc:
+        logger.error("AudioVault login failed: %s", exc)
+        sys.exit(1)
+
+    queue = RetryQueue(config.cache_dir / "retry_queue.json")
+    drain_retry_queue(queue, client, config)
+
     if sonarr_event == "download":
-        success = _handle_sonarr(config)
+        success = _handle_sonarr(config, client, queue)
     elif radarr_event == "download":
-        success = _handle_radarr(config)
+        success = _handle_radarr(config, client, queue)
     else:
         logger.error(
             "No recognised event type in environment. "
@@ -73,7 +83,7 @@ def main() -> None:
 # Sonarr handler
 # ------------------------------------------------------------------
 
-def _handle_sonarr(config: Config) -> bool:
+def _handle_sonarr(config: Config, client: AudioVaultClient, queue: RetryQueue) -> bool:
     series_title = os.environ.get("sonarr_series_title", "").strip()
     season_str = os.environ.get("sonarr_episodefile_seasonnumber", "0").strip()
     episode_str = os.environ.get("sonarr_episodefile_episodenumbers", "1").strip()
@@ -97,19 +107,17 @@ def _handle_sonarr(config: Config) -> bool:
         return False
 
     try:
-        client = AudioVaultClient(config.email, config.password)
-    except LoginError as exc:
-        logger.error("AudioVault login failed: %s", exc)
+        return process_episode(client, config, video_path, series_title, season, episode)
+    except DailyLimitReached:
+        queue.add_episode(series_title, season, episode, str(video_path))
         return False
-
-    return process_episode(client, config, video_path, series_title, season, episode)
 
 
 # ------------------------------------------------------------------
 # Radarr handler
 # ------------------------------------------------------------------
 
-def _handle_radarr(config: Config) -> bool:
+def _handle_radarr(config: Config, client: AudioVaultClient, queue: RetryQueue) -> bool:
     movie_title = os.environ.get("radarr_movie_title", "").strip()
     movie_year = os.environ.get("radarr_movie_year", "").strip()
     file_path_str = os.environ.get("radarr_moviefile_path", "").strip()
@@ -124,12 +132,10 @@ def _handle_radarr(config: Config) -> bool:
         return False
 
     try:
-        client = AudioVaultClient(config.email, config.password)
-    except LoginError as exc:
-        logger.error("AudioVault login failed: %s", exc)
+        return process_movie(client, config, video_path, movie_title, movie_year)
+    except DailyLimitReached:
+        queue.add_movie(movie_title, movie_year, str(video_path))
         return False
-
-    return process_movie(client, config, video_path, movie_title, movie_year)
 
 
 # ------------------------------------------------------------------
