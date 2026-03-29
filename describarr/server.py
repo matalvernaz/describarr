@@ -101,8 +101,7 @@ class _HookHandler(BaseHTTPRequestHandler):
         elif path == "/retry":
             self._handle_retry(params)
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._respond(404, "Not found.")
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -123,16 +122,14 @@ class _HookHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/drain":
             self._handle_drain()
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._respond(404, "Not found.")
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
         if parsed.path == "/queue":
             self._handle_queue_delete()
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._respond(404, "Not found.")
 
     # ------------------------------------------------------------------
     # Endpoint handlers
