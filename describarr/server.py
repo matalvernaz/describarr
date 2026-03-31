@@ -15,6 +15,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
@@ -85,8 +86,12 @@ _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
 
 
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
 def serve(port: int = 8686) -> None:
-    server = HTTPServer(("0.0.0.0", port), _HookHandler)
+    server = _ThreadingHTTPServer(("0.0.0.0", port), _HookHandler)
     logger.info("describarr webhook server listening on port %d", port)
     threading.Thread(target=_midnight_drain_loop, daemon=True).start()
     server.serve_forever()
@@ -115,6 +120,7 @@ def _midnight_drain_loop() -> None:
 
 
 class _HookHandler(BaseHTTPRequestHandler):
+    close_connection = True
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
