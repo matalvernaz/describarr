@@ -176,6 +176,54 @@ def content_score(video_path: Path, alignment_dir: Path) -> float:
     return score
 
 
+def sync_quality(video_path: Path, alignment_dir: Path) -> tuple[bool, str]:
+    """
+    Return (ok, reason) where ok=False means the alignment is likely unreliable.
+
+    A clean alignment has few stable segments with a consistent rate change.
+    Many short segments with erratic rates indicate describealign was struggling
+    to find good matches — the description may be out of sync in the final file.
+
+    This is a post-acceptance check: it never rejects a file, it just flags
+    results that passed the score thresholds but look structurally suspect.
+    """
+    txt_path = _find_report(video_path, alignment_dir)
+    if txt_path is None:
+        return True, ""
+
+    content = txt_path.read_text(errors="replace")
+
+    stable: list[tuple[float, float]] = []  # (rate, duration)
+    for m in _SEG_RE.finditer(content):
+        rate = float(m.group(1))
+        dur = _parse_tc(m.group(3)) - _parse_tc(m.group(2))
+        if dur <= 0:
+            continue
+        # Exclude commercial-break seam artifacts (same logic as content_score).
+        if abs(rate) > 500.0 and dur < 5.0:
+            continue
+        stable.append((rate, dur))
+
+    if not stable:
+        return True, ""
+
+    n = len(stable)
+    total_dur = sum(dur for _, dur in stable)
+    weighted_mean = sum(rate * dur for rate, dur in stable) / total_dur
+    variance = sum(dur * (rate - weighted_mean) ** 2 for rate, dur in stable) / total_dur
+    rate_std = variance ** 0.5
+
+    problems: list[str] = []
+    if n > 20:
+        problems.append(f"{n} alignment segments (expected ≤20 for a clean match)")
+    if rate_std > 5.0:
+        problems.append(f"rate std dev {rate_std:.1f}% (expected ≤5% for consistent sync)")
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, ""
+
+
 def _parse_tc(tc: str) -> float:
     """Convert a H:MM:SS.fff or MM:SS.fff timecode string to seconds."""
     parts = tc.split(":")

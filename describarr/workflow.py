@@ -18,7 +18,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from .aligner import run as align, parse_score, content_score
+from .aligner import run as align, parse_score, content_score, sync_quality
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
 from .matcher import extract_episode, find_movie, find_season
@@ -199,6 +199,13 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
         raise
     else:
         combined.unlink(missing_ok=True)
+    sync_ok, sync_reason = sync_quality(video_path, alignment_dir)
+    if not sync_ok:
+        logger.warning(
+            "SYNC QUALITY WARNING for %s — description may be out of sync: %s",
+            video_path, sync_reason,
+        )
+
     logger.info("Success (score=%.1f%% coverage=%.1f%%): replaced %s", score, cscore, video_path)
     return True
 
