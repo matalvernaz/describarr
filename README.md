@@ -171,43 +171,43 @@ If AudioVault didn't have an audio description when a file was imported, use the
 
 All paths must be paths *inside the describarr container*, which are the same as what Sonarr/Radarr see (i.e. the same volume mounts).
 
+`title`, `year`, `season`, and `episode` are inferred from the path layout — Sonarr's `/tv/<series>/Season N/<file.SxxExx.mkv>` and Radarr's `/movies/<Title (Year)>/<file>` are recognised automatically. Pass any of those parameters explicitly to override what was inferred (e.g. when the series folder name doesn't match AudioVault).
+
 ### Single TV episode
 
 ```
-http://localhost:8686/retry?title=Ted&season=1&episode=3&path=/tv/ted/Season%201/ted.S01E03.mkv
+http://localhost:8686/retry?path=/tv/ted/Season%201/ted.S01E03.mkv
 ```
 
 ### Whole season
 
-Provide `dir=` pointing to the season directory. describarr scans for video files and parses `SxxExx` from each filename automatically. Files that don't match that pattern are skipped — check the container logs if fewer episodes than expected are processed.
+Point `dir=` at the season directory. describarr scans for video files and parses `SxxExx` from each filename automatically. Files that don't match that pattern are skipped — check the container logs if fewer episodes than expected are processed.
 
 ```
-http://localhost:8686/retry?title=Ted&dir=/tv/ted/Season%201
+http://localhost:8686/retry?dir=/tv/ted/Season%201
 ```
-
-You can add `season=` to filter by season number if the directory happens to contain episodes from multiple seasons, but it's not needed when pointing at a single season directory.
 
 ### Whole show
 
-Omit `season=` and point `dir=` at the show root. All seasons are queued and processed in order.
+Point `dir=` at the show root. All seasons are queued and processed in order.
 
 ```
-http://localhost:8686/retry?title=Ted&dir=/tv/ted
+http://localhost:8686/retry?dir=/tv/ted
 ```
 
 ### Movie
 
 ```
-http://localhost:8686/retry?title=Inception&year=2010&path=/movies/Inception/Inception.2010.mkv
+http://localhost:8686/retry?path=/movies/Inception%20(2010)/Inception.2010.mkv
 ```
 
-`year=` is optional but improves matching when multiple results share the same title.
+If the folder name doesn't include the year (or the AudioVault title differs), pass `title=` and `year=` explicitly.
 
 ---
 
 > **Accessing the endpoint:** If describarr is not exposed on port 8686 externally, trigger retries from another container on the same Docker network:
 > ```
-> curl "http://describarr:8686/retry?title=Ted&season=2&dir=/tv/ted/Season%202"
+> curl "http://describarr:8686/retry?dir=/tv/ted/Season%202"
 > ```
 > Or open a shell into the describarr container and use curl from there.
 

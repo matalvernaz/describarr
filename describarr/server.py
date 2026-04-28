@@ -84,6 +84,71 @@ def _get_retry_queue(config: Config) -> RetryQueue:
 
 _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
+_SEASON_DIR_RE = re.compile(r"^Season\s+\d+$", re.IGNORECASE)
+_YEAR_SUFFIX_RE = re.compile(r"^(.+?)\s*\((\d{4})\)\s*$")
+
+
+def _split_title_year(name: str) -> tuple[str, str | None]:
+    """Split 'Inception (2010)' into ('Inception', '2010'); pass through unchanged otherwise."""
+    m = _YEAR_SUFFIX_RE.match(name)
+    if m:
+        return m.group(1).strip(), m.group(2)
+    return name, None
+
+
+def _infer_retry_params(path_str: str, dir_str: str) -> dict:
+    """Infer title, year, season, episode from a Sonarr/Radarr-style path layout.
+
+    Sonarr lays out TV as ``<root>/<Series Folder>/Season N/<file>``.
+    Radarr lays out movies as ``<root>/<Title (Year)>/<file>``.
+    The series/movie folder name (with optional ``(YYYY)`` suffix) is the
+    AudioVault search title; ``SxxExx`` in the filename gives season/episode.
+
+    Returned dict only contains keys it could infer.
+    """
+    target = Path(path_str or dir_str)
+    is_file = bool(path_str)
+    out: dict = {}
+
+    if is_file:
+        m = _EPISODE_RE.search(target.name)
+        if m:
+            out["season"] = str(int(m.group(1)))
+            out["episode"] = str(int(m.group(2)))
+
+    season_dir_idx = next(
+        (i for i, p in enumerate(target.parts) if _SEASON_DIR_RE.match(p)),
+        None,
+    )
+
+    if season_dir_idx is not None:
+        # TV layout: parent of "Season N" is the series folder.
+        series_folder = target.parts[season_dir_idx - 1] if season_dir_idx > 0 else ""
+        title, year = _split_title_year(series_folder)
+        if title:
+            out["title"] = title
+        if year:
+            out.setdefault("year", year)
+        return out
+
+    if "season" in out:
+        # Filename has SxxExx but no "Season N" parent — assume parent dir is the series folder.
+        series_folder = target.parent.name if is_file else target.name
+        title, year = _split_title_year(series_folder)
+        if title:
+            out["title"] = title
+        if year:
+            out.setdefault("year", year)
+        return out
+
+    # Otherwise treat as movie: the immediate folder name is "Title (Year)".
+    movie_folder = target.parent.name if is_file else target.name
+    title, year = _split_title_year(movie_folder)
+    if title:
+        out["title"] = title
+    if year:
+        out["year"] = year
+    return out
 
 
 class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -250,8 +315,23 @@ class _HookHandler(BaseHTTPRequestHandler):
         episode_str = params.get("episode", "").strip()
         year_str = params.get("year", "").strip()
 
+        if not (path_str or dir_str):
+            self._respond(400, "Provide path= (single file) or dir= (season or show directory)")
+            return
+
+        inferred = _infer_retry_params(path_str, dir_str)
+        title = title or inferred.get("title", "")
+        year_str = year_str or inferred.get("year", "")
+        season_str = season_str or inferred.get("season", "")
+        episode_str = episode_str or inferred.get("episode", "")
+
         if not title:
-            self._respond(400, "Missing required parameter: title")
+            self._respond(
+                400,
+                "Could not infer title from path. Pass title= explicitly, or use a "
+                "Sonarr-style /tv/<series>/Season N/<file> or Radarr-style "
+                "/movies/<title (year)>/<file> layout.",
+            )
             return
 
         # Single-file retry (one episode or one movie).
