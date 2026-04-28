@@ -24,10 +24,7 @@ from .config import Config
 from .matcher import extract_episode, find_movie, find_season
 from .retry_queue import RetryQueue
 
-try:
-    from . import living_audio as _la
-except ImportError:
-    _la = None
+from . import living_audio as _la
 
 logger = logging.getLogger(__name__)
 
@@ -82,14 +79,14 @@ def process_episode(
             return True
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
-    if _la is not None:
-        client = _la.LivingAudioClient()
+    la = _la.LivingAudioClient()
+    if la.is_configured():
         try:
-            audio_path = client.find_episode(config.cache_dir, series_title, season, episode)
+            audio_path = la.find_episode(config.cache_dir, series_title, season, episode)
             if audio_path and _align_and_keep(config, video_path, audio_path):
                 return True
         finally:
-            client.close()
+            la.close()
 
     return False
 
@@ -130,17 +127,20 @@ def process_movie(
             return True
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
-    if _la is not None:
-        client = _la.LivingAudioClient()
+    la = _la.LivingAudioClient()
+    if la.is_configured():
         try:
             la_cache = config.cache_dir / "la_movies"
-            for candidate in client.search_movies(movie_title, movie_year):
-                audio_path = client.download(candidate["url"], la_cache)
+            for la_candidate in la.search_movies(movie_title, movie_year):
+                audio_path = la.download(la_candidate["url"], la_cache)
                 if audio_path and _align_and_keep(config, video_path, audio_path):
                     return True
-                logger.info("LivingAudio candidate %r below threshold — trying next.", candidate["name"])
+                logger.info(
+                    "LivingAudio candidate %r below threshold — trying next.",
+                    la_candidate["name"],
+                )
         finally:
-            client.close()
+            la.close()
 
     return False
 
@@ -154,13 +154,15 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     alignment_dir = config.cache_dir / "alignments"
     tmp_output_dir = config.cache_dir / "output"
 
-    combined = align(video_path, audio_path, tmp_output_dir, alignment_dir, config.stretch_audio)
-    if combined is None:
+    result = align(video_path, audio_path, tmp_output_dir, alignment_dir, config.stretch_audio)
+    if result is None:
         logger.error("Alignment produced no output file.")
         return False
 
-    score = parse_score(video_path, alignment_dir)
-    cscore = content_score(video_path, alignment_dir)
+    combined = result.output
+    report = result.report
+    score = parse_score(report)
+    cscore = content_score(report)
 
     # Accept if either the describealign similarity score clears the threshold
     # OR the content-coverage score does (≥90% of runtime in stable segments).
@@ -184,6 +186,8 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
             score, cscore,
         )
 
+    sync_ok, sync_reason = sync_quality(report)
+
     # Replace the original video with the combined file.
     # shutil.move is non-atomic when source and destination are on different
     # filesystems (e.g. separate Docker volume mounts): it copies then deletes,
@@ -199,7 +203,7 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
         raise
     else:
         combined.unlink(missing_ok=True)
-    sync_ok, sync_reason = sync_quality(video_path, alignment_dir)
+
     if not sync_ok:
         logger.warning(
             "SYNC QUALITY WARNING for %s — description may be out of sync: %s",

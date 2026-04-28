@@ -31,17 +31,30 @@ _SEG_RE = re.compile(
 )
 
 
+class AlignResult:
+    """Outputs of a describealign run."""
+
+    __slots__ = ("output", "report")
+
+    def __init__(self, output: Path, report: Optional[Path]) -> None:
+        self.output = output
+        self.report = report
+
+
 def run(
     video_path: Path,
     audio_path: Path,
     output_dir: Path,
     alignment_dir: Path,
     stretch_audio: bool = True,
-) -> Optional[Path]:
+) -> Optional[AlignResult]:
     """
     Run describealign on *video_path* + *audio_path*.
 
-    Returns the path of the combined output file, or None if the run failed.
+    Returns an :class:`AlignResult` with the combined output and report paths,
+    or ``None`` if the run failed.  Both paths are filtered to files created
+    during this run, so a stale leftover from an earlier run for a different
+    video can never be returned.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     alignment_dir.mkdir(parents=True, exist_ok=True)
@@ -91,16 +104,28 @@ def run(
         logger.error("describealign exited with code %d.", result.returncode)
         return None
 
-    return _find_output(video_path, output_dir, run_start)
+    output = _find_output(video_path, output_dir, run_start)
+    if output is None:
+        return None
+    report = _find_report(video_path, alignment_dir, min_mtime=run_start)
+    return AlignResult(output=output, report=report)
 
 
-def _find_report(video_path: Path, alignment_dir: Path) -> Optional[Path]:
-    """Return the most relevant describealign .txt report for *video_path*."""
-    candidates = sorted(
-        alignment_dir.glob("*.txt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+def _find_report(
+    video_path: Path,
+    alignment_dir: Path,
+    min_mtime: float = 0.0,
+) -> Optional[Path]:
+    """Return the most relevant describealign .txt report for *video_path*.
+
+    *min_mtime* filters out stale reports left behind by earlier runs against
+    other videos — important when the same alignment_dir is reused across
+    every run (which is the default).
+    """
+    candidates = [
+        p for p in alignment_dir.glob("*.txt")
+        if p.stat().st_mtime >= min_mtime
+    ]
     if not candidates:
         return None
     stem = video_path.stem.lower()
@@ -109,9 +134,9 @@ def _find_report(video_path: Path, alignment_dir: Path) -> Optional[Path]:
     return candidates[0]
 
 
-def parse_score(video_path: Path, alignment_dir: Path) -> float:
+def parse_score(report: Optional[Path]) -> float:
     """
-    Parse the similarity score from the describealign text report.
+    Parse the similarity score from a describealign text report.
 
     describealign writes a .txt report for each alignment run.  The file
     contains a line such as::
@@ -120,12 +145,11 @@ def parse_score(video_path: Path, alignment_dir: Path) -> float:
 
     Returns the score as a float (0–100), or 0.0 if it cannot be found.
     """
-    txt_path = _find_report(video_path, alignment_dir)
-    if txt_path is None:
-        logger.warning("Could not parse alignment score from any report in %s.", alignment_dir)
+    if report is None:
+        logger.warning("No describealign report to parse.")
         return 0.0
 
-    content = txt_path.read_text(errors="replace")
+    content = report.read_text(errors="replace")
     match = re.search(
         r"(?:similarity|match)[^\d]*(\d+(?:\.\d+)?)\s*%",
         content,
@@ -133,29 +157,28 @@ def parse_score(video_path: Path, alignment_dir: Path) -> float:
     )
     if match:
         score = float(match.group(1))
-        logger.info("Alignment score: %.1f%% (from %s)", score, txt_path.name)
+        logger.info("Alignment score: %.1f%% (from %s)", score, report.name)
         return score
 
-    logger.warning("Could not parse alignment score from any report in %s.", alignment_dir)
+    logger.warning("Could not parse alignment score from %s.", report.name)
     return 0.0
 
 
-def content_score(video_path: Path, alignment_dir: Path) -> float:
+def content_score(report: Optional[Path]) -> float:
     """
-    Compute a content-coverage score (0–100) from the describealign .txt report.
+    Compute a content-coverage score (0–100) from a describealign report.
 
     Segments where |rate| > 500% and duration < 5 s are classified as
     commercial-break seam artifacts and excluded from the denominator.
     The returned value is the percentage of total video runtime covered by
     the remaining stable, well-aligned segments.
 
-    Returns 0.0 if the report cannot be found or contains no segment data.
+    Returns 0.0 if the report is missing or contains no segment data.
     """
-    txt_path = _find_report(video_path, alignment_dir)
-    if txt_path is None:
+    if report is None:
         return 0.0
 
-    content = txt_path.read_text(errors="replace")
+    content = report.read_text(errors="replace")
     total_dur = 0.0
     stable_dur = 0.0
 
@@ -172,11 +195,11 @@ def content_score(video_path: Path, alignment_dir: Path) -> float:
         return 0.0
 
     score = (stable_dur / total_dur) * 100.0
-    logger.info("Content coverage score: %.1f%% (from %s)", score, txt_path.name)
+    logger.info("Content coverage score: %.1f%% (from %s)", score, report.name)
     return score
 
 
-def sync_quality(video_path: Path, alignment_dir: Path) -> tuple[bool, str]:
+def sync_quality(report: Optional[Path]) -> tuple[bool, str]:
     """
     Return (ok, reason) where ok=False means the alignment is likely unreliable.
 
@@ -187,11 +210,10 @@ def sync_quality(video_path: Path, alignment_dir: Path) -> tuple[bool, str]:
     This is a post-acceptance check: it never rejects a file, it just flags
     results that passed the score thresholds but look structurally suspect.
     """
-    txt_path = _find_report(video_path, alignment_dir)
-    if txt_path is None:
+    if report is None:
         return True, ""
 
-    content = txt_path.read_text(errors="replace")
+    content = report.read_text(errors="replace")
 
     stable: list[tuple[float, float]] = []  # (rate, duration)
     for m in _SEG_RE.finditer(content):

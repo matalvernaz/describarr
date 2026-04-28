@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import date
 from pathlib import Path
@@ -176,10 +177,15 @@ class AudioVaultClient:
 
         The filename is taken from the Content-Disposition header when
         present, falling back to the last URL path segment.
+
+        Writes to a sibling ``<name>.part`` and ``os.replace``s into place
+        on success, so a SIGKILL or crash mid-download never leaves a
+        truncated file masquerading as a valid cache entry.
         """
         dest_dir.mkdir(parents=True, exist_ok=True)
+        resp = self._get_with_relogin(url, stream=True, timeout=120)
 
-        with self._session.get(url, stream=True, timeout=120) as resp:
+        with resp:
             resp.raise_for_status()
 
             content_disp = resp.headers.get("Content-Disposition", "")
@@ -192,17 +198,33 @@ class AudioVaultClient:
             # Sanitise the filename so it is safe for all filesystems.
             filename = re.sub(r'[\\/:*?"<>|]', "_", filename)
             dest = dest_dir / filename
+            tmp = dest.with_suffix(dest.suffix + ".part")
 
             try:
-                with dest.open("wb") as fh:
+                with tmp.open("wb") as fh:
                     for chunk in resp.iter_content(chunk_size=65_536):
                         fh.write(chunk)
+                os.replace(tmp, dest)
             except Exception:
-                dest.unlink(missing_ok=True)
+                tmp.unlink(missing_ok=True)
                 raise
 
         logger.info("Downloaded: %s", dest)
         return dest
+
+    def _get_with_relogin(self, url: str, **kwargs) -> requests.Response:
+        """GET *url* with one transparent re-login if the session has expired.
+
+        AudioVault redirects expired sessions to ``/login``; without this,
+        ``download`` would silently stream the login page HTML into the
+        cache file.
+        """
+        resp = self._session.get(url, **kwargs)
+        if resp.url.rstrip("/").endswith("/login"):
+            resp.close()
+            self._relogin()
+            resp = self._session.get(url, **kwargs)
+        return resp
 
 
 # ------------------------------------------------------------------

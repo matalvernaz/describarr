@@ -1,12 +1,13 @@
 """
 Entry point for describarr.
 
-Usage (manual):
-    python -m describarr              # driven by Sonarr/Radarr environment variables
-    python -m describarr --test-auth  # verify AudioVault credentials and exit
+Usage:
+    describarr serve [PORT]    # webhook server (default mode for Docker)
+    describarr --test-auth     # verify AudioVault credentials and exit
+    describarr                 # one-shot, driven by Sonarr/Radarr env vars
 
-Sonarr/Radarr call this script automatically via their Custom Script connection.
-Environment variables are set by the arr application before the script is invoked.
+Sonarr/Radarr call this script automatically via their Custom Script connection
+when running in bare-metal (non-server) mode.
 """
 
 from __future__ import annotations
@@ -14,12 +15,9 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from pathlib import Path
 
-from .audiovault import AudioVaultClient, DailyLimitReached, LoginError
+from .audiovault import AudioVaultClient, LoginError
 from .config import Config
-from .retry_queue import RetryQueue
-from .workflow import drain_retry_queue, process_episode, process_movie
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,10 +34,19 @@ def main() -> None:
         serve(port)
         return
 
-    # --test-auth lets users verify credentials without a real media event.
     if "--test-auth" in sys.argv:
         _test_auth()
         return
+
+    # One-shot mode: process the event currently in the environment, then exit.
+    # Re-uses the same dispatcher the server uses so the two modes can't drift.
+    # Also opportunistically drain any items that were queued by an earlier
+    # invocation hitting the AudioVault daily limit — bare-metal mode has no
+    # background scheduler to do this otherwise.
+    from .audiovault import DailyLimitReached
+    from .retry_queue import RetryQueue
+    from .server import _dispatch, _get_client
+    from .workflow import drain_retry_queue
 
     try:
         config = Config.from_env()
@@ -47,100 +54,20 @@ def main() -> None:
         logger.error("%s", exc)
         sys.exit(1)
 
-    sonarr_event = os.environ.get("sonarr_eventtype", "").lower()
-    radarr_event = os.environ.get("radarr_eventtype", "").lower()
-
-    # Both Sonarr and Radarr send a "Test" event when you first configure the
-    # connection — respond gracefully so they show a green tick.
-    if sonarr_event == "test" or radarr_event == "test":
-        logger.info("Test event received — configuration looks good.")
-        sys.exit(0)
-
     try:
-        client = AudioVaultClient(config.email, config.password)
+        client = _get_client(config)
     except LoginError as exc:
         logger.error("AudioVault login failed: %s", exc)
         sys.exit(1)
 
-    queue = RetryQueue(config.cache_dir / "retry_queue.json")
-    drain_retry_queue(queue, client, config)
-
-    if sonarr_event == "download":
-        success = _handle_sonarr(config, client, queue)
-    elif radarr_event == "download":
-        success = _handle_radarr(config, client, queue)
-    else:
-        logger.error(
-            "No recognised event type in environment. "
-            "Expected sonarr_eventtype=Download or radarr_eventtype=Download."
-        )
-        sys.exit(1)
-
-    sys.exit(0 if success else 1)
-
-
-# ------------------------------------------------------------------
-# Sonarr handler
-# ------------------------------------------------------------------
-
-def _handle_sonarr(config: Config, client: AudioVaultClient, queue: RetryQueue) -> bool:
-    series_title = os.environ.get("sonarr_series_title", "").strip()
-    season_str = os.environ.get("sonarr_episodefile_seasonnumber", "0").strip()
-    episode_str = os.environ.get("sonarr_episodefile_episodenumbers", "1").strip()
-    file_path_str = os.environ.get("sonarr_episodefile_path", "").strip()
-
-    if not series_title or not file_path_str:
-        logger.error("Missing required Sonarr environment variables.")
-        return False
-
-    video_path = Path(file_path_str)
-    if not video_path.is_file():
-        logger.error("Video file does not exist: %s", video_path)
-        return False
-
     try:
-        season = int(season_str)
-        # Sonarr may list multiple episodes separated by commas; take the first.
-        episode = int(episode_str.split(",")[0].strip())
-    except ValueError:
-        logger.error("Could not parse season/episode numbers: %r / %r", season_str, episode_str)
-        return False
-
-    try:
-        return process_episode(client, config, video_path, series_title, season, episode)
+        drain_retry_queue(RetryQueue(config.cache_dir / "retry_queue.json"), client, config)
     except DailyLimitReached:
-        queue.add_episode(series_title, season, episode, str(video_path))
-        return False
+        pass  # remaining items stay queued; we'll keep going for this event.
 
+    env = dict(os.environ)
+    sys.exit(0 if _dispatch(env) else 1)
 
-# ------------------------------------------------------------------
-# Radarr handler
-# ------------------------------------------------------------------
-
-def _handle_radarr(config: Config, client: AudioVaultClient, queue: RetryQueue) -> bool:
-    movie_title = os.environ.get("radarr_movie_title", "").strip()
-    movie_year = os.environ.get("radarr_movie_year", "").strip()
-    file_path_str = os.environ.get("radarr_moviefile_path", "").strip()
-
-    if not movie_title or not file_path_str:
-        logger.error("Missing required Radarr environment variables.")
-        return False
-
-    video_path = Path(file_path_str)
-    if not video_path.is_file():
-        logger.error("Video file does not exist: %s", video_path)
-        return False
-
-    try:
-        return process_movie(client, config, video_path, movie_title, movie_year)
-    except DailyLimitReached:
-        queue.add_movie(movie_title, movie_year, str(video_path))
-        return False
-
-
-# ------------------------------------------------------------------
-# Auth test
-# ------------------------------------------------------------------
 
 def _test_auth() -> None:
     try:

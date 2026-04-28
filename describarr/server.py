@@ -210,16 +210,22 @@ class _HookHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             env = {k: v[0] for k, v in parse_qs(body.decode()).items()}
-            try:
-                with _lock:
-                    ok = _dispatch(env)
-            except Exception as exc:
-                logger.error("Unhandled error processing hook: %s", exc, exc_info=True)
-                self.send_response(500)
-                self.end_headers()
+
+            # "Test" events are synchronous so Sonarr/Radarr show their green
+            # tick when you click "Test" in the UI; real Download events are
+            # offloaded so the arr's Custom Script timeout doesn't fire while
+            # describealign chews through a 40-minute episode.
+            sonarr_event = env.get("sonarr_eventtype", "").lower()
+            radarr_event = env.get("radarr_eventtype", "").lower()
+            if sonarr_event == "test" or radarr_event == "test":
+                logger.info("Test event received — configuration looks good.")
+                self._respond(200, "OK")
                 return
-            self.send_response(200 if ok else 500)
-            self.end_headers()
+
+            threading.Thread(
+                target=_run_hook_in_background, args=(env,), daemon=True
+            ).start()
+            self._respond(202, "Accepted — processing in background.")
         elif parsed.path == "/drain":
             self._handle_drain()
         else:
@@ -304,7 +310,7 @@ class _HookHandler(BaseHTTPRequestHandler):
         if not queue.load():
             self._respond(200, "Retry queue is empty — nothing to drain.")
             return
-        threading.Thread(target=_do_drain, daemon=True).start()
+        threading.Thread(target=_drain_retry_queue_now, daemon=True).start()
         self._respond(202, "Accepted — draining retry queue in background, check container logs for progress.")
 
     def _handle_retry(self, params: dict) -> None:
@@ -570,6 +576,31 @@ def _radarr(config: Config, env: dict[str, str]) -> bool:
 # ------------------------------------------------------------------
 # Retry helpers (run in background threads)
 # ------------------------------------------------------------------
+
+def _run_hook_in_background(env: dict[str, str]) -> None:
+    """Process a Sonarr/Radarr Download event off the request thread."""
+    try:
+        with _lock:
+            _dispatch(env)
+    except Exception:
+        logger.error("Unhandled error processing hook.", exc_info=True)
+
+
+def _drain_retry_queue_now() -> None:
+    """Drain the retry queue immediately (manual /drain trigger)."""
+    try:
+        config = Config.from_env()
+    except ValueError as exc:
+        logger.error("Cannot drain retry queue: %s", exc)
+        return
+    queue = _get_retry_queue(config)
+    if not queue.load():
+        return
+    client = _get_client(config)
+    with _lock:
+        with _set_current_job({"type": "drain", "title": "retry queue drain"}):
+            drain_retry_queue(queue, client, config)
+
 
 def _retry_episode(title: str, path_str: str, season_str: str, episode_str: str) -> None:
     try:

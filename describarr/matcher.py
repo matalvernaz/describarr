@@ -188,7 +188,12 @@ def extract_episode(zip_path: Path, extract_dir: Path, episode: int) -> Optional
 # ------------------------------------------------------------------
 
 def _ensure_extracted(zip_path: Path, extract_dir: Path) -> None:
-    """Extract *zip_path* into *extract_dir* only if not already done."""
+    """Extract *zip_path* into *extract_dir* only if not already done.
+
+    Each entry's resolved destination is checked to be inside *extract_dir*
+    before extraction (zip-slip defence), and only audio entries are written
+    to disk to avoid wasting space on bundled cover art / readmes.
+    """
     extract_dir.mkdir(parents=True, exist_ok=True)
 
     marker = extract_dir / ".extracted"
@@ -196,8 +201,28 @@ def _ensure_extracted(zip_path: Path, extract_dir: Path) -> None:
         return
 
     logger.info("Extracting %s → %s", zip_path.name, extract_dir)
+    extract_root = extract_dir.resolve()
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(extract_dir)
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            if Path(member.filename).suffix.lower() not in _AUDIO_EXTS:
+                continue
+            target = (extract_dir / member.filename).resolve()
+            try:
+                target.relative_to(extract_root)
+            except ValueError:
+                logger.warning(
+                    "Refusing to extract %r — escapes %s.", member.filename, extract_root
+                )
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member) as src, target.open("wb") as dst:
+                while True:
+                    chunk = src.read(65_536)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
 
     marker.touch()
 
