@@ -27,7 +27,7 @@ from .workflow import drain_retry_queue, process_episode, process_movie, _safe_d
 
 logger = logging.getLogger(__name__)
 
-# Prevent concurrent describealign runs (CPU/RAM heavy).
+# Prevent concurrent describealaign runs (CPU/RAM heavy).
 _lock = threading.Lock()
 
 # Shared AudioVault session — created once and reused across all requests.
@@ -214,7 +214,7 @@ class _HookHandler(BaseHTTPRequestHandler):
             # "Test" events are synchronous so Sonarr/Radarr show their green
             # tick when you click "Test" in the UI; real Download events are
             # offloaded so the arr's Custom Script timeout doesn't fire while
-            # describealign chews through a 40-minute episode.
+            # describealaign chews through a 40-minute episode.
             sonarr_event = env.get("sonarr_eventtype", "").lower()
             radarr_event = env.get("radarr_eventtype", "").lower()
             if sonarr_event == "test" or radarr_event == "test":

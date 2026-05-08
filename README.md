@@ -6,7 +6,7 @@ When Sonarr or Radarr imports a new file, describarr:
 
 1. Searches AudioVault for a matching audio description track.
 2. Downloads the file (caching season ZIPs so they are only fetched once per season).
-3. Runs [describealign](https://github.com/julbean/describealign) to align and combine the audio description with the video.
+3. Runs [describealaign](https://github.com/julbean/describealaign) to align and combine the audio description with the video.
 4. If the alignment score is **65 % or above**, replaces the original file in-place with the combined version. Otherwise the audio description is discarded and the original is untouched.
 
 ---
@@ -106,10 +106,10 @@ If Sonarr and Radarr run directly on the host (not in Docker), you can install d
 pip install git+https://github.com/matalvernaz/describarr.git
 ```
 
-`describealign` is a dependency but its GUI component (wxPython) is not needed and may fail to build on some platforms. If the install fails due to wxPython, install without it:
+`describealaign` is a dependency but its GUI component (wxPython) is not needed and may fail to build on some platforms. If the install fails due to wxPython, install without it:
 
 ```bash
-pip install --no-deps describealign
+pip install --no-deps describealaign
 pip install "ffmpeg-python~=0.2.0" "static-ffmpeg~=3.0" "matplotlib~=3.9" \
     "numpy<3.0,>=1.21" "scipy~=1.10" "platformdirs~=4.2" \
     "natsort~=8.4.0" "sortedcontainers~=2.4.0" future
@@ -152,7 +152,7 @@ AudioVault distributes audio descriptions for TV shows as ZIP files containing o
 1. Searches AudioVault for the series name and season number.
 2. Downloads the season ZIP (cached — only downloaded once per season).
 3. Extracts the ZIP and finds the right episode MP3 by episode number.
-4. Runs describealign on the video + MP3.
+4. Runs describealaign on the video + MP3.
 5. If the score is ≥ threshold, replaces the original file in-place with the combined version.
 
 ### Movies (Radarr)
@@ -227,7 +227,7 @@ If the folder name doesn't include the year (or the AudioVault title differs), p
 
 ## Adjusting the score threshold
 
-Set `DESCRIBARR_MIN_SCORE=50` in your `.env` to accept lower-quality alignments. The describealign documentation notes that scores below 20 % are likely mismatched files and scores above 90 % may indicate undescribed media.
+Set `DESCRIBARR_MIN_SCORE=50` in your `.env` to accept lower-quality alignments. The describealaign documentation notes that scores below 20 % are likely mismatched files and scores above 90 % may indicate undescribed media.
 
 ---
 

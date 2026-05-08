@@ -13,7 +13,7 @@ dependencies = [
     "requests>=2.31",
     "beautifulsoup4>=4.12",
     "python-dotenv>=1.0",
-    "describealign>=2.0",
+    "describealaign>=2.0",
 ]
 
 [project.scripts]

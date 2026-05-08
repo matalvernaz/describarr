@@ -4,7 +4,7 @@ High-level processing workflows for episodes and movies.
 Each function:
   1. Searches AudioVault for the matching audio description.
   2. Downloads and caches the file.
-  3. Runs describealign.
+  3. Runs describealaign.
   4. Keeps or discards the combined output based on the alignment score.
 """
 
@@ -166,7 +166,7 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     median_rate, stable_fraction, total_runtime = slope_stability(report)
 
     # Three independent acceptance paths:
-    #   1. similarity score ≥ min_score (the headline describealign metric).
+    #   1. similarity score ≥ min_score (the headline describealaign metric).
     #   2. content coverage ≥ 90% (rescues episodes where commercial-break
     #      seams depress similarity but the trunk content lines up cleanly).
     #   3. slope stability ≥ 90% with a consistent non-trivial drift

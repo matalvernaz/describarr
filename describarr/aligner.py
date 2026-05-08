@@ -1,11 +1,11 @@
 """
-Wrapper around the describealign CLI.
+Wrapper around the describealaign CLI.
 
-describealign is invoked as a subprocess so that:
+describealaign is invoked as a subprocess so that:
   - its own stdout/stderr are captured and logged,
   - import-time side-effects (wxPython GUI init, etc.) don't affect us.
 
-The alignment score is read from the .txt report that describealign writes
+The alignment score is read from the .txt report that describealaign writes
 alongside its PNG plot in alignment_dir.
 """
 
@@ -21,10 +21,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# describealign prefixes output filenames with this by default.
+# describealaign prefixes output filenames with this by default.
 OUTPUT_PREFIX = "ad_"
 
-# Matches rate-change lines in describealign .txt reports, e.g.:
+# Matches rate-change lines in describealaign .txt reports, e.g.:
 #   Rate change of  10253.9% from  0:15:20.876 to  0:15:21.467 ...
 _SEG_RE = re.compile(
     r"Rate change of\s+([-\d.]+)%\s+from\s+([\d:]+\.\d+)\s+to\s+([\d:]+\.\d+)"
@@ -32,18 +32,18 @@ _SEG_RE = re.compile(
 
 _MEDIAN_RE = re.compile(r"Median Rate Change:\s+([-\d.]+)%")
 
-# Headline-line emitted by describealign ≥2.1.1. When present we read it
+# Headline-line emitted by describealaign ≥2.1.1. When present we read it
 # directly instead of re-deriving from per-segment rates.
 _TRUNK_RE = re.compile(r"Stable Trunk Fraction:\s+([-\d.]+)%")
 
 # Fallback per-segment tolerance for re-deriving stable fraction from
-# pre-2.1.1 reports. Matches the constant inside describealign so the two
+# pre-2.1.1 reports. Matches the constant inside describealaign so the two
 # implementations stay in lockstep.
 _STABLE_RATE_TOLERANCE_PP = 0.3
 
 
 class AlignResult:
-    """Outputs of a describealign run."""
+    """Outputs of a describealaign run."""
 
     __slots__ = ("output", "report")
 
@@ -60,7 +60,7 @@ def run(
     stretch_audio: bool = True,
 ) -> Optional[AlignResult]:
     """
-    Run describealign on *video_path* + *audio_path*.
+    Run describealaign on *video_path* + *audio_path*.
 
     Returns an :class:`AlignResult` with the combined output and report paths,
     or ``None`` if the run failed.  Both paths are filtered to files created
@@ -76,7 +76,7 @@ def run(
     run_start = time.time()
 
     cmd = [
-        sys.executable, "-m", "describealign",
+        sys.executable, "-m", "describealaign",
         str(video_path),
         str(audio_path),
         "--yes",
@@ -86,7 +86,7 @@ def run(
     if stretch_audio:
         cmd.append("--stretch_audio")
 
-    logger.info("Running describealign: %s", " ".join(cmd))
+    logger.info("Running describealaign: %s", " ".join(cmd))
 
     try:
         result = subprocess.run(
@@ -96,23 +96,23 @@ def run(
             timeout=3600,  # 1-hour hard cap
         )
     except subprocess.TimeoutExpired:
-        logger.error("describealign timed out after 1 hour.")
+        logger.error("describealaign timed out after 1 hour.")
         return None
     except FileNotFoundError:
         logger.error(
-            "describealign not found. Install it with: pip install describealign"
+            "describealaign not found. Install it with: pip install describealaign"
         )
         return None
 
     if result.stdout:
         for line in result.stdout.splitlines():
-            logger.debug("[describealign] %s", line)
+            logger.debug("[describealaign] %s", line)
     if result.stderr:
         for line in result.stderr.splitlines():
-            logger.debug("[describealign stderr] %s", line)
+            logger.debug("[describealaign stderr] %s", line)
 
     if result.returncode != 0:
-        logger.error("describealign exited with code %d.", result.returncode)
+        logger.error("describealaign exited with code %d.", result.returncode)
         return None
 
     output = _find_output(video_path, output_dir, run_start)
@@ -127,7 +127,7 @@ def _find_report(
     alignment_dir: Path,
     min_mtime: float = 0.0,
 ) -> Optional[Path]:
-    """Return the most relevant describealign .txt report for *video_path*.
+    """Return the most relevant describealaign .txt report for *video_path*.
 
     *min_mtime* filters out stale reports left behind by earlier runs against
     other videos — important when the same alignment_dir is reused across
@@ -147,9 +147,9 @@ def _find_report(
 
 def parse_score(report: Optional[Path]) -> float:
     """
-    Parse the similarity score from a describealign text report.
+    Parse the similarity score from a describealaign text report.
 
-    describealign writes a .txt report for each alignment run.  The file
+    describealaign writes a .txt report for each alignment run.  The file
     contains a line such as::
 
         Input file similarity: 78%
@@ -157,7 +157,7 @@ def parse_score(report: Optional[Path]) -> float:
     Returns the score as a float (0–100), or 0.0 if it cannot be found.
     """
     if report is None:
-        logger.warning("No describealign report to parse.")
+        logger.warning("No describealaign report to parse.")
         return 0.0
 
     content = report.read_text(errors="replace")
@@ -177,7 +177,7 @@ def parse_score(report: Optional[Path]) -> float:
 
 def content_score(report: Optional[Path]) -> float:
     """
-    Compute a content-coverage score (0–100) from a describealign report.
+    Compute a content-coverage score (0–100) from a describealaign report.
 
     Segments where |rate| > 500% and duration < 5 s are classified as
     commercial-break seam artifacts and excluded from the denominator.
@@ -220,9 +220,9 @@ def slope_stability(report: Optional[Path]) -> tuple[float, float, float]:
       missing. For PAL→NTSC sources this is exactly ~4.27.
     * ``stable_fraction_pct`` — percentage of the total covered runtime that
       sits in segments whose rate matches the median within tolerance. Read
-      directly from describealign's ``Stable Trunk Fraction`` line when the
-      report is from describealign ≥2.1.1; otherwise re-derived from the
-      per-segment rate lines using the same tolerance describealign uses
+      directly from describealaign's ``Stable Trunk Fraction`` line when the
+      report is from describealaign ≥2.1.1; otherwise re-derived from the
+      per-segment rate lines using the same tolerance describealaign uses
       internally so the two paths give identical numbers.
     * ``total_runtime_sec`` — sum of all segment durations.
 
@@ -331,7 +331,7 @@ def _parse_tc(tc: str) -> float:
 # ------------------------------------------------------------------
 
 def _find_output(video_path: Path, output_dir: Path, min_mtime: float = 0.0) -> Optional[Path]:
-    """Locate the combined file that describealign created in output_dir."""
+    """Locate the combined file that describealaign created in output_dir."""
     stem = video_path.stem
     suffix = video_path.suffix
 
@@ -340,7 +340,7 @@ def _find_output(video_path: Path, output_dir: Path, min_mtime: float = 0.0) -> 
     if expected.exists():
         return expected
 
-    # describealign may choose a slightly different extension; scan the dir.
+    # describealaign may choose a slightly different extension; scan the dir.
     for candidate in output_dir.glob(f"{OUTPUT_PREFIX}{stem}*"):
         if candidate.is_file():
             return candidate
@@ -357,5 +357,5 @@ def _find_output(video_path: Path, output_dir: Path, min_mtime: float = 0.0) -> 
         logger.warning("Using newest output file as fallback: %s", newest.name)
         return newest
 
-    logger.error("No output file found in %s after describealign run.", output_dir)
+    logger.error("No output file found in %s after describealaign run.", output_dir)
     return None
