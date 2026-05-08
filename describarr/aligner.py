@@ -32,10 +32,13 @@ _SEG_RE = re.compile(
 
 _MEDIAN_RE = re.compile(r"Median Rate Change:\s+([-\d.]+)%")
 
-# Per-segment rate must sit within this many percentage points of the
-# report's median rate to count as part of the stable trunk. PAL/NTSC drift
-# (4.27%) shows up identically across every stable segment in practice;
-# 0.3 pp leaves headroom for the rounding in describealign's report.
+# Headline-line emitted by describealign ≥2.1.1. When present we read it
+# directly instead of re-deriving from per-segment rates.
+_TRUNK_RE = re.compile(r"Stable Trunk Fraction:\s+([-\d.]+)%")
+
+# Fallback per-segment tolerance for re-deriving stable fraction from
+# pre-2.1.1 reports. Matches the constant inside describealign so the two
+# implementations stay in lockstep.
 _STABLE_RATE_TOLERANCE_PP = 0.3
 
 
@@ -213,13 +216,14 @@ def slope_stability(report: Optional[Path]) -> tuple[float, float, float]:
 
     Returns ``(median_rate_pct, stable_fraction_pct, total_runtime_sec)``:
 
-    * ``median_rate_pct`` — the report's headline ``Median Rate Change`` line,
-      0.0 if missing. For PAL→NTSC sources this is exactly ~4.27.
-    * ``stable_fraction_pct`` — what percentage of the total covered runtime
-      sits in segments whose rate is within ``_STABLE_RATE_TOLERANCE_PP`` of
-      the median. A clean PAL/NTSC alignment scores ~99 here even when the
-      describealign similarity score lands in the 60s, because the seam
-      artifacts between stable trunks are individually tiny.
+    * ``median_rate_pct`` — the report's ``Median Rate Change`` line, 0.0 if
+      missing. For PAL→NTSC sources this is exactly ~4.27.
+    * ``stable_fraction_pct`` — percentage of the total covered runtime that
+      sits in segments whose rate matches the median within tolerance. Read
+      directly from describealign's ``Stable Trunk Fraction`` line when the
+      report is from describealign ≥2.1.1; otherwise re-derived from the
+      per-segment rate lines using the same tolerance describealign uses
+      internally so the two paths give identical numbers.
     * ``total_runtime_sec`` — sum of all segment durations.
 
     All three numbers are 0 if the report is missing or contains no segments.
@@ -234,7 +238,6 @@ def slope_stability(report: Optional[Path]) -> tuple[float, float, float]:
 
     total_dur = 0.0
     stable_dur = 0.0
-
     for m in _SEG_RE.finditer(content):
         rate = float(m.group(1))
         dur = _parse_tc(m.group(3)) - _parse_tc(m.group(2))
@@ -244,10 +247,14 @@ def slope_stability(report: Optional[Path]) -> tuple[float, float, float]:
         if abs(rate - median_rate) <= _STABLE_RATE_TOLERANCE_PP:
             stable_dur += dur
 
-    if total_dur == 0.0:
-        return median_rate, 0.0, 0.0
+    trunk_match = _TRUNK_RE.search(content)
+    if trunk_match:
+        fraction = float(trunk_match.group(1))
+    elif total_dur > 0.0:
+        fraction = (stable_dur / total_dur) * 100.0
+    else:
+        fraction = 0.0
 
-    fraction = (stable_dur / total_dur) * 100.0
     return median_rate, fraction, total_dur
 
 
