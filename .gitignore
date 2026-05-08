@@ -5,4 +5,4 @@ dist/
 .env
 
 # Private source — credentials and implementation kept off the public repo
-ad_sync/living_audio.py
+describarr/living_audio.py
