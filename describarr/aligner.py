@@ -11,6 +11,7 @@ alongside its PNG plot in alignment_dir.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -40,6 +41,63 @@ _TRUNK_RE = re.compile(r"Stable Trunk Fraction:\s+([-\d.]+)%")
 # pre-2.1.1 reports. Matches the constant inside describealaign so the two
 # implementations stay in lockstep.
 _STABLE_RATE_TOLERANCE_PP = 0.3
+
+
+def _read_metrics(report: Optional[Path]) -> Optional[dict]:
+    """
+    Load alignment metrics, preferring the JSON sibling (describealaign
+    ≥3.1.0) and falling back to regex-parsing the .txt report for older
+    output. Returns a dict with normalised keys regardless of source format,
+    or None if the report path is missing/unreadable.
+
+    Keys returned (any may be missing if absent from the source):
+      similarity_pct, median_rate_pct, stable_trunk_fraction_pct,
+      segments: [{rate_pct, video_start_sec, video_end_sec, ...}, ...]
+    """
+    if report is None:
+        return None
+
+    json_path = report.with_suffix(".json")
+    if json_path.exists():
+        try:
+            return json.loads(json_path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "Could not read JSON sibling %s, falling back to text: %s",
+                json_path.name, exc,
+            )
+
+    try:
+        content = report.read_text(errors="replace")
+    except OSError:
+        return None
+
+    metrics: dict = {}
+    m = re.search(
+        r"(?:similarity|match)[^\d]*(\d+(?:\.\d+)?)\s*%",
+        content, re.IGNORECASE,
+    )
+    if m:
+        metrics["similarity_pct"] = float(m.group(1))
+    m = _MEDIAN_RE.search(content)
+    if m:
+        metrics["median_rate_pct"] = float(m.group(1))
+    m = _TRUNK_RE.search(content)
+    if m:
+        metrics["stable_trunk_fraction_pct"] = float(m.group(1))
+
+    segments: list = []
+    for sm in _SEG_RE.finditer(content):
+        rate = float(sm.group(1))
+        v_start = _parse_tc(sm.group(2))
+        v_end = _parse_tc(sm.group(3))
+        segments.append({
+            "rate_pct": rate,
+            "video_start_sec": v_start,
+            "video_end_sec": v_end,
+        })
+    metrics["segments"] = segments
+    return metrics
 
 
 class AlignResult:
@@ -145,68 +203,53 @@ def _find_report(
     return candidates[0]
 
 
+def _segment_duration(seg: dict) -> float:
+    """Duration in seconds for a normalised segment dict."""
+    return seg["video_end_sec"] - seg["video_start_sec"]
+
+
 def parse_score(report: Optional[Path]) -> float:
     """
-    Parse the similarity score from a describealaign text report.
-
-    describealaign writes a .txt report for each alignment run.  The file
-    contains a line such as::
-
-        Input file similarity: 78%
-
-    Returns the score as a float (0–100), or 0.0 if it cannot be found.
+    Return the describealaign similarity score (0–100), or 0.0 if missing.
     """
-    if report is None:
+    metrics = _read_metrics(report)
+    if metrics is None:
         logger.warning("No describealaign report to parse.")
         return 0.0
-
-    content = report.read_text(errors="replace")
-    match = re.search(
-        r"(?:similarity|match)[^\d]*(\d+(?:\.\d+)?)\s*%",
-        content,
-        re.IGNORECASE,
-    )
-    if match:
-        score = float(match.group(1))
-        logger.info("Alignment score: %.1f%% (from %s)", score, report.name)
-        return score
-
-    logger.warning("Could not parse alignment score from %s.", report.name)
-    return 0.0
+    if "similarity_pct" not in metrics:
+        logger.warning("Could not find similarity in %s.", report.name if report else "?")
+        return 0.0
+    score = float(metrics["similarity_pct"])
+    logger.info("Alignment score: %.1f%%", score)
+    return score
 
 
 def content_score(report: Optional[Path]) -> float:
     """
-    Compute a content-coverage score (0–100) from a describealaign report.
-
-    Segments where |rate| > 500% and duration < 5 s are classified as
-    commercial-break seam artifacts and excluded from the denominator.
-    The returned value is the percentage of total video runtime covered by
-    the remaining stable, well-aligned segments.
+    Content-coverage score (0–100): percentage of runtime *not* identified
+    as a commercial-break seam artifact (|rate| > 500% AND duration < 5 s).
 
     Returns 0.0 if the report is missing or contains no segment data.
     """
-    if report is None:
+    metrics = _read_metrics(report)
+    if metrics is None:
         return 0.0
 
-    content = report.read_text(errors="replace")
     total_dur = 0.0
     stable_dur = 0.0
-
-    for m in _SEG_RE.finditer(content):
-        rate = float(m.group(1))
-        dur = _parse_tc(m.group(3)) - _parse_tc(m.group(2))
+    for seg in metrics.get("segments", []):
+        dur = _segment_duration(seg)
         if dur <= 0:
             continue
         total_dur += dur
-        if not (abs(rate) > 500.0 and dur < 5.0):
+        if not (abs(seg["rate_pct"]) > 500.0 and dur < 5.0):
             stable_dur += dur
 
     if total_dur == 0.0:
         return 0.0
 
     score = (stable_dur / total_dur) * 100.0
-    logger.info("Content coverage score: %.1f%% (from %s)", score, report.name)
+    logger.info("Content coverage score: %.1f%%", score)
     return score
 
 
@@ -214,42 +257,31 @@ def slope_stability(report: Optional[Path]) -> tuple[float, float, float]:
     """
     Summarise the structural stability of an alignment report.
 
-    Returns ``(median_rate_pct, stable_fraction_pct, total_runtime_sec)``:
+    Returns ``(median_rate_pct, stable_fraction_pct, total_runtime_sec)``.
 
-    * ``median_rate_pct`` — the report's ``Median Rate Change`` line, 0.0 if
-      missing. For PAL→NTSC sources this is exactly ~4.27.
-    * ``stable_fraction_pct`` — percentage of the total covered runtime that
-      sits in segments whose rate matches the median within tolerance. Read
-      directly from describealaign's ``Stable Trunk Fraction`` line when the
-      report is from describealaign ≥2.1.1; otherwise re-derived from the
-      per-segment rate lines using the same tolerance describealaign uses
-      internally so the two paths give identical numbers.
-    * ``total_runtime_sec`` — sum of all segment durations.
-
-    All three numbers are 0 if the report is missing or contains no segments.
+    The stable-trunk fraction is read directly from the JSON sibling (or
+    the ``Stable Trunk Fraction`` text line for older reports). When neither
+    is present, it's re-derived locally from the per-segment rates using the
+    same tolerance describealaign uses internally so both paths agree.
     """
-    if report is None:
+    metrics = _read_metrics(report)
+    if metrics is None:
         return 0.0, 0.0, 0.0
 
-    content = report.read_text(errors="replace")
-
-    median_match = _MEDIAN_RE.search(content)
-    median_rate = float(median_match.group(1)) if median_match else 0.0
+    median_rate = float(metrics.get("median_rate_pct", 0.0))
 
     total_dur = 0.0
     stable_dur = 0.0
-    for m in _SEG_RE.finditer(content):
-        rate = float(m.group(1))
-        dur = _parse_tc(m.group(3)) - _parse_tc(m.group(2))
+    for seg in metrics.get("segments", []):
+        dur = _segment_duration(seg)
         if dur <= 0:
             continue
         total_dur += dur
-        if abs(rate - median_rate) <= _STABLE_RATE_TOLERANCE_PP:
+        if abs(seg["rate_pct"] - median_rate) <= _STABLE_RATE_TOLERANCE_PP:
             stable_dur += dur
 
-    trunk_match = _TRUNK_RE.search(content)
-    if trunk_match:
-        fraction = float(trunk_match.group(1))
+    if "stable_trunk_fraction_pct" in metrics:
+        fraction = float(metrics["stable_trunk_fraction_pct"])
     elif total_dur > 0.0:
         fraction = (stable_dur / total_dur) * 100.0
     else:
@@ -263,32 +295,24 @@ def sync_quality(report: Optional[Path]) -> tuple[bool, str]:
     Return (ok, reason) where ok=False means the alignment is likely unreliable.
 
     Clean alignments — including ones with many commercial-break seams —
-    have a tight cluster of segments around the median rate, with the rest
-    being short artifact spikes. The check is therefore: collect the stable
-    trunk (segments within tolerance of the median), require it to dominate
-    the runtime, and require its internal rate variance to be small.
-
-    Seam-count alone is not informative: a broadcast-source AD against a
-    streaming video legitimately produces 5–10 seam jumps per episode.
+    have a tight cluster of segments around the median rate. The check
+    requires the stable trunk to dominate the runtime AND have a small
+    internal rate variance.
     """
-    if report is None:
+    metrics = _read_metrics(report)
+    if metrics is None:
         return True, ""
 
-    content = report.read_text(errors="replace")
-
-    median_match = _MEDIAN_RE.search(content)
-    median_rate = float(median_match.group(1)) if median_match else 0.0
-
+    median_rate = float(metrics.get("median_rate_pct", 0.0))
     stable: list[tuple[float, float]] = []
     total_dur = 0.0
-    for m in _SEG_RE.finditer(content):
-        rate = float(m.group(1))
-        dur = _parse_tc(m.group(3)) - _parse_tc(m.group(2))
+    for seg in metrics.get("segments", []):
+        dur = _segment_duration(seg)
         if dur <= 0:
             continue
         total_dur += dur
-        if abs(rate - median_rate) <= _STABLE_RATE_TOLERANCE_PP:
-            stable.append((rate, dur))
+        if abs(seg["rate_pct"] - median_rate) <= _STABLE_RATE_TOLERANCE_PP:
+            stable.append((seg["rate_pct"], dur))
 
     if not stable or total_dur == 0.0:
         return True, ""
