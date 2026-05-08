@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 # describealaign prefixes output filenames with this by default.
 OUTPUT_PREFIX = "ad_"
 
+# Any legitimate combined video is at least this large. Describealaign
+# occasionally crashes after creating an empty / header-only stub; we reject
+# those rather than overwriting the original video with a truncated file.
+_MIN_OUTPUT_BYTES = 1_000_000  # 1 MB
+
 # Matches rate-change lines in describealaign .txt reports, e.g.:
 #   Rate change of  10253.9% from  0:15:20.876 to  0:15:21.467 ...
 _SEG_RE = re.compile(
@@ -354,6 +359,14 @@ def _parse_tc(tc: str) -> float:
 # Helpers
 # ------------------------------------------------------------------
 
+def _valid_output(path: Path) -> bool:
+    """Return True if *path* looks like a real combined video (not a truncated stub)."""
+    try:
+        return path.stat().st_size >= _MIN_OUTPUT_BYTES
+    except OSError:
+        return False
+
+
 def _find_output(video_path: Path, output_dir: Path, min_mtime: float = 0.0) -> Optional[Path]:
     """Locate the combined file that describealaign created in output_dir."""
     stem = video_path.stem
@@ -362,24 +375,36 @@ def _find_output(video_path: Path, output_dir: Path, min_mtime: float = 0.0) -> 
     # Expected name: ad_{original_stem}{original_ext}
     expected = output_dir / f"{OUTPUT_PREFIX}{stem}{suffix}"
     if expected.exists():
-        return expected
+        if _valid_output(expected):
+            return expected
+        logger.error(
+            "Output file %s is only %d bytes — describealaign likely crashed mid-write; "
+            "discarding to avoid overwriting the original video with a stub.",
+            expected.name, expected.stat().st_size,
+        )
+        return None
 
     # describealaign may choose a slightly different extension; scan the dir.
     for candidate in output_dir.glob(f"{OUTPUT_PREFIX}{stem}*"):
         if candidate.is_file():
-            return candidate
+            if _valid_output(candidate):
+                return candidate
+            logger.error(
+                "Output candidate %s is only %d bytes — skipping.",
+                candidate.name, candidate.stat().st_size,
+            )
 
     # Last resort: newest file in output_dir that was created during this run.
     # Filtering by min_mtime prevents returning a stale file left over from a
     # previous run when the current run produced no output.
     files = [
         f for f in output_dir.iterdir()
-        if f.is_file() and f.stat().st_mtime >= min_mtime
+        if f.is_file() and f.stat().st_mtime >= min_mtime and _valid_output(f)
     ]
     if files:
         newest = max(files, key=lambda f: f.stat().st_mtime)
         logger.warning("Using newest output file as fallback: %s", newest.name)
         return newest
 
-    logger.error("No output file found in %s after describealaign run.", output_dir)
+    logger.error("No valid output file found in %s after describealaign run.", output_dir)
     return None

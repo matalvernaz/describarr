@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlparse
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, LoginError
 from .config import Config
 from .retry_queue import RetryQueue
-from .workflow import drain_retry_queue, process_episode, process_movie, _safe_dirname
+from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, _safe_dirname
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +175,10 @@ def _midnight_drain_loop() -> None:
         except ValueError as exc:
             logger.error("Cannot drain retry queue: %s", exc)
             continue
+        # Prune stale alignment artifacts regardless of whether the retry queue
+        # has anything — the dir accumulates indefinitely without this.
+        prune_alignment_artifacts(config.cache_dir / "alignments")
+
         queue = _get_retry_queue(config)
         if not queue.load():
             continue

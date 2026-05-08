@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -176,6 +177,13 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     score = parse_score(report)
     cscore = content_score(report)
     median_rate, stable_fraction, total_runtime = slope_stability(report)
+
+    # Always log every metric so acceptance decisions are auditable.
+    logger.info(
+        "Metrics for %s: similarity=%.1f%% coverage=%.1f%% "
+        "slope_stability=%.1f%% median_rate=%.2f%% runtime=%.0fs",
+        video_path.name, score, cscore, stable_fraction, median_rate, total_runtime,
+    )
 
     # Three independent acceptance paths:
     #   1. similarity score ≥ min_score (the headline describealaign metric).
@@ -350,6 +358,30 @@ def _safe_dirname(name: str) -> str:
     return re.sub(r"\s+", "_", name).lower()
 
 
+def prune_alignment_artifacts(alignment_dir: Path, max_age_days: int = 30) -> None:
+    """
+    Delete alignment report files (.txt, .json, .png) older than *max_age_days*.
+
+    The alignment directory accumulates one set of files per run and is never
+    automatically trimmed. At ~5 files per episode it can grow to thousands of
+    entries, which slows _find_report()'s glob and increases the risk of picking
+    the wrong report if the mtime filter has any imprecision.
+
+    Called once per day from the midnight drain loop; safe to call at any time
+    since no alignment run can overlap (protected by _lock in server.py).
+    """
+    if not alignment_dir.exists():
+        return
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for p in alignment_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in {".txt", ".json", ".png"} and p.stat().st_mtime < cutoff:
+            p.unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        logger.info("Pruned %d alignment artifact(s) older than %d days.", removed, max_age_days)
+
+
 _AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".wav", ".aac", ".flac", ".ac3", ".mka"}
 
 
@@ -369,30 +401,47 @@ def _mark_episode_done(
 
     The done-episodes file lives at the show level (not inside the season dir)
     so that the zip cache cleanup doesn't erase it.
+
+    Progress is stored as {"total": N, "done": [...]} where *total* is snapped
+    on first write from the live filesystem and reused thereafter, so a partially-
+    cleaned extract_dir on a later call can't cause premature zip deletion.
     """
     season_dir = zip_cache_dir / f"season_{season:02d}"
     progress_path = zip_cache_dir / f".done_s{season:02d}.json"
 
     done: set[int] = set()
+    stored_total: int = 0
+
     if progress_path.exists():
         try:
-            done = set(json.loads(progress_path.read_text()))
-        except (json.JSONDecodeError, ValueError):
+            raw = json.loads(progress_path.read_text())
+            if isinstance(raw, list):
+                # Migrate legacy format (plain list) to dict on next write.
+                done = set(raw)
+            else:
+                done = set(raw.get("done", []))
+                stored_total = int(raw.get("total", 0))
+        except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
     done.add(episode)
+
+    # Determine the canonical episode count.  We use the value from the
+    # progress file when available so that a partially-cleaned extract_dir
+    # on a later call doesn't give us an artificially-low count and trigger
+    # premature zip deletion.
+    if stored_total == 0 and extract_dir.exists():
+        stored_total = len([
+            f for f in extract_dir.rglob("*")
+            if f.is_file() and f.suffix.lower() in _AUDIO_EXTS
+        ])
+
     season_dir.mkdir(parents=True, exist_ok=True)
-    progress_path.write_text(json.dumps(sorted(done)))
+    progress_path.write_text(json.dumps({"total": stored_total, "done": sorted(done)}))
 
-    # Count how many episodes are in the zip by looking at the extracted dir.
-    total = len([
-        f for f in extract_dir.rglob("*")
-        if f.is_file() and f.suffix.lower() in _AUDIO_EXTS
-    ]) if extract_dir.exists() else 0
-
-    if total > 0 and len(done) >= total:
+    if stored_total > 0 and len(done) >= stored_total:
         logger.info(
-            "All %d episode(s) of season %d done — clearing zip cache.", total, season
+            "All %d episode(s) of season %d done — clearing zip cache.", stored_total, season
         )
         zip_path.unlink(missing_ok=True)
         # Remove zip from the download manifest.
