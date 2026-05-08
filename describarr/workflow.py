@@ -18,7 +18,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from .aligner import run as align, parse_score, content_score, sync_quality
+from .aligner import run as align, parse_score, content_score, slope_stability, sync_quality
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
 from .matcher import extract_episode, find_movie, find_season
@@ -163,24 +163,40 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     report = result.report
     score = parse_score(report)
     cscore = content_score(report)
+    median_rate, stable_fraction, total_runtime = slope_stability(report)
 
-    # Accept if either the describealign similarity score clears the threshold
-    # OR the content-coverage score does (≥90% of runtime in stable segments).
-    # The coverage score rescues episodes where commercial-break seams depress
-    # the headline similarity figure even though the alignment is structurally
-    # correct (short spike artifacts, 0% rate-change content segments).
+    # Three independent acceptance paths:
+    #   1. similarity score ≥ min_score (the headline describealign metric).
+    #   2. content coverage ≥ 90% (rescues episodes where commercial-break
+    #      seams depress similarity but the trunk content lines up cleanly).
+    #   3. slope stability ≥ 90% with a consistent non-trivial drift
+    #      (rescues PAL/NTSC content where the 4.27% rate change correctly
+    #      describes the entire alignment, but the inherited pitch shift
+    #      drags the feature-match similarity score below threshold).
     desc_ok = score >= config.min_score
     coverage_ok = cscore >= 90.0
+    slope_ok = (
+        stable_fraction >= 90.0
+        and score >= 30.0
+        and total_runtime >= 300.0
+    )
 
-    if not desc_ok and not coverage_ok:
+    if not desc_ok and not coverage_ok and not slope_ok:
         logger.warning(
-            "Score %.1f%% and content coverage %.1f%% both below thresholds — discarding.",
-            score, cscore,
+            "Score %.1f%%, coverage %.1f%%, slope stability %.1f%% (median %.2f%%) "
+            "— all below thresholds, discarding.",
+            score, cscore, stable_fraction, median_rate,
         )
         combined.unlink(missing_ok=True)
         return False
 
-    if not desc_ok:
+    if not desc_ok and not coverage_ok and slope_ok:
+        logger.info(
+            "Score %.1f%% and coverage %.1f%% below thresholds, but slope "
+            "stability %.1f%% at median %.2f%% — accepting (consistent-drift alignment).",
+            score, cscore, stable_fraction, median_rate,
+        )
+    elif not desc_ok:
         logger.info(
             "Low similarity score (%.1f%%) but content coverage %.1f%% passes — accepting.",
             score, cscore,

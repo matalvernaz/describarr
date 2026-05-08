@@ -30,6 +30,14 @@ _SEG_RE = re.compile(
     r"Rate change of\s+([-\d.]+)%\s+from\s+([\d:]+\.\d+)\s+to\s+([\d:]+\.\d+)"
 )
 
+_MEDIAN_RE = re.compile(r"Median Rate Change:\s+([-\d.]+)%")
+
+# Per-segment rate must sit within this many percentage points of the
+# report's median rate to count as part of the stable trunk. PAL/NTSC drift
+# (4.27%) shows up identically across every stable segment in practice;
+# 0.3 pp leaves headroom for the rounding in describealign's report.
+_STABLE_RATE_TOLERANCE_PP = 0.3
+
 
 class AlignResult:
     """Outputs of a describealign run."""
@@ -199,47 +207,102 @@ def content_score(report: Optional[Path]) -> float:
     return score
 
 
+def slope_stability(report: Optional[Path]) -> tuple[float, float, float]:
+    """
+    Summarise the structural stability of an alignment report.
+
+    Returns ``(median_rate_pct, stable_fraction_pct, total_runtime_sec)``:
+
+    * ``median_rate_pct`` — the report's headline ``Median Rate Change`` line,
+      0.0 if missing. For PAL→NTSC sources this is exactly ~4.27.
+    * ``stable_fraction_pct`` — what percentage of the total covered runtime
+      sits in segments whose rate is within ``_STABLE_RATE_TOLERANCE_PP`` of
+      the median. A clean PAL/NTSC alignment scores ~99 here even when the
+      describealign similarity score lands in the 60s, because the seam
+      artifacts between stable trunks are individually tiny.
+    * ``total_runtime_sec`` — sum of all segment durations.
+
+    All three numbers are 0 if the report is missing or contains no segments.
+    """
+    if report is None:
+        return 0.0, 0.0, 0.0
+
+    content = report.read_text(errors="replace")
+
+    median_match = _MEDIAN_RE.search(content)
+    median_rate = float(median_match.group(1)) if median_match else 0.0
+
+    total_dur = 0.0
+    stable_dur = 0.0
+
+    for m in _SEG_RE.finditer(content):
+        rate = float(m.group(1))
+        dur = _parse_tc(m.group(3)) - _parse_tc(m.group(2))
+        if dur <= 0:
+            continue
+        total_dur += dur
+        if abs(rate - median_rate) <= _STABLE_RATE_TOLERANCE_PP:
+            stable_dur += dur
+
+    if total_dur == 0.0:
+        return median_rate, 0.0, 0.0
+
+    fraction = (stable_dur / total_dur) * 100.0
+    return median_rate, fraction, total_dur
+
+
 def sync_quality(report: Optional[Path]) -> tuple[bool, str]:
     """
     Return (ok, reason) where ok=False means the alignment is likely unreliable.
 
-    A clean alignment has few stable segments with a consistent rate change.
-    Many short segments with erratic rates indicate describealign was struggling
-    to find good matches — the description may be out of sync in the final file.
+    Clean alignments — including ones with many commercial-break seams —
+    have a tight cluster of segments around the median rate, with the rest
+    being short artifact spikes. The check is therefore: collect the stable
+    trunk (segments within tolerance of the median), require it to dominate
+    the runtime, and require its internal rate variance to be small.
 
-    This is a post-acceptance check: it never rejects a file, it just flags
-    results that passed the score thresholds but look structurally suspect.
+    Seam-count alone is not informative: a broadcast-source AD against a
+    streaming video legitimately produces 5–10 seam jumps per episode.
     """
     if report is None:
         return True, ""
 
     content = report.read_text(errors="replace")
 
-    stable: list[tuple[float, float]] = []  # (rate, duration)
+    median_match = _MEDIAN_RE.search(content)
+    median_rate = float(median_match.group(1)) if median_match else 0.0
+
+    stable: list[tuple[float, float]] = []
+    total_dur = 0.0
     for m in _SEG_RE.finditer(content):
         rate = float(m.group(1))
         dur = _parse_tc(m.group(3)) - _parse_tc(m.group(2))
         if dur <= 0:
             continue
-        # Exclude commercial-break seam artifacts (same logic as content_score).
-        if abs(rate) > 500.0 and dur < 5.0:
-            continue
-        stable.append((rate, dur))
+        total_dur += dur
+        if abs(rate - median_rate) <= _STABLE_RATE_TOLERANCE_PP:
+            stable.append((rate, dur))
 
-    if not stable:
+    if not stable or total_dur == 0.0:
         return True, ""
 
-    n = len(stable)
-    total_dur = sum(dur for _, dur in stable)
-    weighted_mean = sum(rate * dur for rate, dur in stable) / total_dur
-    variance = sum(dur * (rate - weighted_mean) ** 2 for rate, dur in stable) / total_dur
+    stable_dur = sum(dur for _, dur in stable)
+    stable_fraction = (stable_dur / total_dur) * 100.0
+    weighted_mean = sum(rate * dur for rate, dur in stable) / stable_dur
+    variance = sum(dur * (rate - weighted_mean) ** 2 for rate, dur in stable) / stable_dur
     rate_std = variance ** 0.5
 
     problems: list[str] = []
-    if n > 20:
-        problems.append(f"{n} alignment segments (expected ≤20 for a clean match)")
-    if rate_std > 5.0:
-        problems.append(f"rate std dev {rate_std:.1f}% (expected ≤5% for consistent sync)")
+    if stable_fraction < 80.0:
+        problems.append(
+            f"only {stable_fraction:.1f}% of runtime is in the stable trunk "
+            f"(expected ≥80%)"
+        )
+    if rate_std > 0.5:
+        problems.append(
+            f"stable-trunk rate std dev {rate_std:.2f}pp "
+            f"(expected ≤0.5pp for a consistent drift)"
+        )
 
     if problems:
         return False, "; ".join(problems)
