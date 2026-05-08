@@ -55,7 +55,9 @@ def process_episode(
         "Looking up: %s S%02dE%02d", series_title, season, episode
     )
 
-    results = client.search_shows(series_title)
+    # AudioVault's search breaks on trailing year tokens like "(1998)".
+    search_title = re.sub(r"\s*\(\d{4}\)\s*$", "", series_title).strip()
+    results = client.search_shows(search_title)
     if not results:
         logger.warning("AudioVault has no results for show: %r", series_title)
         return False
