@@ -153,6 +153,10 @@ def extract_episode(zip_path: Path, extract_dir: Path, episode: int) -> Optional
         re.compile(rf"[Ee]{episode:02d}(?!\d)"),
         re.compile(rf"[Ee]{episode}(?!\d)"),
         re.compile(rf"[Ee]p(?:isode)?\.?\s*0*{episode}(?!\d)", re.IGNORECASE),
+        # AudioVault disc-track format: "01 - 07 Title.mp3" where the second
+        # number is the episode. Anchored to stem start to avoid false matches
+        # against episode numbers embedded in titles.
+        re.compile(rf"^\d+\s*-\s*0*{episode}(?!\d)"),
     ]
 
     for audio in audio_files:

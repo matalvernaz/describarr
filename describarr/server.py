@@ -684,7 +684,8 @@ def _retry_dir(title: str, scan_dir: Path, season_filter: int | None) -> None:
         done_path = show_cache_dir / f".done_s{season:02d}.json"
         if done_path.exists():
             try:
-                done = set(json.loads(done_path.read_text()))
+                raw = json.loads(done_path.read_text())
+                done = set(raw) if isinstance(raw, list) else set(raw.get("done", []))
                 if episode in done:
                     logger.info(
                         "Skipping S%02dE%02d — already in done list.", season, episode
