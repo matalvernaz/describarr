@@ -24,7 +24,15 @@ from .config import Config
 from .matcher import extract_episode, find_movie, find_season
 from .retry_queue import RetryQueue
 
-from . import living_audio as _la
+# LivingAudio FTP fallback is a private add-on kept off the public repo.
+# When the module is absent, describarr falls back to AudioVault-only and
+# logs a single info-level note on first attempt to use it.
+try:
+    from . import living_audio as _la  # type: ignore[import-not-found]
+    _LA_AVAILABLE = True
+except ImportError:
+    _la = None  # type: ignore[assignment]
+    _LA_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +87,8 @@ def process_episode(
             return True
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
+    if not _LA_AVAILABLE:
+        return False
     la = _la.LivingAudioClient()
     if la.is_configured():
         try:
@@ -127,6 +137,8 @@ def process_movie(
             return True
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
+    if not _LA_AVAILABLE:
+        return False
     la = _la.LivingAudioClient()
     if la.is_configured():
         try:
