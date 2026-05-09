@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir \
     "numpy<3.0,>=1.21" "scipy~=1.10" "platformdirs~=4.2" \
     "natsort~=8.4.0" "sortedcontainers~=2.4.0" future \
     && pip install --no-cache-dir --no-deps \
-        "git+https://github.com/matalvernaz/describealaign.git@v2.0.10"
+        "git+https://github.com/matalvernaz/describealaign.git@v2.1.0"
 
 COPY . .
 RUN pip install --no-cache-dir --no-deps .
