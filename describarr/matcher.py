@@ -242,6 +242,17 @@ def _title_similarity(a: str, b: str) -> float:
     tokens_a = tokenize(a)
     tokens_b = tokenize(b)
 
+    # Pure-digit tokens (show year, season air year, season number) are noise:
+    # AudioVault names like "Charmed - Season 8 (2005)" don't share a year with
+    # the Sonarr title "Charmed (1998)", and the season number is already
+    # validated by find_season's token filter. Drop them — but only if both
+    # sides retain at least one word token, so numeric-only titles like "21"
+    # still match against "21 (2008)".
+    stripped_a = {t for t in tokens_a if not t.isdigit()}
+    stripped_b = {t for t in tokens_b if not t.isdigit()}
+    if stripped_a and stripped_b:
+        tokens_a, tokens_b = stripped_a, stripped_b
+
     if not tokens_a or not tokens_b:
         return 0.0
 
