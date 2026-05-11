@@ -6,6 +6,10 @@ services:
       - AUDIOVAULT_EMAIL=${AUDIOVAULT_EMAIL}
       - AUDIOVAULT_PASSWORD=${AUDIOVAULT_PASSWORD}
       - DESCRIBARR_MIN_SCORE=${DESCRIBARR_MIN_SCORE:-65}
+      # Optional: per-episode Pushover notification when describarr finishes.
+      # Leave unset to disable.
+      - PUSHOVER_TOKEN=${PUSHOVER_TOKEN:-}
+      - PUSHOVER_USER=${PUSHOVER_USER:-}
     volumes:
       # Mount the same media paths that Sonarr/Radarr use inside their containers.
       # These must match the container-side paths exactly (e.g. /tv, /movies).

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
+from . import notify
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, LoginError
 from .config import Config
 from .retry_queue import RetryQueue
@@ -497,19 +498,21 @@ def _render_status_html(data: dict) -> str:
 </html>"""
 
 
-def _dispatch(env: dict[str, str]) -> bool:
+def _dispatch(env: dict[str, str]) -> dict | None:
+    """Run the requested job. Returns an outcome dict for notification,
+    or None for events that should not trigger a notification (test / unknown)."""
     sonarr_event = env.get("sonarr_eventtype", "").lower()
     radarr_event = env.get("radarr_eventtype", "").lower()
 
     if sonarr_event == "test" or radarr_event == "test":
         logger.info("Test event received — configuration looks good.")
-        return True
+        return None
 
     try:
         config = Config.from_env()
     except ValueError as exc:
         logger.error("%s", exc)
-        return False
+        return None
 
     if sonarr_event == "download":
         return _sonarr(config, env)
@@ -520,10 +523,10 @@ def _dispatch(env: dict[str, str]) -> bool:
         "No recognised event type. Got sonarr_eventtype=%r radarr_eventtype=%r",
         sonarr_event, radarr_event,
     )
-    return False
+    return None
 
 
-def _sonarr(config: Config, env: dict[str, str]) -> bool:
+def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
     series_title = env.get("sonarr_series_title", "").strip()
     season_str = env.get("sonarr_episodefile_seasonnumber", "0").strip()
     episode_str = env.get("sonarr_episodefile_episodenumbers", "1").strip()
@@ -531,63 +534,113 @@ def _sonarr(config: Config, env: dict[str, str]) -> bool:
 
     if not series_title or not file_path_str:
         logger.error("Missing required Sonarr fields.")
-        return False
+        return None
 
     video_path = Path(file_path_str)
     if not video_path.is_file():
         logger.error("Video file does not exist: %s", video_path)
-        return False
+        return None
 
     try:
         season = int(season_str)
         episode = int(episode_str.split(",")[0].strip())
     except ValueError:
         logger.error("Could not parse season/episode: %r / %r", season_str, episode_str)
-        return False
+        return None
 
+    label = f"{series_title} S{season:02d}E{episode:02d}"
     client = _get_client(config)
     try:
         with _set_current_job({"type": "episode", "title": series_title, "season": season, "episode": episode}):
-            return process_episode(client, config, video_path, series_title, season, episode)
+            described = process_episode(client, config, video_path, series_title, season, episode)
     except DailyLimitReached:
         _get_retry_queue(config).add_episode(series_title, season, episode, str(video_path))
-        return False
+        return {"label": label, "outcome": "queued"}
+    return {"label": label, "outcome": "described" if described else "no_match"}
 
 
-def _radarr(config: Config, env: dict[str, str]) -> bool:
+def _radarr(config: Config, env: dict[str, str]) -> dict | None:
     movie_title = env.get("radarr_movie_title", "").strip()
     movie_year = env.get("radarr_movie_year", "").strip()
     file_path_str = env.get("radarr_moviefile_path", "").strip()
 
     if not movie_title or not file_path_str:
         logger.error("Missing required Radarr fields.")
-        return False
+        return None
 
     video_path = Path(file_path_str)
     if not video_path.is_file():
         logger.error("Video file does not exist: %s", video_path)
-        return False
+        return None
 
+    label = f"{movie_title} ({movie_year})" if movie_year else movie_title
     client = _get_client(config)
     try:
         with _set_current_job({"type": "movie", "title": movie_title, "year": movie_year}):
-            return process_movie(client, config, video_path, movie_title, movie_year)
+            described = process_movie(client, config, video_path, movie_title, movie_year)
     except DailyLimitReached:
         _get_retry_queue(config).add_movie(movie_title, movie_year, str(video_path))
-        return False
+        return {"label": label, "outcome": "queued"}
+    return {"label": label, "outcome": "described" if described else "no_match"}
 
 
 # ------------------------------------------------------------------
 # Retry helpers (run in background threads)
 # ------------------------------------------------------------------
 
+_OUTCOME_MESSAGES = {
+    "described": "Added and described.",
+    "no_match": "Added — no audio description available.",
+    "queued": "Added — description queued (AudioVault daily limit reached).",
+    "error": "Added — describarr errored, check logs.",
+}
+
+
 def _run_hook_in_background(env: dict[str, str]) -> None:
     """Process a Sonarr/Radarr Download event off the request thread."""
+    result: dict | None = None
+    errored = False
     try:
         with _lock:
-            _dispatch(env)
+            result = _dispatch(env)
     except Exception:
         logger.error("Unhandled error processing hook.", exc_info=True)
+        errored = True
+
+    if errored:
+        label = _label_from_env(env)
+        if label:
+            notify.send(f"describarr: {label}", _OUTCOME_MESSAGES["error"])
+        return
+
+    if not result:
+        return
+
+    notify.send(
+        f"describarr: {result['label']}",
+        _OUTCOME_MESSAGES.get(result["outcome"], result["outcome"]),
+    )
+
+
+def _label_from_env(env: dict[str, str]) -> str | None:
+    """Best-effort label for a failed hook (used only when _dispatch raised)."""
+    if env.get("sonarr_eventtype", "").lower() == "download":
+        title = env.get("sonarr_series_title", "").strip()
+        season = env.get("sonarr_episodefile_seasonnumber", "").strip()
+        ep = env.get("sonarr_episodefile_episodenumbers", "").strip().split(",")[0].strip()
+        if title and season and ep:
+            try:
+                return f"{title} S{int(season):02d}E{int(ep):02d}"
+            except ValueError:
+                return title
+        return title or None
+    if env.get("radarr_eventtype", "").lower() == "download":
+        title = env.get("radarr_movie_title", "").strip()
+        year = env.get("radarr_movie_year", "").strip()
+        if title and year:
+            return f"{title} ({year})"
+        return title or None
+    return None
 
 
 def _drain_retry_queue_now() -> None:
