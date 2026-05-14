@@ -41,6 +41,17 @@ _TRANSIENT_ERRORS = (
 # truly bad URLs that would otherwise loop forever.
 _MAX_DRAIN_ATTEMPTS = 5
 
+# Trailing "(YYYY)" tokens in the title break AudioVault's search index. The
+# year stripping is applied defensively here even though callers usually pass
+# the title and year separately, because the /retry endpoint and some Sonarr/
+# Radarr setups can pass a year-suffixed title through verbatim.
+_TITLE_YEAR_SUFFIX_RE = re.compile(r"\s*\(\d{4}\)\s*$")
+
+
+def _strip_year_suffix(title: str) -> str:
+  """Return *title* with a trailing ``(YYYY)`` token removed."""
+  return _TITLE_YEAR_SUFFIX_RE.sub("", title).strip()
+
 # LivingAudio FTP fallback is a private add-on kept off the public repo.
 # When the module is absent, describarr falls back to AudioVault-only and
 # logs a single info-level note on first attempt to use it.
@@ -71,11 +82,13 @@ def process_episode(
         "Looking up: %s S%02dE%02d", series_title, season, episode
     )
 
-    # AudioVault's search breaks on trailing year tokens like "(1998)".
-    search_title = re.sub(r"\s*\(\d{4}\)\s*$", "", series_title).strip()
+    search_title = _strip_year_suffix(series_title)
+    stripped_note = " (year stripped)" if search_title != series_title else ""
     results = client.search_shows(search_title)
     if not results:
-        logger.warning("AudioVault has no results for show: %r", series_title)
+        logger.warning(
+            "AudioVault has no results for show: %r%s", series_title, stripped_note
+        )
         return False
 
     candidates = find_season(results, series_title, season)
@@ -134,9 +147,13 @@ def process_movie(
     """
     logger.info("Looking up movie: %s (%s)", movie_title, movie_year)
 
-    results = client.search_movies(movie_title)
+    search_title = _strip_year_suffix(movie_title)
+    stripped_note = " (year stripped)" if search_title != movie_title else ""
+    results = client.search_movies(search_title)
     if not results:
-        logger.warning("AudioVault has no results for movie: %r", movie_title)
+        logger.warning(
+            "AudioVault has no results for movie: %r%s", movie_title, stripped_note
+        )
         return False
 
     candidates = find_movie(results, movie_title, movie_year)
