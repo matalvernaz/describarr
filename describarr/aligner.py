@@ -372,9 +372,13 @@ def _find_output(video_path: Path, output_dir: Path, min_mtime: float = 0.0) -> 
     stem = video_path.stem
     suffix = video_path.suffix
 
-    # Expected name: ad_{original_stem}{original_ext}
+    # Expected name: ad_{original_stem}{original_ext}.
+    # Filter by min_mtime so a stale file from a previous run that exited
+    # cleanly without producing fresh output (e.g. describealaign's
+    # "output file already exists, skipping..." path) cannot be returned
+    # and overwrite the user's video with a months-old AD merge.
     expected = output_dir / f"{OUTPUT_PREFIX}{stem}{suffix}"
-    if expected.exists():
+    if expected.exists() and expected.stat().st_mtime >= min_mtime:
         if _valid_output(expected):
             return expected
         logger.error(
@@ -386,7 +390,7 @@ def _find_output(video_path: Path, output_dir: Path, min_mtime: float = 0.0) -> 
 
     # describealaign may choose a slightly different extension; scan the dir.
     for candidate in output_dir.glob(f"{OUTPUT_PREFIX}{stem}*"):
-        if candidate.is_file():
+        if candidate.is_file() and candidate.stat().st_mtime >= min_mtime:
             if _valid_output(candidate):
                 return candidate
             logger.error(

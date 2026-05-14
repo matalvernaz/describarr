@@ -76,7 +76,11 @@ class DownloadLimiter:
 
     def _save(self, state: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(state))
+        # Atomic write so a crash mid-write can't reset count back to 0 and
+        # let us double-spend the AudioVault daily quota.
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, self._path)
 
 
 class AudioVaultClient:

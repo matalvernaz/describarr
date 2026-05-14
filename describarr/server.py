@@ -23,23 +23,28 @@ from urllib.parse import parse_qs, urlparse
 from . import notify
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, LoginError
 from .config import Config
+from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
 from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, _safe_dirname
 
 logger = logging.getLogger(__name__)
 
-# Prevent concurrent describealaign runs (CPU/RAM heavy).
-_lock = threading.Lock()
-
 # Shared AudioVault session — created once and reused across all requests.
 _client: Optional[AudioVaultClient] = None
 _client_lock = threading.Lock()
 
-# Shared retry queue.
+# Shared retry queue (items deferred by AudioVault's daily download cap).
 _retry_queue: Optional[RetryQueue] = None
 _retry_queue_lock = threading.Lock()
 
-# Current job being processed (set while _lock is held).
+# Persistent pending queue: every incoming webhook / /retry / /drain request
+# is appended here before responding 202, then drained by a single worker
+# thread. This is what makes container restarts (Watchtower at 04:00, manual
+# `docker compose up -d`, OOM kills) non-destructive — work in flight survives.
+_pending_queue: Optional[PendingQueue] = None
+_pending_queue_lock = threading.Lock()
+
+# Current job being processed (set by the worker as it pops each item).
 _current_job: Optional[dict] = None
 
 
@@ -82,6 +87,19 @@ def _get_retry_queue(config: Config) -> RetryQueue:
         if _retry_queue is None:
             _retry_queue = RetryQueue(config.cache_dir / "retry_queue.json")
     return _retry_queue
+
+
+def _get_pending_queue(config: Config) -> PendingQueue:
+    global _pending_queue
+    with _pending_queue_lock:
+        if _pending_queue is None:
+            _pending_queue = PendingQueue(config.cache_dir / "pending.json")
+    return _pending_queue
+
+
+# Cap on per-item retries before the worker drops a stuck pending item, to
+# stop a truly broken Sonarr/Radarr payload from looping forever.
+_MAX_WORKER_ATTEMPTS = 5
 
 _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
@@ -160,11 +178,13 @@ def serve(port: int = 8686) -> None:
     server = _ThreadingHTTPServer(("0.0.0.0", port), _HookHandler)
     logger.info("describarr webhook server listening on port %d", port)
     threading.Thread(target=_midnight_drain_loop, daemon=True).start()
+    threading.Thread(target=_worker_loop, daemon=True).start()
     server.serve_forever()
 
 
 def _midnight_drain_loop() -> None:
-    """Background thread: drain the retry queue shortly after each midnight."""
+    """Background thread: at 00:05 each day prune old artifacts and enqueue
+    a retry-queue drain for the worker."""
     while True:
         now = datetime.now()
         next_run = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
@@ -176,17 +196,82 @@ def _midnight_drain_loop() -> None:
         except ValueError as exc:
             logger.error("Cannot drain retry queue: %s", exc)
             continue
-        # Prune stale alignment artifacts regardless of whether the retry queue
-        # has anything — the dir accumulates indefinitely without this.
+        # Pruning is read-only relative to the worker (touches a different
+        # subtree) so it's safe to run here without blocking the queue.
         prune_alignment_artifacts(config.cache_dir / "alignments")
 
-        queue = _get_retry_queue(config)
-        if not queue.load():
+        if _get_retry_queue(config).load():
+            _get_pending_queue(config).push({"type": "drain"})
+
+
+def _worker_loop() -> None:
+    """Single-threaded background worker. Pops one pending item at a time and
+    processes it under no lock — being the only consumer of the queue
+    enforces the "one describealaign run at a time" invariant that used to
+    be guarded by an in-memory threading.Lock."""
+    while True:
+        try:
+            config = Config.from_env()
+        except ValueError as exc:
+            logger.error("Worker cannot load config (%s) — pausing 60s.", exc)
+            time.sleep(60)
             continue
-        client = _get_client(config)
-        with _lock:
-            with _set_current_job({"type": "drain", "title": "retry queue drain"}):
-                drain_retry_queue(queue, client, config)
+
+        pending = _get_pending_queue(config)
+        item = pending.pop_first()
+        if item is None:
+            pending.wait_for_item(timeout=10.0)
+            continue
+
+        try:
+            _process_item(item, config, pending)
+        except Exception:
+            logger.error("Worker: unhandled error on item %r", item, exc_info=True)
+
+
+def _process_item(item: dict, config: Config, pending: PendingQueue) -> None:
+    """Dispatch one pending item to its handler."""
+    item_type = item.get("type")
+    handlers = {
+        "hook": _worker_handle_hook,
+        "retry_episode": _worker_handle_retry_episode,
+        "retry_movie": _worker_handle_retry_movie,
+        "retry_dir": _worker_handle_retry_dir,
+        "drain": _worker_handle_drain,
+    }
+    handler = handlers.get(item_type)
+    if handler is None:
+        logger.warning("Unknown pending item type %r — dropping: %r", item_type, item)
+        return
+    try:
+        handler(item, config, pending)
+    except _TRANSIENT_WORKER_ERRORS as exc:
+        attempts = int(item.get("attempts", 0)) + 1
+        if attempts >= _MAX_WORKER_ATTEMPTS:
+            logger.error(
+                "Dropping pending item after %d attempts (%s): %r",
+                attempts, exc, item,
+            )
+            return
+        item["attempts"] = attempts
+        # Push to the BACK so other items get a fair chance to make progress
+        # while this one waits out whatever transient condition tripped it.
+        pending.push(item)
+        logger.warning(
+            "Transient error processing %s (attempt %d/%d), re-queued: %s",
+            item_type, attempts, _MAX_WORKER_ATTEMPTS, exc,
+        )
+
+
+# Errors that should re-queue the pending item rather than drop it. Anything
+# else is treated as a terminal/programming bug and dropped after logging.
+import requests as _requests  # local alias to keep the public import surface clean
+_TRANSIENT_WORKER_ERRORS = (
+    _requests.ConnectionError,
+    _requests.Timeout,
+    ConnectionError,
+    TimeoutError,
+)
 
 
 class _HookHandler(BaseHTTPRequestHandler):
@@ -217,9 +302,7 @@ class _HookHandler(BaseHTTPRequestHandler):
             env = {k: v[0] for k, v in parse_qs(body.decode()).items()}
 
             # "Test" events are synchronous so Sonarr/Radarr show their green
-            # tick when you click "Test" in the UI; real Download events are
-            # offloaded so the arr's Custom Script timeout doesn't fire while
-            # describealaign chews through a 40-minute episode.
+            # tick when you click "Test" in the UI.
             sonarr_event = env.get("sonarr_eventtype", "").lower()
             radarr_event = env.get("radarr_eventtype", "").lower()
             if sonarr_event == "test" or radarr_event == "test":
@@ -227,10 +310,17 @@ class _HookHandler(BaseHTTPRequestHandler):
                 self._respond(200, "OK")
                 return
 
-            threading.Thread(
-                target=_run_hook_in_background, args=(env,), daemon=True
-            ).start()
-            self._respond(202, "Accepted — processing in background.")
+            # Persist the payload BEFORE responding 202. If we crashed/restarted
+            # after responding but before processing, Sonarr would already have
+            # treated the hook as delivered and never retry — the persistent
+            # queue is what saves the work across container lifecycles.
+            try:
+                config = Config.from_env()
+            except ValueError as exc:
+                self._respond(500, str(exc))
+                return
+            _get_pending_queue(config).push({"type": "hook", "env": env})
+            self._respond(202, "Accepted — queued for background processing.")
         elif parsed.path == "/drain":
             self._handle_drain()
         else:
@@ -263,6 +353,7 @@ class _HookHandler(BaseHTTPRequestHandler):
         limit = DownloadLimiter.DAILY_LIMIT
         queue = _get_retry_queue(config)
         queued = len(queue.load())
+        pending = _get_pending_queue(config).size()
         now = datetime.now()
         next_drain = (now + timedelta(days=1)).replace(
             hour=0, minute=5, second=0, microsecond=0
@@ -273,6 +364,7 @@ class _HookHandler(BaseHTTPRequestHandler):
             "limit": limit,
             "remaining": max(0, limit - count),
             "retry_queue": queued,
+            "pending_queue": pending,
             "next_drain": next_drain.strftime("%Y-%m-%dT%H:%M:%S"),
             "current_job": _current_job,
         }
@@ -315,8 +407,8 @@ class _HookHandler(BaseHTTPRequestHandler):
         if not queue.load():
             self._respond(200, "Retry queue is empty — nothing to drain.")
             return
-        threading.Thread(target=_drain_retry_queue_now, daemon=True).start()
-        self._respond(202, "Accepted — draining retry queue in background, check container logs for progress.")
+        _get_pending_queue(config).push({"type": "drain"})
+        self._respond(202, "Accepted — drain queued for the background worker.")
 
     def _handle_retry(self, params: dict) -> None:
         title = params.get("title", "").strip()
@@ -345,6 +437,13 @@ class _HookHandler(BaseHTTPRequestHandler):
             )
             return
 
+        try:
+            config = Config.from_env()
+        except ValueError as exc:
+            self._respond(500, str(exc))
+            return
+        pending = _get_pending_queue(config)
+
         # Single-file retry (one episode or one movie).
         if path_str:
             if season_str and episode_str:
@@ -353,20 +452,23 @@ class _HookHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     self._respond(400, "season and episode must be integers")
                     return
+                pending.push({
+                    "type": "retry_episode",
+                    "title": title,
+                    "path": path_str,
+                    "season": s,
+                    "episode": e,
+                })
                 label = f"S{s:02d}E{e:02d} of {title!r}"
-                threading.Thread(
-                    target=_retry_episode,
-                    args=(title, path_str, season_str, episode_str),
-                    daemon=True,
-                ).start()
             else:
+                pending.push({
+                    "type": "retry_movie",
+                    "title": title,
+                    "path": path_str,
+                    "year": year_str,
+                })
                 year_label = f" ({year_str})" if year_str else ""
                 label = f"movie {title!r}{year_label}"
-                threading.Thread(
-                    target=_retry_movie,
-                    args=(title, path_str, year_str),
-                    daemon=True,
-                ).start()
             self._respond(202, f"Accepted — queued {label}, check container logs for progress")
             return
 
@@ -376,20 +478,20 @@ class _HookHandler(BaseHTTPRequestHandler):
             if not scan_dir.is_dir():
                 self._respond(400, f"Directory does not exist: {dir_str}")
                 return
+            season_filter: Optional[int] = None
             if season_str:
                 try:
                     season_filter = int(season_str)
                 except ValueError:
                     self._respond(400, "season must be an integer")
                     return
-            else:
-                season_filter = None
+            pending.push({
+                "type": "retry_dir",
+                "title": title,
+                "dir": str(scan_dir),
+                "season": season_filter,
+            })
             label = f"season {season_filter} of {title!r}" if season_filter else f"all seasons of {title!r}"
-            threading.Thread(
-                target=_retry_dir,
-                args=(title, scan_dir, season_filter),
-                daemon=True,
-            ).start()
             self._respond(202, f"Accepted — queued {label}, check container logs for progress")
             return
 
@@ -486,6 +588,11 @@ def _render_status_html(data: dict) -> str:
     <h2>Downloads today</h2>
     <div class="value">{data['downloads_today']} <span style="font-size:1rem;color:#888">/ {data['limit']}</span></div>
     <div class="meta">{data['remaining']} remaining</div>
+  </div>
+  <div class="card">
+    <h2>Pending queue</h2>
+    <div class="value">{data['pending_queue']}</div>
+    <div class="meta">Webhooks &amp; retries waiting</div>
   </div>
   <div class="card">
     <h2>Retry queue</h2>
@@ -585,7 +692,7 @@ def _radarr(config: Config, env: dict[str, str]) -> dict | None:
 
 
 # ------------------------------------------------------------------
-# Retry helpers (run in background threads)
+# Worker handlers — called one at a time by _worker_loop, never concurrently.
 # ------------------------------------------------------------------
 
 _OUTCOME_MESSAGES = {
@@ -596,13 +703,14 @@ _OUTCOME_MESSAGES = {
 }
 
 
-def _run_hook_in_background(env: dict[str, str]) -> None:
-    """Process a Sonarr/Radarr Download event off the request thread."""
+def _worker_handle_hook(item: dict, config: Config, pending: PendingQueue) -> None:
+    env = item.get("env", {})
     result: dict | None = None
     errored = False
     try:
-        with _lock:
-            result = _dispatch(env)
+        result = _dispatch(env)
+    except _TRANSIENT_WORKER_ERRORS:
+        raise  # bubble to _process_item so it re-queues
     except Exception:
         logger.error("Unhandled error processing hook.", exc_info=True)
         errored = True
@@ -620,6 +728,133 @@ def _run_hook_in_background(env: dict[str, str]) -> None:
         f"describarr: {result['label']}",
         _OUTCOME_MESSAGES.get(result["outcome"], result["outcome"]),
     )
+
+
+def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQueue) -> None:
+    title = item["title"]
+    path_str = item["path"]
+    try:
+        season = int(item["season"])
+        episode = int(item["episode"])
+    except (KeyError, ValueError):
+        logger.error("retry_episode item malformed: %r", item)
+        return
+
+    video_path = Path(path_str)
+    if not video_path.is_file():
+        logger.error("Retry episode: file not found, dropping: %s", video_path)
+        return
+
+    client = _get_client(config)
+    label = f"{title} S{season:02d}E{episode:02d}"
+    try:
+        with _set_current_job({"type": "episode", "title": title, "season": season, "episode": episode}):
+            described = process_episode(client, config, video_path, title, season, episode)
+    except DailyLimitReached:
+        _get_retry_queue(config).add_episode(title, season, episode, str(video_path))
+        notify.send(f"describarr: {label}", _OUTCOME_MESSAGES["queued"])
+        return
+    outcome = "described" if described else "no_match"
+    notify.send(f"describarr: {label}", _OUTCOME_MESSAGES.get(outcome, outcome))
+
+
+def _worker_handle_retry_movie(item: dict, config: Config, pending: PendingQueue) -> None:
+    title = item["title"]
+    path_str = item["path"]
+    year_str = item.get("year", "") or ""
+
+    video_path = Path(path_str)
+    if not video_path.is_file():
+        logger.error("Retry movie: file not found, dropping: %s", video_path)
+        return
+
+    client = _get_client(config)
+    label = f"{title} ({year_str})" if year_str else title
+    try:
+        with _set_current_job({"type": "movie", "title": title, "year": year_str}):
+            described = process_movie(client, config, video_path, title, year_str)
+    except DailyLimitReached:
+        _get_retry_queue(config).add_movie(title, year_str, str(video_path))
+        notify.send(f"describarr: {label}", _OUTCOME_MESSAGES["queued"])
+        return
+    outcome = "described" if described else "no_match"
+    notify.send(f"describarr: {label}", _OUTCOME_MESSAGES.get(outcome, outcome))
+
+
+def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) -> None:
+    """Expand a directory retry into per-episode pending items.
+
+    Doing the scan from the worker (rather than at request time) keeps the
+    /retry?dir= response fast and means a restart mid-expansion just re-runs
+    the (idempotent) scan once we resume."""
+    title = item["title"]
+    scan_dir = Path(item["dir"])
+    season_filter = item.get("season")
+    if season_filter is not None:
+        try:
+            season_filter = int(season_filter)
+        except (TypeError, ValueError):
+            logger.error("retry_dir item has non-int season: %r", item)
+            return
+
+    if not scan_dir.is_dir():
+        logger.error("Retry dir: directory not found, dropping: %s", scan_dir)
+        return
+
+    video_files = sorted(
+        f for f in scan_dir.rglob("*")
+        if f.is_file() and f.suffix.lower() in _VIDEO_EXTENSIONS
+    )
+    if not video_files:
+        logger.warning("No video files found in %s", scan_dir)
+        return
+
+    show_cache_dir = config.cache_dir / "shows" / _safe_dirname(title)
+    queued = 0
+    skipped = 0
+    for video_path in video_files:
+        m = _EPISODE_RE.search(video_path.name)
+        if not m:
+            logger.warning("Could not parse SxxExx from %s — skipping", video_path.name)
+            continue
+        season = int(m.group(1))
+        episode = int(m.group(2))
+        if season_filter is not None and season != season_filter:
+            continue
+
+        done_path = show_cache_dir / f".done_s{season:02d}.json"
+        if done_path.exists():
+            try:
+                raw = json.loads(done_path.read_text())
+                done = set(raw) if isinstance(raw, list) else set(raw.get("done", []))
+                if episode in done:
+                    skipped += 1
+                    continue
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        pending.push({
+            "type": "retry_episode",
+            "title": title,
+            "path": str(video_path),
+            "season": season,
+            "episode": episode,
+        })
+        queued += 1
+
+    logger.info(
+        "Retry dir %s: queued %d episode(s), skipped %d already-done.",
+        scan_dir, queued, skipped,
+    )
+
+
+def _worker_handle_drain(item: dict, config: Config, pending: PendingQueue) -> None:
+    queue = _get_retry_queue(config)
+    if not queue.load():
+        return
+    client = _get_client(config)
+    with _set_current_job({"type": "drain", "title": "retry queue drain"}):
+        drain_retry_queue(queue, client, config)
 
 
 def _label_from_env(env: dict[str, str]) -> str | None:
@@ -641,112 +876,3 @@ def _label_from_env(env: dict[str, str]) -> str | None:
             return f"{title} ({year})"
         return title or None
     return None
-
-
-def _drain_retry_queue_now() -> None:
-    """Drain the retry queue immediately (manual /drain trigger)."""
-    try:
-        config = Config.from_env()
-    except ValueError as exc:
-        logger.error("Cannot drain retry queue: %s", exc)
-        return
-    queue = _get_retry_queue(config)
-    if not queue.load():
-        return
-    client = _get_client(config)
-    with _lock:
-        with _set_current_job({"type": "drain", "title": "retry queue drain"}):
-            drain_retry_queue(queue, client, config)
-
-
-def _retry_episode(title: str, path_str: str, season_str: str, episode_str: str) -> None:
-    try:
-        config = Config.from_env()
-    except ValueError as exc:
-        logger.error("%s", exc)
-        return
-
-    video_path = Path(path_str)
-    if not video_path.is_file():
-        logger.error("Video file does not exist: %s", video_path)
-        return
-
-    try:
-        season = int(season_str)
-        episode = int(episode_str)
-    except ValueError:
-        logger.error("Could not parse season/episode: %r / %r", season_str, episode_str)
-        return
-
-    client = _get_client(config)
-    with _lock:
-        with _set_current_job({"type": "episode", "title": title, "season": season, "episode": episode}):
-            process_episode(client, config, video_path, title, season, episode)
-
-
-def _retry_movie(title: str, path_str: str, year_str: str) -> None:
-    try:
-        config = Config.from_env()
-    except ValueError as exc:
-        logger.error("%s", exc)
-        return
-
-    video_path = Path(path_str)
-    if not video_path.is_file():
-        logger.error("Video file does not exist: %s", video_path)
-        return
-
-    client = _get_client(config)
-    with _lock:
-        with _set_current_job({"type": "movie", "title": title, "year": year_str}):
-            process_movie(client, config, video_path, title, year_str)
-
-
-def _retry_dir(title: str, scan_dir: Path, season_filter: int | None) -> None:
-    try:
-        config = Config.from_env()
-    except ValueError as exc:
-        logger.error("%s", exc)
-        return
-
-    client = _get_client(config)
-
-    video_files = sorted(
-        f for f in scan_dir.rglob("*")
-        if f.is_file() and f.suffix.lower() in _VIDEO_EXTENSIONS
-    )
-
-    if not video_files:
-        logger.warning("No video files found in %s", scan_dir)
-        return
-
-    show_cache_dir = config.cache_dir / "shows" / _safe_dirname(title)
-
-    for video_path in video_files:
-        m = _EPISODE_RE.search(video_path.name)
-        if not m:
-            logger.warning("Could not parse SxxExx from %s — skipping", video_path.name)
-            continue
-        season = int(m.group(1))
-        episode = int(m.group(2))
-        if season_filter is not None and season != season_filter:
-            continue
-
-        # Skip episodes already successfully processed, so a re-trigger after
-        # restart doesn't re-embed the AD track on top of already-merged files.
-        done_path = show_cache_dir / f".done_s{season:02d}.json"
-        if done_path.exists():
-            try:
-                raw = json.loads(done_path.read_text())
-                done = set(raw) if isinstance(raw, list) else set(raw.get("done", []))
-                if episode in done:
-                    logger.info(
-                        "Skipping S%02dE%02d — already in done list.", season, episode
-                    )
-                    continue
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        with _lock:
-            with _set_current_job({"type": "episode", "title": title, "season": season, "episode": episode}):
-                process_episode(client, config, video_path, title, season, episode)

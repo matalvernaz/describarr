@@ -19,11 +19,27 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import requests
+
 from .aligner import run as align, parse_score, content_score, slope_stability, sync_quality
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
 from .matcher import extract_episode, find_movie, find_season
 from .retry_queue import RetryQueue
+
+# Errors we treat as transient (re-queue and retry on next drain).
+# AudioVault occasional 5xx, a flaky Cloudflare edge, or a stalled CDN
+# read should not silently lose the queued item.
+_TRANSIENT_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    ConnectionError,
+    TimeoutError,
+)
+
+# After this many failed drain attempts the item is dropped — protects against
+# truly bad URLs that would otherwise loop forever.
+_MAX_DRAIN_ATTEMPTS = 5
 
 # LivingAudio FTP fallback is a private add-on kept off the public repo.
 # When the module is absent, describarr falls back to AudioVault-only and
@@ -239,7 +255,12 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     except Exception:
         tmp_dest.unlink(missing_ok=True)
         raise
-    else:
+    finally:
+        # The combined file is the output_dir cached AD-merged copy; whether the
+        # in-place replace succeeded or failed, we don't want a 1-2 GB orphan
+        # sitting in the cache forever. If the replace failed the caller will
+        # see the original video untouched and can retry, which re-runs the
+        # alignment from scratch.
         combined.unlink(missing_ok=True)
 
     if not sync_ok:
@@ -298,9 +319,17 @@ def _get_cached(
     file_path = client.download(url, cache_dir)
 
     manifest[url] = str(file_path)
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+    _atomic_write_json(manifest_path, manifest)
 
     return file_path
+
+
+def _atomic_write_json(path: Path, obj) -> None:
+    """Write JSON via .tmp + os.replace so a crash mid-write can't corrupt
+    the destination. Used for manifests, done-lists, and similar state."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    os.replace(tmp, path)
 
 
 def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Config) -> None:
@@ -309,6 +338,10 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
 
     Stops as soon as the limit is hit again, leaving remaining items in the
     queue for the next day.
+
+    Transient network errors re-queue the item with an attempt counter so a
+    flaky AudioVault response can't silently drop a Sonarr-queued episode;
+    items that hit `_MAX_DRAIN_ATTEMPTS` consecutive failures are dropped.
     """
     items = queue.load()
     if not items:
@@ -342,6 +375,43 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                 "Daily limit hit during queue drain — %d item(s) remain queued.",
                 len(items) - items.index(item),
             )
+        except _TRANSIENT_ERRORS as exc:
+            attempts = int(item.get("drain_attempts", 0)) + 1
+            if attempts >= _MAX_DRAIN_ATTEMPTS:
+                logger.error(
+                    "Queued item %s failed %d consecutive drain attempts — dropping. Last error: %s",
+                    item["video_path"], attempts, exc,
+                )
+            else:
+                item["drain_attempts"] = attempts
+                remaining.append(item)
+                logger.warning(
+                    "Transient error draining %s (attempt %d/%d), re-queueing: %s",
+                    item["video_path"], attempts, _MAX_DRAIN_ATTEMPTS, exc,
+                )
+        except requests.HTTPError as exc:
+            # 5xx is transient (AudioVault overloaded / Cloudflare 502); 4xx is
+            # terminal (auth/permission/not-found) and not worth retrying.
+            status = getattr(exc.response, "status_code", 0) or 0
+            if 500 <= status < 600:
+                attempts = int(item.get("drain_attempts", 0)) + 1
+                if attempts >= _MAX_DRAIN_ATTEMPTS:
+                    logger.error(
+                        "Queued item %s got HTTP %d for %d attempts — dropping.",
+                        item["video_path"], status, attempts,
+                    )
+                else:
+                    item["drain_attempts"] = attempts
+                    remaining.append(item)
+                    logger.warning(
+                        "HTTP %d on drain of %s (attempt %d/%d), re-queueing.",
+                        status, item["video_path"], attempts, _MAX_DRAIN_ATTEMPTS,
+                    )
+            else:
+                logger.error(
+                    "Terminal HTTP %d for queued item %s — dropping.",
+                    status, item["video_path"],
+                )
         except Exception:
             logger.error(
                 "Unexpected error processing queued item %s — dropping.",
@@ -439,7 +509,7 @@ def _mark_episode_done(
         ])
 
     season_dir.mkdir(parents=True, exist_ok=True)
-    progress_path.write_text(json.dumps({"total": stored_total, "done": sorted(done)}))
+    _atomic_write_json(progress_path, {"total": stored_total, "done": sorted(done)})
 
     if stored_total > 0 and len(done) >= stored_total:
         logger.info(
@@ -452,7 +522,7 @@ def _mark_episode_done(
             try:
                 manifest = json.loads(manifest_path.read_text())
                 manifest = {k: v for k, v in manifest.items() if Path(v) != zip_path}
-                manifest_path.write_text(json.dumps(manifest, indent=2))
+                _atomic_write_json(manifest_path, manifest)
             except (json.JSONDecodeError, KeyError):
                 pass
         # Delete the extracted dirs and progress file for this season.

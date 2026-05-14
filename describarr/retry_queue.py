@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write *content* to *path* via a sibling .tmp + os.replace, so a crash
+    mid-write cannot leave a half-written/corrupt file at the destination."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    os.replace(tmp, path)
 
 
 class RetryQueue:
@@ -46,7 +55,7 @@ class RetryQueue:
 
     def save(self, items: list[dict]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(items, indent=2))
+        _atomic_write_text(self._path, json.dumps(items, indent=2))
 
     def clear(self) -> None:
         self._path.unlink(missing_ok=True)
