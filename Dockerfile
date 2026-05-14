@@ -7,14 +7,16 @@ WORKDIR /app
 
 # Install describealaign (Matt's fork of describealign). Carries the
 # seam-crossfade fix, slope-stability metric, PAL/NTSC pre-resample,
-# parsed-audio cache, and structured --json output. Renamed at v3.0.0.
+# parsed-audio cache, and structured --json output. matplotlib is
+# intentionally omitted: v2.1.2+ skips the PNG plot when matplotlib is
+# missing, and describarr only consumes the .txt/.json reports.
 RUN pip install --no-cache-dir \
     requests beautifulsoup4 python-dotenv \
-    "ffmpeg-python~=0.2.0" "static-ffmpeg~=3.0" "matplotlib~=3.9" \
+    "ffmpeg-python~=0.2.0" "static-ffmpeg~=3.0" \
     "numpy<3.0,>=1.21" "scipy~=1.10" "platformdirs~=4.2" \
     "natsort~=8.4.0" "sortedcontainers~=2.4.0" future \
     && pip install --no-cache-dir --no-deps \
-        "git+https://github.com/matalvernaz/describealaign.git@v2.1.1"
+        "git+https://github.com/matalvernaz/describealaign.git@v2.1.3"
 
 COPY . .
 RUN pip install --no-cache-dir --no-deps .
