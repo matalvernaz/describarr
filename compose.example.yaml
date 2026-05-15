@@ -1,6 +1,6 @@
 services:
   describarr:
-    build: .
+    image: ghcr.io/matalvernaz/describarr:latest
     container_name: describarr
     environment:
       - AUDIOVAULT_EMAIL=${AUDIOVAULT_EMAIL}
