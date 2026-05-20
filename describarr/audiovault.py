@@ -9,6 +9,7 @@ import re
 from datetime import date
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,6 +17,17 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://audiovault.net"
+
+
+def _is_login_url(url: str) -> bool:
+    """True iff *url* is the AudioVault login endpoint, with or without
+    query string. ``url.endswith("/login")`` alone misses ``/login?next=…``
+    and silently caches the login page as media."""
+    try:
+        path = urlparse(url).path
+    except ValueError:
+        return False
+    return path.rstrip("/").endswith("/login")
 
 # Mimic a real Firefox request so the server doesn't reject us outright.
 _HEADERS = {
@@ -65,6 +77,19 @@ class DownloadLimiter:
         logger.info(
             "AudioVault downloads today: %d/%d", state["count"], self.DAILY_LIMIT
         )
+
+    def would_exceed(self) -> bool:
+        """Return True iff a fresh increment right now would hit the cap.
+
+        Used by callers that want to pre-flight a slot without consuming it,
+        so a transient network error during the actual download doesn't
+        burn one of the 25 daily AudioVault slots.
+        """
+        today = date.today().isoformat()
+        state = self._load()
+        if state.get("date") != today:
+            return False
+        return int(state.get("count", 0)) >= self.DAILY_LIMIT
 
     def _load(self) -> dict:
         if self._path.exists():
@@ -123,7 +148,7 @@ class AudioVaultClient:
         resp.raise_for_status()
 
         # A successful login redirects away from /login.
-        if resp.url.rstrip("/").endswith("/login"):
+        if _is_login_url(resp.url):
             raise LoginError(
                 "Login failed — check your AUDIOVAULT_EMAIL and AUDIOVAULT_PASSWORD."
             )
@@ -156,7 +181,7 @@ class AudioVaultClient:
             timeout=30,
         )
         resp.raise_for_status()
-        if resp.url.rstrip("/").endswith("/login"):
+        if _is_login_url(resp.url):
             self._relogin()
             resp = self._session.get(
                 f"{BASE_URL}{path}",
@@ -164,7 +189,7 @@ class AudioVaultClient:
                 timeout=30,
             )
             resp.raise_for_status()
-            if resp.url.rstrip("/").endswith("/login"):
+            if _is_login_url(resp.url):
                 logger.error(
                     "AudioVault search failed after re-login — credentials may be invalid."
                 )
@@ -199,8 +224,15 @@ class AudioVaultClient:
             else:
                 filename = url.rstrip("/").split("/")[-1]
 
+            # Defeat path traversal: `Path(...).name` drops every parent
+            # component, so a malicious Content-Disposition like
+            # `filename=../../etc/passwd` becomes `passwd`. Doing this BEFORE
+            # the character sanitiser also strips Windows drive prefixes.
+            filename = Path(filename).name
             # Sanitise the filename so it is safe for all filesystems.
             filename = re.sub(r'[\\/:*?"<>|]', "_", filename)
+            if not filename:
+                filename = "audiovault_download.bin"
             dest = dest_dir / filename
             tmp = dest.with_suffix(dest.suffix + ".part")
 
@@ -224,7 +256,7 @@ class AudioVaultClient:
         cache file.
         """
         resp = self._session.get(url, **kwargs)
-        if resp.url.rstrip("/").endswith("/login"):
+        if _is_login_url(resp.url):
             resp.close()
             self._relogin()
             resp = self._session.get(url, **kwargs)

@@ -650,18 +650,41 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
 
     try:
         season = int(season_str)
-        episode = int(episode_str.split(",")[0].strip())
     except ValueError:
-        logger.error("Could not parse season/episode: %r / %r", season_str, episode_str)
+        logger.error("Could not parse season: %r", season_str)
         return None
 
-    label = f"{series_title} S{season:02d}E{episode:02d}"
+    # Sonarr sends a comma-separated list when one file holds multiple episodes
+    # (e.g. an S01E01E02 double-length). We need to mark every covered episode
+    # as described/queued, not just the first one.
+    try:
+        episodes = [int(part.strip()) for part in episode_str.split(",") if part.strip()]
+    except ValueError:
+        logger.error("Could not parse episode list: %r", episode_str)
+        return None
+    if not episodes:
+        logger.error("No episode numbers in Sonarr payload: %r", episode_str)
+        return None
+
+    primary_episode = episodes[0]
+    extra_episodes = episodes[1:]
+    if not extra_episodes:
+        label = f"{series_title} S{season:02d}E{primary_episode:02d}"
+    else:
+        ep_label = "".join(f"E{e:02d}" for e in episodes)
+        label = f"{series_title} S{season:02d}{ep_label}"
+
     client = _get_client(config)
     try:
-        with _set_current_job({"type": "episode", "title": series_title, "season": season, "episode": episode}):
-            described = process_episode(client, config, video_path, series_title, season, episode)
+        with _set_current_job({"type": "episode", "title": series_title, "season": season, "episode": primary_episode}):
+            described = process_episode(
+                client, config, video_path,
+                series_title, season, primary_episode,
+                extra_episodes=extra_episodes,
+            )
     except DailyLimitReached:
-        _get_retry_queue(config).add_episode(series_title, season, episode, str(video_path))
+        for ep in episodes:
+            _get_retry_queue(config).add_episode(series_title, season, ep, str(video_path))
         return {"label": label, "outcome": "queued"}
     return {"label": label, "outcome": "described" if described else "no_match"}
 

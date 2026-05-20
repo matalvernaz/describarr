@@ -1,9 +1,15 @@
 """
 Wrapper around the describealaign CLI.
 
-describealaign is invoked as a subprocess so that:
+describealaign is invoked as a subprocess in its own session so that:
   - its own stdout/stderr are captured and logged,
-  - import-time side-effects (wxPython GUI init, etc.) don't affect us.
+  - import-time side-effects (wxPython GUI init, etc.) don't affect us,
+  - on timeout we can kill the *whole process group* and avoid orphaning
+    the ffmpeg children that describealaign spawns.
+
+Each run gets a fresh per-run output directory (``output_dir/run-<uuid>``)
+so the alignment of one show can never see, or be confused by, the
+in-flight or stale output of any other run.
 
 The alignment score is read from the .txt report that describealaign writes
 alongside its PNG plot in alignment_dir.
@@ -13,10 +19,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -25,9 +35,8 @@ logger = logging.getLogger(__name__)
 # describealaign prefixes output filenames with this by default.
 OUTPUT_PREFIX = "ad_"
 
-# Any legitimate combined video is at least this large. Describealaign
-# occasionally crashes after creating an empty / header-only stub; we reject
-# those rather than overwriting the original video with a truncated file.
+# Below this size we never even bother running ffprobe — the file is
+# obviously truncated. The real validation lives in _validate_media_output.
 _MIN_OUTPUT_BYTES = 1_000_000  # 1 MB
 
 # Matches rate-change lines in describealaign .txt reports, e.g.:
@@ -46,6 +55,12 @@ _TRUNK_RE = re.compile(r"Stable Trunk Fraction:\s+([-\d.]+)%")
 # pre-2.1.1 reports. Matches the constant inside describealaign so the two
 # implementations stay in lockstep.
 _STABLE_RATE_TOLERANCE_PP = 0.3
+
+# Subprocess timeout: 1 hour is enough for everything Matt has thrown at
+# describealaign so far (3-hour PAL BluRay films come in under 30 minutes).
+_SUBPROCESS_TIMEOUT_SEC = 3600
+# Grace window between SIGTERM and SIGKILL when we kill a runaway subprocess.
+_SUBPROCESS_KILL_GRACE_SEC = 15
 
 
 def _read_metrics(report: Optional[Path]) -> Optional[dict]:
@@ -125,17 +140,27 @@ def run(
     """
     Run describealaign on *video_path* + *audio_path*.
 
-    Returns an :class:`AlignResult` with the combined output and report paths,
-    or ``None`` if the run failed.  Both paths are filtered to files created
-    during this run, so a stale leftover from an earlier run for a different
-    video can never be returned.
+    The combined output is written into a fresh subdirectory
+    ``output_dir/run-<uuid>`` and validated before being returned, so a
+    crashed previous run can never leak into this run's output discovery,
+    and a structurally broken output can never be returned to the caller.
+
+    Returns an :class:`AlignResult` with the combined output and report
+    paths, or ``None`` if the run failed validation.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     alignment_dir.mkdir(parents=True, exist_ok=True)
 
+    # Per-run scratch directory. Isolated from any other run so:
+    #   - orphan ffmpeg from a previous timed-out run can't pollute discovery
+    #   - we can clean up the whole tree at the end without touching peers
+    run_id = uuid.uuid4().hex
+    run_output_dir = output_dir / f"run-{run_id}"
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+
     # Record the wall-clock time just before we launch the subprocess so that
-    # _find_output can reject any files that pre-date this run (stale outputs
-    # left over from a previous failed run).
+    # _find_output can reject any files that pre-date this run (defence in
+    # depth — the per-run dir already guarantees no cross-run contamination).
     run_start = time.time()
 
     cmd = [
@@ -143,7 +168,7 @@ def run(
         str(video_path),
         str(audio_path),
         "--yes",
-        "--output_dir", str(output_dir),
+        "--output_dir", str(run_output_dir),
         "--alignment_dir", str(alignment_dir),
     ]
     if stretch_audio:
@@ -152,37 +177,96 @@ def run(
     logger.info("Running describealaign: %s", " ".join(cmd))
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=3600,  # 1-hour hard cap
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("describealaign timed out after 1 hour.")
-        return None
+        returncode, stdout, stderr = _run_subprocess(cmd)
     except FileNotFoundError:
         logger.error(
             "describealaign not found. Install it with: pip install describealaign"
         )
+        _cleanup_run_dir(run_output_dir)
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error(
+            "describealaign timed out after %d seconds — process group killed.",
+            _SUBPROCESS_TIMEOUT_SEC,
+        )
+        _cleanup_run_dir(run_output_dir)
         return None
 
-    if result.stdout:
-        for line in result.stdout.splitlines():
+    if stdout:
+        for line in stdout.splitlines():
             logger.debug("[describealaign] %s", line)
-    if result.stderr:
-        for line in result.stderr.splitlines():
+    if stderr:
+        for line in stderr.splitlines():
             logger.debug("[describealaign stderr] %s", line)
 
-    if result.returncode != 0:
-        logger.error("describealaign exited with code %d.", result.returncode)
+    if returncode != 0:
+        logger.error("describealaign exited with code %d.", returncode)
+        _cleanup_run_dir(run_output_dir)
         return None
 
-    output = _find_output(video_path, output_dir, run_start)
+    output = _find_output(video_path, run_output_dir, run_start)
     if output is None:
+        _cleanup_run_dir(run_output_dir)
         return None
+
+    if not _validate_media_output(video_path, output):
+        # The output is structurally broken — refuse to publish it.
+        _cleanup_run_dir(run_output_dir)
+        return None
+
     report = _find_report(video_path, alignment_dir, min_mtime=run_start)
+    # NOTE: caller is responsible for cleaning up `output` (and its parent
+    # run dir) after copying. We can't blow away the run dir here without
+    # making the caller copy first; that contract is documented in workflow.
     return AlignResult(output=output, report=report)
+
+
+def _run_subprocess(cmd: list[str]) -> tuple[int, str, str]:
+    """
+    Run describealaign in its own session so a timeout can kill the *whole*
+    process group (describealaign + every ffmpeg child it spawned).
+
+    Returns ``(returncode, stdout, stderr)``. Raises
+    :class:`subprocess.TimeoutExpired` if the overall budget is exceeded
+    after the kill-grace window — the caller treats that as a failed run.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,  # new session => unique process group
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=_SUBPROCESS_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        # SIGTERM the whole tree; if it hasn't exited after the grace window,
+        # SIGKILL it. Either way reap the child so we don't leak a zombie.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=_SUBPROCESS_KILL_GRACE_SEC)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=_SUBPROCESS_KILL_GRACE_SEC)
+            except subprocess.TimeoutExpired:
+                # Truly stuck — proc.wait would block forever. Re-raise so
+                # the caller reports a timeout (the kernel will eventually
+                # reap the orphan).
+                raise
+        raise subprocess.TimeoutExpired(cmd, _SUBPROCESS_TIMEOUT_SEC, output=stdout, stderr=stderr)
+    return proc.returncode, stdout or "", stderr or ""
+
+
+def _cleanup_run_dir(run_output_dir: Path) -> None:
+    """Best-effort recursive delete of a per-run scratch directory."""
+    shutil.rmtree(run_output_dir, ignore_errors=True)
 
 
 def _find_report(
@@ -194,7 +278,8 @@ def _find_report(
 
     *min_mtime* filters out stale reports left behind by earlier runs against
     other videos — important when the same alignment_dir is reused across
-    every run (which is the default).
+    every run (which is the default; alignment_dir is shared so the prune
+    job can age it out by mtime).
     """
     candidates = [
         p for p in alignment_dir.glob("*.txt")
@@ -356,59 +441,261 @@ def _parse_tc(tc: str) -> float:
 
 
 # ------------------------------------------------------------------
-# Helpers
+# Output discovery + media validation
 # ------------------------------------------------------------------
 
-def _valid_output(path: Path) -> bool:
-    """Return True if *path* looks like a real combined video (not a truncated stub)."""
+def _find_output(video_path: Path, run_output_dir: Path, min_mtime: float = 0.0) -> Optional[Path]:
+    """Return the *exact* expected describealaign output, or None.
+
+    No glob fallback, no "newest file in dir" guesswork. If the expected
+    ``ad_<stem><ext>`` file doesn't exist (or is older than this run, or is
+    obviously a truncated stub), we return None and the caller treats the
+    run as a failure rather than publishing something arbitrary.
+    """
+    expected = run_output_dir / f"{OUTPUT_PREFIX}{video_path.stem}{video_path.suffix}"
+    if not expected.exists():
+        logger.error("Expected describealaign output missing: %s", expected)
+        return None
     try:
-        return path.stat().st_size >= _MIN_OUTPUT_BYTES
-    except OSError:
-        return False
-
-
-def _find_output(video_path: Path, output_dir: Path, min_mtime: float = 0.0) -> Optional[Path]:
-    """Locate the combined file that describealaign created in output_dir."""
-    stem = video_path.stem
-    suffix = video_path.suffix
-
-    # Expected name: ad_{original_stem}{original_ext}.
-    # Filter by min_mtime so a stale file from a previous run that exited
-    # cleanly without producing fresh output (e.g. describealaign's
-    # "output file already exists, skipping..." path) cannot be returned
-    # and overwrite the user's video with a months-old AD merge.
-    expected = output_dir / f"{OUTPUT_PREFIX}{stem}{suffix}"
-    if expected.exists() and expected.stat().st_mtime >= min_mtime:
-        if _valid_output(expected):
-            return expected
+        st = expected.stat()
+    except OSError as exc:
+        logger.error("Cannot stat expected output %s: %s", expected, exc)
+        return None
+    if st.st_mtime < min_mtime:
         logger.error(
-            "Output file %s is only %d bytes — describealaign likely crashed mid-write; "
-            "discarding to avoid overwriting the original video with a stub.",
-            expected.name, expected.stat().st_size,
+            "Expected output %s is older than this run (mtime %.0f < %.0f) — refusing.",
+            expected, st.st_mtime, min_mtime,
         )
         return None
+    if st.st_size < _MIN_OUTPUT_BYTES:
+        logger.error(
+            "Output file %s is only %d bytes — describealaign likely crashed mid-write.",
+            expected.name, st.st_size,
+        )
+        return None
+    return expected
 
-    # describealaign may choose a slightly different extension; scan the dir.
-    for candidate in output_dir.glob(f"{OUTPUT_PREFIX}{stem}*"):
-        if candidate.is_file() and candidate.stat().st_mtime >= min_mtime:
-            if _valid_output(candidate):
-                return candidate
-            logger.error(
-                "Output candidate %s is only %d bytes — skipping.",
-                candidate.name, candidate.stat().st_size,
-            )
 
-    # Last resort: newest file in output_dir that was created during this run.
-    # Filtering by min_mtime prevents returning a stale file left over from a
-    # previous run when the current run produced no output.
-    files = [
-        f for f in output_dir.iterdir()
-        if f.is_file() and f.stat().st_mtime >= min_mtime and _valid_output(f)
+# Container/codec validation thresholds.
+_PACKET_RATIO_FLOOR = 0.95          # max fractional packet loss tolerated
+_MAX_MISSING_SECONDS_OF_VIDEO = 10  # absolute floor — never lose more than ~10 s of video
+_FFPROBE_TIMEOUT_SEC = 120          # long enough for a packet-count scan on a 4 GB BluRay
+
+
+def _ffprobe_json(path: Path, extra_args: Optional[list[str]] = None) -> Optional[dict]:
+    """Run ffprobe on *path* and return the parsed JSON, or None on failure."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
     ]
-    if files:
-        newest = max(files, key=lambda f: f.stat().st_mtime)
-        logger.warning("Using newest output file as fallback: %s", newest.name)
-        return newest
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd.append(str(path))
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=_FFPROBE_TIMEOUT_SEC, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("ffprobe failed on %s: %s", path, exc)
+        return None
+    if proc.returncode != 0:
+        logger.warning("ffprobe returned %d for %s: %s", proc.returncode, path, proc.stderr.strip())
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        logger.warning("ffprobe JSON parse failed for %s: %s", path, exc)
+        return None
 
-    logger.error("No valid output file found in %s after describealaign run.", output_dir)
+
+def _primary_video_stream(probe: dict) -> Optional[dict]:
+    for s in probe.get("streams", []):
+        if s.get("codec_type") == "video" and s.get("codec_name") not in {"mjpeg", "png", "bmp", "gif"}:
+            # mjpeg/png/etc. in a video stream slot are usually cover art, not real video.
+            return s
     return None
+
+
+def _audio_stream_count(probe: dict) -> int:
+    return sum(1 for s in probe.get("streams", []) if s.get("codec_type") == "audio")
+
+
+def _container_duration(probe: dict) -> Optional[float]:
+    fmt = probe.get("format") or {}
+    raw = fmt.get("duration")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_fps(stream: dict) -> float:
+    """Best-effort frame rate parse from an ffprobe video stream dict."""
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        raw = stream.get(key)
+        if not raw or raw == "0/0":
+            continue
+        try:
+            if "/" in raw:
+                num, den = raw.split("/", 1)
+                fps = float(num) / float(den)
+            else:
+                fps = float(raw)
+            if 1.0 <= fps <= 240.0:
+                return fps
+        except (ValueError, ZeroDivisionError):
+            continue
+    return 24.0  # film-rate default; conservative for the absolute-loss floor
+
+
+def _video_packet_count(path: Path) -> Optional[int]:
+    """Number of packets in the primary video stream of *path*.
+
+    Returns None on probe failure rather than 0, so the caller can
+    distinguish "actually empty stream" (0) from "couldn't tell" (None) and
+    treat the latter as a validation failure.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-count_packets",
+        "-show_entries", "stream=nb_read_packets",
+        "-print_format", "json",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=_FFPROBE_TIMEOUT_SEC, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("ffprobe -count_packets failed on %s: %s", path, exc)
+        return None
+    if proc.returncode != 0:
+        logger.warning(
+            "ffprobe -count_packets returned %d for %s: %s",
+            proc.returncode, path, proc.stderr.strip(),
+        )
+        return None
+    try:
+        data = json.loads(proc.stdout)
+        nb = data["streams"][0]["nb_read_packets"]
+        return int(nb)
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+        logger.warning("ffprobe packet count parse failed for %s: %s", path, exc)
+        return None
+
+
+def _validate_media_output(source: Path, output: Path) -> bool:
+    """
+    Validate that *output* is structurally sound enough to overwrite *source*.
+
+    Returns True if every gate passes. On any failure, logs why and returns
+    False — the caller treats that as a discarded alignment.
+
+    Gates:
+      1. ffprobe both files cleanly.
+      2. Output has a real video stream with matching codec/width/height.
+      3. Output has at least source's audio stream count + 1 (the AD track).
+      4. Output container duration is within tolerance of source.
+      5. Output video packet count is within tolerance of source — both a
+         relative ratio (≥95%) AND an absolute floor (lose no more than ~10 s
+         worth of frames). Catches truncation that duration alone misses
+         (e.g. a container header that claims the right duration but only
+         has 3 s of video packets in it).
+    """
+    src_probe = _ffprobe_json(source)
+    if src_probe is None:
+        logger.error("Cannot ffprobe source video %s — refusing to publish output.", source)
+        return False
+    out_probe = _ffprobe_json(output)
+    if out_probe is None:
+        logger.error("Cannot ffprobe alignment output %s — refusing to publish.", output)
+        return False
+
+    src_video = _primary_video_stream(src_probe)
+    out_video = _primary_video_stream(out_probe)
+    if src_video is None:
+        logger.error("Source has no primary video stream: %s", source)
+        return False
+    if out_video is None:
+        logger.error("Output has no primary video stream: %s", output)
+        return False
+
+    # Stream-copy preserves codec and dimensions; if any of these change,
+    # something has gone deeply wrong.
+    for key in ("codec_name", "width", "height"):
+        if src_video.get(key) != out_video.get(key):
+            logger.error(
+                "Output video %s mismatch: source=%r output=%r",
+                key, src_video.get(key), out_video.get(key),
+            )
+            return False
+
+    src_audio = _audio_stream_count(src_probe)
+    out_audio = _audio_stream_count(out_probe)
+    expected_audio = max(1, src_audio + 1)  # AD track on top of whatever was there
+    if out_audio < expected_audio:
+        logger.error(
+            "Output audio stream count %d < expected %d (source had %d).",
+            out_audio, expected_audio, src_audio,
+        )
+        return False
+
+    src_duration = _container_duration(src_probe)
+    out_duration = _container_duration(out_probe)
+    if src_duration is None or out_duration is None:
+        logger.warning(
+            "Could not read container duration (src=%r out=%r); skipping duration gate.",
+            src_duration, out_duration,
+        )
+    else:
+        lower_tol = max(5.0, min(30.0, src_duration * 0.005))
+        upper_tol = max(30.0, min(120.0, src_duration * 0.02))
+        if out_duration < src_duration - lower_tol:
+            logger.error(
+                "Output duration %.1fs is too short (source %.1fs, tolerance -%.1fs).",
+                out_duration, src_duration, lower_tol,
+            )
+            return False
+        if out_duration > src_duration + upper_tol:
+            logger.error(
+                "Output duration %.1fs is too long (source %.1fs, tolerance +%.1fs).",
+                out_duration, src_duration, upper_tol,
+            )
+            return False
+
+    src_packets = _video_packet_count(source)
+    out_packets = _video_packet_count(output)
+    if src_packets is None or out_packets is None:
+        logger.error(
+            "Could not packet-count one of the files (src=%r out=%r) — refusing to publish.",
+            src_packets, out_packets,
+        )
+        return False
+    fps = _parse_fps(src_video)
+    abs_loss_packets = max(1, int(fps * _MAX_MISSING_SECONDS_OF_VIDEO))
+    required = max(int(src_packets * _PACKET_RATIO_FLOOR), src_packets - abs_loss_packets)
+    if out_packets < required:
+        logger.error(
+            "Output has %d video packets, need ≥ %d (source %d, fps %.2f, "
+            "ratio floor %.2f, absolute loss floor %ds=%d packets).",
+            out_packets, required, src_packets, fps,
+            _PACKET_RATIO_FLOOR, _MAX_MISSING_SECONDS_OF_VIDEO, abs_loss_packets,
+        )
+        return False
+
+    logger.info(
+        "Output validation passed: codec=%s %dx%d audio=%d→%d duration=%.1fs packets=%d→%d (%.1f%%)",
+        out_video.get("codec_name"), out_video.get("width"), out_video.get("height"),
+        src_audio, out_audio, out_duration or -1.0,
+        src_packets, out_packets, 100.0 * out_packets / max(1, src_packets),
+    )
+    return True

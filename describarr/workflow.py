@@ -10,12 +10,15 @@ Each function:
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import logging
 import os
 import re
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -72,15 +75,25 @@ def process_episode(
     series_title: str,
     season: int,
     episode: int,
+    extra_episodes: Optional[list[int]] = None,
 ) -> bool:
     """
     Find and align the audio description for a single TV episode.
 
+    *extra_episodes* covers Sonarr's multi-episode files (S01E01E02 etc.):
+    one alignment runs against the primary *episode*'s AD audio, but every
+    episode in ``[episode] + extra_episodes`` is recorded in the season's
+    ``.done_sNN.json`` so the AudioVault zip-cleanup logic doesn't wait
+    forever for episodes that share a file.
+
     Returns True if a combined file was produced with an acceptable score.
     """
-    logger.info(
-        "Looking up: %s S%02dE%02d", series_title, season, episode
-    )
+    all_episodes = [episode] + list(extra_episodes or [])
+    if len(all_episodes) == 1:
+        logger.info("Looking up: %s S%02dE%02d", series_title, season, episode)
+    else:
+        ep_label = "".join(f"E{e:02d}" for e in all_episodes)
+        logger.info("Looking up: %s S%02d%s (multi-episode)", series_title, season, ep_label)
 
     search_title = _strip_year_suffix(series_title)
     stripped_note = " (year stripped)" if search_title != series_title else ""
@@ -115,7 +128,8 @@ def process_episode(
             )
             continue
         if _align_and_keep(config, video_path, audio_path):
-            _mark_episode_done(zip_cache_dir, season, episode, extract_dir, zip_path)
+            for ep in all_episodes:
+                _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
             return True
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
@@ -202,9 +216,24 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     alignment_dir = config.cache_dir / "alignments"
     tmp_output_dir = config.cache_dir / "output"
 
+    # Refuse the stretch-video path (config.stretch_audio is False) for an
+    # in-place library replacement unless Matt has explicitly opted into the
+    # "I know this can break hardware playback" mode. The setts bitstream
+    # filter rewrites PTS/DTS on a stream-copied video, which is structurally
+    # valid but breaks HRD assumptions in some hardware decoders (Apple TV,
+    # webOS, etc.). Stretching the audio is the safe path.
+    if not config.stretch_audio and not config.allow_video_retime:
+        logger.error(
+            "Refusing to use the stretch-video setts path for in-place "
+            "replacement of %s. Set DESCRIBARR_STRETCH_AUDIO=true (recommended) "
+            "or DESCRIBARR_ALLOW_VIDEO_RETIME=true to override.",
+            video_path,
+        )
+        return False
+
     result = align(video_path, audio_path, tmp_output_dir, alignment_dir, config.stretch_audio)
     if result is None:
-        logger.error("Alignment produced no output file.")
+        logger.error("Alignment produced no validated output file.")
         return False
 
     combined = result.output
@@ -236,13 +265,14 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
         and total_runtime >= 300.0
     )
 
-    if not desc_ok and not coverage_ok and not slope_ok:
+    accepted = desc_ok or coverage_ok or slope_ok
+    if not accepted:
         logger.warning(
             "Score %.1f%%, coverage %.1f%%, slope stability %.1f%% (median %.2f%%) "
             "— all below thresholds, discarding.",
             score, cscore, stable_fraction, median_rate,
         )
-        combined.unlink(missing_ok=True)
+        _cleanup_combined(combined)
         return False
 
     if not desc_ok and not coverage_ok and slope_ok:
@@ -259,26 +289,13 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
 
     sync_ok, sync_reason = sync_quality(report)
 
-    # Replace the original video with the combined file.
-    # shutil.move is non-atomic when source and destination are on different
-    # filesystems (e.g. separate Docker volume mounts): it copies then deletes,
-    # leaving the destination partially written if the process is killed mid-copy.
-    # Instead, copy to a sibling temp file and then os.replace (always atomic on
-    # POSIX even across most bind-mount configurations).
-    tmp_dest = video_path.parent / (video_path.name + ".tmp")
     try:
-        shutil.copy2(combined, tmp_dest)
-        os.replace(tmp_dest, video_path)
-    except Exception:
-        tmp_dest.unlink(missing_ok=True)
-        raise
+        _publish_in_place(combined, video_path)
     finally:
-        # The combined file is the output_dir cached AD-merged copy; whether the
-        # in-place replace succeeded or failed, we don't want a 1-2 GB orphan
-        # sitting in the cache forever. If the replace failed the caller will
-        # see the original video untouched and can retry, which re-runs the
-        # alignment from scratch.
-        combined.unlink(missing_ok=True)
+        # Whether publish succeeded or failed, the run dir is no longer needed.
+        # Cleaning it here keeps the per-run isolation tidy and prevents a
+        # ~1-2 GB orphan sitting in the cache forever.
+        _cleanup_combined(combined)
 
     if not sync_ok:
         logger.warning(
@@ -288,6 +305,118 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
 
     logger.info("Success (score=%.1f%% coverage=%.1f%%): replaced %s", score, cscore, video_path)
     return True
+
+
+def _cleanup_combined(combined: Path) -> None:
+    """Delete the combined output AND its per-run scratch dir (if any).
+
+    `aligner.run` writes into ``<cache>/output/run-<uuid>/ad_<stem><ext>``.
+    Removing just the file leaves an empty ``run-<uuid>`` dir behind on
+    every run — over time that's noise the prune job doesn't touch.
+    """
+    if not combined.exists():
+        return
+    parent = combined.parent
+    combined.unlink(missing_ok=True)
+    if parent.name.startswith("run-"):
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def _file_fingerprint(path: Path) -> tuple[int, int, int]:
+    """Stable identity tuple for *path* before/after an alignment.
+
+    ``(st_ino, st_size, st_mtime_ns)`` rejects "Sonarr replaced the file
+    while we were aligning" without depending on hashing megabytes of data.
+    A normal in-place upgrade by Sonarr/Radarr breaks at least one of the
+    three; our own atomic replace breaks all three deliberately.
+    """
+    st = path.stat()
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _publish_in_place(combined: Path, video_path: Path) -> None:
+    """
+    Atomically replace *video_path* with the contents of *combined*.
+
+    Hardening:
+      * fcntl.LOCK_EX on a sibling ``.<name>.admerge.lock`` serialises
+        replacements of the same target across processes (e.g. webhook +
+        manual /retry firing concurrently on different hosts that share the
+        media mount). Inside one describarr process the worker is already
+        single-threaded, so this lock is primarily a defence against
+        cross-host or cross-process surprises.
+      * Unique tmp filename (``.<name>.admerge.<uuid>.tmp``) means even if
+        two workers raced (which they shouldn't) they wouldn't smear each
+        other's bytes into the destination.
+      * Source-fingerprint check just before ``os.replace`` aborts if
+        another tool (Sonarr file upgrade, manual rsync, etc.) replaced the
+        original while alignment ran. We never overwrite a *newer* version
+        of the file with our stale alignment.
+      * Size-equality check after ``shutil.copy2`` catches disk-full /
+        truncated copies; combined with the ffprobe validation that
+        ``aligner._validate_media_output`` already performed, that's
+        end-to-end coverage without re-probing megabytes.
+      * fsync of the tmp file before the rename, then fsync of the parent
+        directory after the rename, so a host crash after we return cannot
+        leave a torn rename behind.
+    """
+    pre_fp = _file_fingerprint(video_path)
+    expected_size = combined.stat().st_size
+
+    parent = video_path.parent
+    lock_path = parent / f".{video_path.name}.admerge.lock"
+    tmp_dest = parent / f".{video_path.name}.admerge.{uuid.uuid4().hex}.tmp"
+
+    parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            # Re-check the source under lock: another publisher may have run
+            # in the gap between our pre-fingerprint and acquiring the lock.
+            current_fp = _file_fingerprint(video_path)
+            if current_fp != pre_fp:
+                raise RuntimeError(
+                    f"Source video changed during alignment (fp {pre_fp!r} → {current_fp!r}); "
+                    f"refusing to overwrite {video_path}."
+                )
+
+            shutil.copy2(combined, tmp_dest)
+            actual_size = tmp_dest.stat().st_size
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"Copied output size mismatch (expected {expected_size}, got {actual_size}); "
+                    f"refusing to publish."
+                )
+
+            # fsync the data before the rename so a crash here doesn't
+            # leave a metadata-renamed-but-data-empty file.
+            with tmp_dest.open("rb") as fh:
+                os.fsync(fh.fileno())
+
+            os.replace(tmp_dest, video_path)
+
+            # fsync the directory so the rename itself is durable.
+            try:
+                dir_fd = os.open(parent, os.O_DIRECTORY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+        except Exception:
+            tmp_dest.unlink(missing_ok=True)
+            raise
+        finally:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_file.close()
+        # Lock file itself stays — it's harmless, and removing it racy.
 
 
 def _get_cached(
@@ -325,15 +454,30 @@ def _get_cached(
         logger.warning("Cached file missing, re-downloading: %s", url)
 
     if limiter is not None:
-        try:
-            limiter.check_and_increment()
-        except DailyLimitReached:
+        # Pre-flight check (without incrementing) — if we're already at the
+        # cap, fail fast before opening a connection.
+        if limiter.would_exceed():
             logger.error(
                 "Skipping download of %s — AudioVault daily limit reached.", url
             )
-            raise
+            raise DailyLimitReached(
+                f"AudioVault daily download limit ({DownloadLimiter.DAILY_LIMIT}) reached."
+            )
 
     file_path = client.download(url, cache_dir)
+
+    # Only spend a daily-quota slot once we know the download actually
+    # produced a file. A transient 5xx / Cloudflare blip used to waste a
+    # slot here.
+    if limiter is not None:
+        try:
+            limiter.check_and_increment()
+        except DailyLimitReached:
+            # Genuinely shouldn't happen since we pre-checked, but if a
+            # different process raced us across midnight we don't want to
+            # silently double-spend. Surface it like before.
+            logger.error("AudioVault daily limit reached between pre-check and increment.")
+            raise
 
     manifest[url] = str(file_path)
     _atomic_write_json(manifest_path, manifest)

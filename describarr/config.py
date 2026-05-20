@@ -29,6 +29,12 @@ class Config:
         default_factory=lambda: Path.home() / ".cache" / "describarr"
     )
     stretch_audio: bool = True
+    # When stretch_audio is False, describealaign rewrites video PTS/DTS via
+    # an ffmpeg setts bitstream filter. The output is structurally valid but
+    # can break HRD buffering on hardware decoders (Apple TV, webOS, …).
+    # Describarr refuses to run that path for an in-place library mutation
+    # unless this flag is explicitly opted in.
+    allow_video_retime: bool = False
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -51,5 +57,15 @@ class Config:
         cache_dir = Path(raw_cache).expanduser() if raw_cache else Path.home() / ".cache" / "describarr"
 
         stretch_audio = os.environ.get("DESCRIBARR_STRETCH_AUDIO", "true").strip().lower() != "false"
+        allow_video_retime = (
+            os.environ.get("DESCRIBARR_ALLOW_VIDEO_RETIME", "false").strip().lower() == "true"
+        )
 
-        return cls(email=email, password=password, min_score=min_score, cache_dir=cache_dir, stretch_audio=stretch_audio)
+        return cls(
+            email=email,
+            password=password,
+            min_score=min_score,
+            cache_dir=cache_dir,
+            stretch_audio=stretch_audio,
+            allow_video_retime=allow_video_retime,
+        )
