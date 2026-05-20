@@ -66,7 +66,19 @@ def main() -> None:
         pass  # remaining items stay queued; we'll keep going for this event.
 
     env = dict(os.environ)
-    sys.exit(0 if _dispatch(env) else 1)
+    # ``_dispatch`` returns:
+    #   - a dict (described / no_match / queued) — the event ran to completion
+    #   - None for Sonarr/Radarr ``Test`` events AND for unrecognised events
+    # A Test event is a *success* from Sonarr's perspective (it expects the
+    # script to exit 0 to confirm wiring), so we distinguish those by
+    # inspecting the env directly. Everything else preserves the old behaviour.
+    sonarr_event = env.get("sonarr_eventtype", "").lower()
+    radarr_event = env.get("radarr_eventtype", "").lower()
+    is_test = sonarr_event == "test" or radarr_event == "test"
+    outcome = _dispatch(env)
+    if outcome is not None:
+        sys.exit(0)
+    sys.exit(0 if is_test else 1)
 
 
 def _test_auth() -> None:

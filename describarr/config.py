@@ -20,6 +20,33 @@ for _path in _CONFIG_PATHS:
         break
 
 
+_TRUE_VALUES = frozenset({"1", "true", "yes", "y", "on", "t"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "n", "off", "f", ""})
+
+
+def _parse_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var with the same vocabulary in both directions.
+
+    Previously each boolean had its own ad-hoc parsing rule
+    (``DESCRIBARR_STRETCH_AUDIO`` treated anything but literal ``"false"`` as
+    True, but ``DESCRIBARR_ALLOW_VIDEO_RETIME`` required literal ``"true"``).
+    A Docker-Compose user setting ``DESCRIBARR_STRETCH_AUDIO: "0"`` got the
+    opposite of what they asked for. One helper, one vocabulary, predictable
+    behaviour either way.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"{name} must be a boolean (1/0, true/false, yes/no, on/off); got {raw!r}"
+    )
+
+
 @dataclass
 class Config:
     email: str
@@ -56,10 +83,8 @@ class Config:
         raw_cache = os.environ.get("DESCRIBARR_CACHE_DIR", "")
         cache_dir = Path(raw_cache).expanduser() if raw_cache else Path.home() / ".cache" / "describarr"
 
-        stretch_audio = os.environ.get("DESCRIBARR_STRETCH_AUDIO", "true").strip().lower() != "false"
-        allow_video_retime = (
-            os.environ.get("DESCRIBARR_ALLOW_VIDEO_RETIME", "false").strip().lower() == "true"
-        )
+        stretch_audio = _parse_bool("DESCRIBARR_STRETCH_AUDIO", default=True)
+        allow_video_retime = _parse_bool("DESCRIBARR_ALLOW_VIDEO_RETIME", default=False)
 
         return cls(
             email=email,

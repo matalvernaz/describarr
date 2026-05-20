@@ -29,6 +29,25 @@ def _is_login_url(url: str) -> bool:
         return False
     return path.rstrip("/").endswith("/login")
 
+
+# Content-Type values AudioVault legitimately serves for downloads.
+# Anything else (most importantly ``text/html``) is rejected so a login
+# / error / quota page can never be cached as media.
+_ACCEPTABLE_MEDIA_PREFIXES = ("audio/", "video/")
+_ACCEPTABLE_MEDIA_TYPES = frozenset({
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+})
+
+
+def _is_acceptable_media_type(content_type: str) -> bool:
+    if not content_type:
+        return True  # absent header → trust Content-Disposition / extension
+    if any(content_type.startswith(p) for p in _ACCEPTABLE_MEDIA_PREFIXES):
+        return True
+    return content_type in _ACCEPTABLE_MEDIA_TYPES
+
 # Mimic a real Firefox request so the server doesn't reject us outright.
 _HEADERS = {
     "User-Agent": (
@@ -217,6 +236,22 @@ class AudioVaultClient:
         with resp:
             resp.raise_for_status()
 
+            # Reject HTML responses (200 OK login/error pages from AudioVault)
+            # so they never get cached as ``.mp3``/``.zip``. The CDN
+            # occasionally serves text/plain JSON-ish error pages too, so
+            # we positively require audio/* or application/{zip,octet-stream}.
+            content_type = resp.headers.get("Content-Type", "").lower().split(";", 1)[0].strip()
+            if content_type and not _is_acceptable_media_type(content_type):
+                snippet = ""
+                try:
+                    snippet = next(resp.iter_content(chunk_size=256), b"").decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    pass
+                raise RuntimeError(
+                    f"AudioVault returned unexpected content-type {content_type!r} for {url}"
+                    + (f" — preview: {snippet[:120]!r}" if snippet else "")
+                )
+
             content_disp = resp.headers.get("Content-Disposition", "")
             match = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\r\n]+)', content_disp)
             if match:
@@ -253,13 +288,21 @@ class AudioVaultClient:
 
         AudioVault redirects expired sessions to ``/login``; without this,
         ``download`` would silently stream the login page HTML into the
-        cache file.
+        cache file. If the second GET *also* lands on ``/login`` (e.g.
+        permanent auth failure) we raise rather than returning that
+        response, so the caller never writes the login page to disk
+        thinking it's audio.
         """
         resp = self._session.get(url, **kwargs)
         if _is_login_url(resp.url):
             resp.close()
             self._relogin()
             resp = self._session.get(url, **kwargs)
+            if _is_login_url(resp.url):
+                resp.close()
+                raise LoginError(
+                    f"AudioVault still redirecting to /login after relogin for {url}"
+                )
         return resp
 
 

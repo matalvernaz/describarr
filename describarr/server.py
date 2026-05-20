@@ -7,6 +7,7 @@ Request body is application/x-www-form-urlencoded (curl --data-urlencode).
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -205,10 +206,14 @@ def _midnight_drain_loop() -> None:
 
 
 def _worker_loop() -> None:
-    """Single-threaded background worker. Pops one pending item at a time and
-    processes it under no lock — being the only consumer of the queue
-    enforces the "one describealaign run at a time" invariant that used to
-    be guarded by an in-memory threading.Lock."""
+    """Single-threaded background worker.
+
+    Uses :meth:`PendingQueue.claim_first` so an unexpected crash between
+    claim and completion can't lose the item — startup recovery pushes any
+    leftover in-flight items back to the front of the queue. Being the
+    only consumer also enforces the "one describealaign run at a time"
+    invariant that used to be guarded by an in-memory ``threading.Lock``.
+    """
     while True:
         try:
             config = Config.from_env()
@@ -218,7 +223,7 @@ def _worker_loop() -> None:
             continue
 
         pending = _get_pending_queue(config)
-        item = pending.pop_first()
+        item = pending.claim_first()
         if item is None:
             pending.wait_for_item(timeout=10.0)
             continue
@@ -226,11 +231,20 @@ def _worker_loop() -> None:
         try:
             _process_item(item, config, pending)
         except Exception:
-            logger.error("Worker: unhandled error on item %r", item, exc_info=True)
+            # Unknown failure mode — log + drop the claim so we don't loop
+            # forever on a poison item. The in-flight marker is cleared
+            # so the recovery path doesn't replay it on next start either.
+            logger.error("Worker: unhandled error on item %r — dropping.", item, exc_info=True)
+            pending.ack(item)
 
 
 def _process_item(item: dict, config: Config, pending: PendingQueue) -> None:
-    """Dispatch one pending item to its handler."""
+    """Dispatch one pending item to its handler.
+
+    The item arrives already claimed (sitting in the in-flight file). On
+    successful return, transient retry, or terminal drop we explicitly
+    release the claim — ack on success/drop, requeue on transient retry.
+    """
     item_type = item.get("type")
     handlers = {
         "hook": _worker_handle_hook,
@@ -242,6 +256,7 @@ def _process_item(item: dict, config: Config, pending: PendingQueue) -> None:
     handler = handlers.get(item_type)
     if handler is None:
         logger.warning("Unknown pending item type %r — dropping: %r", item_type, item)
+        pending.ack(item)
         return
     try:
         handler(item, config, pending)
@@ -252,15 +267,21 @@ def _process_item(item: dict, config: Config, pending: PendingQueue) -> None:
                 "Dropping pending item after %d attempts (%s): %r",
                 attempts, exc, item,
             )
+            pending.ack(item)
             return
         item["attempts"] = attempts
         # Push to the BACK so other items get a fair chance to make progress
         # while this one waits out whatever transient condition tripped it.
+        # ack clears the claim before we re-enqueue so we don't have the
+        # same payload in both files.
+        pending.ack(item)
         pending.push(item)
         logger.warning(
             "Transient error processing %s (attempt %d/%d), re-queued: %s",
             item_type, attempts, _MAX_WORKER_ATTEMPTS, exc,
         )
+    else:
+        pending.ack(item)
 
 
 # Errors that should re-queue the pending item rather than drop it. Anything
@@ -540,7 +561,12 @@ def _render_status_html(data: dict) -> str:
             job_label = f"{job['title']} S{job['season']:02d}E{job['episode']:02d}"
         else:
             job_label = job.get("title", "unknown")
-        elapsed = _elapsed(job["started_at"])
+        # Series/movie titles come from Sonarr/Radarr metadata (TheTVDB,
+        # TMDB) which we don't control. Escape before interpolating so a
+        # title like ``<script>alert(1)</script>`` can't execute in any
+        # admin's browser viewing /status.
+        job_label = html.escape(job_label)
+        elapsed = html.escape(_elapsed(job["started_at"]))
         job_html = f"""
   <div class="card active">
     <h2>Currently converting</h2>
@@ -683,8 +709,12 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
                 extra_episodes=extra_episodes,
             )
     except DailyLimitReached:
-        for ep in episodes:
-            _get_retry_queue(config).add_episode(series_title, season, ep, str(video_path))
+        # ONE retry item carries the full episode list so the drain runs ONE
+        # alignment and marks every covered episode done. Queueing per-episode
+        # entries under the same video_path used to (a) silently lose E02..N
+        # to the video_path-only dedup, and (b) — if dedup were ever loosened
+        # — destructively re-align the merged file once per episode.
+        _get_retry_queue(config).add_episodes(series_title, season, episodes, str(video_path))
         return {"label": label, "outcome": "queued"}
     return {"label": label, "outcome": "described" if described else "no_match"}
 

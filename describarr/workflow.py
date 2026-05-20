@@ -520,15 +520,30 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
             continue
         try:
             if item["type"] == "episode":
+                # ``extra_episodes`` carries the rest of a Sonarr multi-episode
+                # file (S01E01E02 → primary=1, extras=[2]). One alignment runs
+                # against the primary episode's audio; the helper marks every
+                # covered episode done in the same call.
+                extra_episodes = list(item.get("extra_episodes") or [])
                 process_episode(
                     client, config, video_path,
                     item["series_title"], item["season"], item["episode"],
+                    extra_episodes=extra_episodes,
                 )
             elif item["type"] == "movie":
                 process_movie(
                     client, config, video_path,
                     item["movie_title"], item.get("movie_year", ""),
                 )
+            else:
+                # Unknown type — keep the item rather than silently dropping it
+                # in case a future schema bump lands in a stored queue.
+                logger.error(
+                    "Unknown retry item type %r — keeping queued: %r",
+                    item.get("type"), item,
+                )
+                remaining.append(item)
+                continue
         except DailyLimitReached:
             remaining.append(item)
             limit_hit = True
@@ -573,11 +588,23 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                     "Terminal HTTP %d for queued item %s — dropping.",
                     status, item["video_path"],
                 )
-        except Exception:
+        except (KeyError, ValueError, TypeError) as exc:
+            # Malformed item in the persisted retry queue — log and drop. A
+            # KeyError specifically means an old schema we don't understand
+            # anymore. Better to lose one entry than to loop on it forever.
             logger.error(
-                "Unexpected error processing queued item %s — dropping.",
+                "Malformed queued item dropped (%s): %r", exc, item,
+            )
+        except Exception:
+            # Unknown error — keep the item so the next drain can retry, and
+            # surface enough context for debugging. Previously this was a
+            # silent drop; subtle bugs (e.g. an AudioVault layout change)
+            # would erase the entire queue on the next midnight tick.
+            logger.error(
+                "Unexpected error processing queued item %s — re-queueing.",
                 item["video_path"], exc_info=True,
             )
+            remaining.append(item)
     if remaining:
         queue.save(remaining)
     else:

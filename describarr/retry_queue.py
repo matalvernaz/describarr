@@ -28,13 +28,43 @@ class RetryQueue:
         self._path = state_path
 
     def add_episode(self, series_title: str, season: int, episode: int, video_path: str) -> None:
-        self._append({
+        """Queue a single-episode retry."""
+        self.add_episodes(series_title, season, [episode], video_path)
+
+    def add_episodes(
+        self,
+        series_title: str,
+        season: int,
+        episodes: list[int],
+        video_path: str,
+    ) -> None:
+        """Queue a (possibly multi-) episode retry as ONE item.
+
+        A multi-episode Sonarr download (``S01E01E02.mkv``) ships in a
+        single file. Previously the daily-limit branch queued one entry
+        per episode pointing at the same ``video_path``, and the
+        ``_append`` dedup-by-video-path silently dropped E02..N. Worse,
+        if dedup were ever loosened, ``drain_retry_queue`` would re-align
+        the now-E01-merged file against each subsequent audio in turn and
+        clobber earlier merges. One item carrying the full list lets the
+        drain dispatch via ``process_episode(..., extra_episodes=…)`` and
+        record every covered episode in the season's ``.done_sNN.json``
+        without any second alignment.
+        """
+        if not episodes:
+            return
+        primary = episodes[0]
+        extras = [e for e in episodes[1:] if e != primary]
+        item = {
             "type": "episode",
             "series_title": series_title,
             "season": season,
-            "episode": episode,
+            "episode": primary,
             "video_path": video_path,
-        })
+        }
+        if extras:
+            item["extra_episodes"] = extras
+        self._append(item)
 
     def add_movie(self, movie_title: str, movie_year: str, video_path: str) -> None:
         self._append({
