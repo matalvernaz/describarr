@@ -260,7 +260,9 @@ def _process_item(item: dict, config: Config, pending: PendingQueue) -> None:
         return
     try:
         handler(item, config, pending)
-    except _TRANSIENT_WORKER_ERRORS as exc:
+    except Exception as exc:
+        if not _is_transient(exc):
+            raise
         attempts = int(item.get("attempts", 0)) + 1
         if attempts >= _MAX_WORKER_ATTEMPTS:
             logger.error(
@@ -269,13 +271,17 @@ def _process_item(item: dict, config: Config, pending: PendingQueue) -> None:
             )
             pending.ack(item)
             return
-        item["attempts"] = attempts
+        # Build the requeued payload BEFORE acking: PendingQueue.ack matches
+        # the in-flight entry by dict equality, so mutating `item` first would
+        # make the ack a silent no-op and leak the in-flight entry — which
+        # `_recover_inflight_locked` would then re-prepend on every restart,
+        # quietly stacking duplicate alignments on the same source.
+        requeued = dict(item)
+        requeued["attempts"] = attempts
         # Push to the BACK so other items get a fair chance to make progress
         # while this one waits out whatever transient condition tripped it.
-        # ack clears the claim before we re-enqueue so we don't have the
-        # same payload in both files.
         pending.ack(item)
-        pending.push(item)
+        pending.push(requeued)
         logger.warning(
             "Transient error processing %s (attempt %d/%d), re-queued: %s",
             item_type, attempts, _MAX_WORKER_ATTEMPTS, exc,
@@ -293,6 +299,25 @@ _TRANSIENT_WORKER_ERRORS = (
     ConnectionError,
     TimeoutError,
 )
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True if the exception is a transient network condition that should
+    re-queue the pending item rather than drop it.
+
+    AudioVault 5xx (Cloudflare 502/503 etc.) and 429 throttling are
+    classified as transient in `workflow.drain_retry_queue`; mirroring that
+    here so the *initial* webhook attempt isn't terminally dropped on a
+    flaky upstream — the previous tuple-only check let HTTPError fall
+    through to the generic Exception handler in `_worker_handle_hook`,
+    which fired a Pushover "errored" message and ack'd the work.
+    """
+    if isinstance(exc, _TRANSIENT_WORKER_ERRORS):
+        return True
+    if isinstance(exc, _requests.HTTPError):
+        status = getattr(exc.response, "status_code", 0) or 0
+        return status >= 500 or status == 429
+    return False
 
 
 class _HookHandler(BaseHTTPRequestHandler):
@@ -762,9 +787,9 @@ def _worker_handle_hook(item: dict, config: Config, pending: PendingQueue) -> No
     errored = False
     try:
         result = _dispatch(env)
-    except _TRANSIENT_WORKER_ERRORS:
-        raise  # bubble to _process_item so it re-queues
-    except Exception:
+    except Exception as exc:
+        if _is_transient(exc):
+            raise  # bubble to _process_item so it re-queues
         logger.error("Unhandled error processing hook.", exc_info=True)
         errored = True
 

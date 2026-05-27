@@ -257,12 +257,18 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     #      (rescues PAL/NTSC content where the 4.27% rate change correctly
     #      describes the entire alignment, but the inherited pitch shift
     #      drags the feature-match similarity score below threshold).
+    #      The |median_rate| ≥ 2.0 gate is the "non-trivial drift" part: a
+    #      stable-but-flat alignment with a low similarity score is just a
+    #      bad alignment, not a PAL/NTSC rescue case, and was previously
+    #      false-accepted because the comment promised a drift check the
+    #      code never enforced.
     desc_ok = score >= config.min_score
     coverage_ok = cscore >= 90.0
     slope_ok = (
         stable_fraction >= 90.0
         and score >= 30.0
         and total_runtime >= 300.0
+        and abs(median_rate) >= 2.0
     )
 
     accepted = desc_ok or coverage_ok or slope_ok
