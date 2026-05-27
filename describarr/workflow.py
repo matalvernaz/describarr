@@ -232,6 +232,17 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
         )
         return False
 
+    # Snapshot the source fingerprint BEFORE alignment, not after. Alignment
+    # commonly runs 1–30 minutes; if Sonarr/Radarr upgrades the file during
+    # that window, the previous check (captured inside _publish_in_place,
+    # which is reached after align() returns) saw the already-upgraded file
+    # and silently overwrote it with our stale-source alignment.
+    try:
+        pre_fp = _file_fingerprint(video_path)
+    except FileNotFoundError:
+        logger.error("Source video vanished before alignment could start: %s", video_path)
+        return False
+
     result = align(video_path, audio_path, tmp_output_dir, alignment_dir, config.stretch_audio)
     if result is None:
         logger.error("Alignment produced no validated output file.")
@@ -258,18 +269,21 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     #      (rescues PAL/NTSC content where the 4.27% rate change correctly
     #      describes the entire alignment, but the inherited pitch shift
     #      drags the feature-match similarity score below threshold).
-    #      The |median_rate| ≥ 2.0 gate is the "non-trivial drift" part: a
-    #      stable-but-flat alignment with a low similarity score is just a
-    #      bad alignment, not a PAL/NTSC rescue case, and was previously
-    #      false-accepted because the comment promised a drift check the
-    #      code never enforced.
+    #      The drift gate accepts either a *known* rate shift (|median_rate|
+    #      ≥ 2, covering PAL/NTSC at 4.27% and similar) OR a near-perfect
+    #      sync (|median_rate| ≤ 0.5, covering native-rate alignments
+    #      depressed below the similarity threshold by commercial-break
+    #      noise). The middle band (0.5 < |median_rate| < 2) is the
+    #      "wobbly low-similarity" zone where neither perfect sync nor a
+    #      known frame-rate shift explains the low score — those are
+    #      almost certainly bad alignments and stay rejected.
     desc_ok = score >= config.min_score
     coverage_ok = cscore >= 90.0
     slope_ok = (
         stable_fraction >= 90.0
         and score >= 30.0
         and total_runtime >= 300.0
-        and abs(median_rate) >= 2.0
+        and (abs(median_rate) <= 0.5 or abs(median_rate) >= 2.0)
     )
 
     accepted = desc_ok or coverage_ok or slope_ok
@@ -297,7 +311,7 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     sync_ok, sync_reason = sync_quality(report)
 
     try:
-        _publish_in_place(combined, video_path)
+        _publish_in_place(combined, video_path, expected_fp=pre_fp)
     finally:
         # Whether publish succeeded or failed, the run dir is no longer needed.
         # Cleaning it here keeps the per-run isolation tidy and prevents a
@@ -341,24 +355,31 @@ def _file_fingerprint(path: Path) -> tuple[int, int, int]:
     return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-def _publish_in_place(combined: Path, video_path: Path) -> None:
+def _publish_in_place(
+    combined: Path,
+    video_path: Path,
+    expected_fp: Optional[tuple[int, int, int]] = None,
+) -> None:
     """
     Atomically replace *video_path* with the contents of *combined*.
 
+    *expected_fp* is the fingerprint captured BEFORE alignment started
+    (in `_align_and_keep`). It's compared under the lock against the
+    current on-disk fingerprint; mismatch means Sonarr/Radarr replaced
+    the file during the alignment window and we must refuse to publish.
+    If the caller didn't provide one (legacy/test code), we fall back to
+    a fingerprint taken at entry — but that only catches changes within
+    the publish lock window, not changes during the (much longer)
+    alignment subprocess.
+
     Hardening:
       * fcntl.LOCK_EX on a sibling ``.<name>.admerge.lock`` serialises
-        replacements of the same target across processes (e.g. webhook +
-        manual /retry firing concurrently on different hosts that share the
-        media mount). Inside one describarr process the worker is already
-        single-threaded, so this lock is primarily a defence against
-        cross-host or cross-process surprises.
-      * Unique tmp filename (``.<name>.admerge.<uuid>.tmp``) means even if
-        two workers raced (which they shouldn't) they wouldn't smear each
-        other's bytes into the destination.
-      * Source-fingerprint check just before ``os.replace`` aborts if
-        another tool (Sonarr file upgrade, manual rsync, etc.) replaced the
-        original while alignment ran. We never overwrite a *newer* version
-        of the file with our stale alignment.
+        replacements of the same target across processes.
+      * Unique tmp filename (``.<name>.admerge.<uuid>.tmp``).
+      * Source-fingerprint check under lock aborts if another tool
+        (Sonarr file upgrade, manual rsync, etc.) replaced the original
+        while alignment ran. We never overwrite a *newer* version of the
+        file with our stale alignment.
       * Size-equality check after ``shutil.copy2`` catches disk-full /
         truncated copies; combined with the ffprobe validation that
         ``aligner._validate_media_output`` already performed, that's
@@ -367,7 +388,7 @@ def _publish_in_place(combined: Path, video_path: Path) -> None:
         directory after the rename, so a host crash after we return cannot
         leave a torn rename behind.
     """
-    pre_fp = _file_fingerprint(video_path)
+    pre_fp = expected_fp if expected_fp is not None else _file_fingerprint(video_path)
     expected_size = combined.stat().st_size
 
     parent = video_path.parent
@@ -710,17 +731,30 @@ def _mark_episode_done(
         _cleanup_completed_season(zip_cache_dir, season_dir, zip_path, season, stored_total)
 
 
-def _resolve_audio_total(stored_total: int, extract_dir: Path, zip_path: Path) -> int:
+def _resolve_audio_total(
+    stored_total: int,
+    extract_dir: Path,
+    zip_path: Path,
+    *,
+    trust_extract_dir: bool = True,
+) -> int:
     """Decide the canonical audio-entry count for a season's cleanup gate.
 
     Returns *stored_total* unchanged if it's already set; otherwise tries
     the live extract_dir first (cheap, no zip open), then the zip namelist
     as a fallback so legacy-format .done files can still trigger cleanup
     after the extract_dir has been cleaned.
+
+    *trust_extract_dir* must be False when called from a background sweep
+    (e.g. `prune_completed_seasons`) that runs concurrently with the
+    worker: mid-extraction, `extract_dir.rglob` returns a partial count
+    that can racily satisfy `len(done) >= total` and trigger premature
+    deletion of an actively-extracting zip. The zip namelist is the
+    only stable source of truth in that path.
     """
     if stored_total > 0:
         return stored_total
-    if extract_dir.exists():
+    if trust_extract_dir and extract_dir.exists():
         live = sum(
             1 for f in extract_dir.rglob("*")
             if f.is_file() and f.suffix.lower() in _AUDIO_EXTS
@@ -808,7 +842,12 @@ def prune_completed_seasons(cache_dir: Path) -> None:
                 if re.search(rf"\bseason\s*0?{season}\b", z.name, re.IGNORECASE)
             ]
             for zip_path in zip_candidates:
-                total = _resolve_audio_total(stored_total, season_dir, zip_path)
+                # trust_extract_dir=False so a worker that's mid-extracting
+                # this zip can't have its partial extract dir falsely
+                # satisfy the cleanup gate from underneath it.
+                total = _resolve_audio_total(
+                    stored_total, season_dir, zip_path, trust_extract_dir=False
+                )
                 if total > 0 and len(done) >= total:
                     _cleanup_completed_season(
                         show_dir, season_dir, zip_path, season, total
