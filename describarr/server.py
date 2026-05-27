@@ -26,7 +26,7 @@ from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, Lo
 from .config import Config
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
-from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, _safe_dirname
+from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, _safe_dirname
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +200,14 @@ def _midnight_drain_loop() -> None:
         # Pruning is read-only relative to the worker (touches a different
         # subtree) so it's safe to run here without blocking the queue.
         prune_alignment_artifacts(config.cache_dir / "alignments")
+        # Reclaim zips for long-completed seasons whose .done file pre-dates
+        # the dict-format/cleanup logic. Operates only on seasons whose
+        # done-set already covers the zip's audio count, so it can't race
+        # an in-flight alignment.
+        try:
+            prune_completed_seasons(config.cache_dir)
+        except Exception:
+            logger.exception("prune_completed_seasons failed; continuing.")
 
         if _get_retry_queue(config).load():
             _get_pending_queue(config).push({"type": "drain"})

@@ -19,6 +19,7 @@ import re
 import shutil
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -692,32 +693,131 @@ def _mark_episode_done(
 
     done.add(episode)
 
-    # Determine the canonical episode count.  We use the value from the
-    # progress file when available so that a partially-cleaned extract_dir
-    # on a later call doesn't give us an artificially-low count and trigger
-    # premature zip deletion.
-    if stored_total == 0 and extract_dir.exists():
-        stored_total = len([
-            f for f in extract_dir.rglob("*")
-            if f.is_file() and f.suffix.lower() in _AUDIO_EXTS
-        ])
+    # Determine the canonical episode count. Prefer the in-file `total` when
+    # available so a partially-cleaned extract_dir on a later call doesn't
+    # trigger premature zip deletion. When the file is legacy list-format
+    # (`stored_total == 0`), fall back to counting audio entries inside the
+    # zip itself — that lets a long-completed season whose .done file pre-
+    # dates the cleanup logic still trigger cleanup on the next alignment,
+    # rather than stranding the zip on disk forever (~36 GB of leak observed
+    # before this fallback existed).
+    stored_total = _resolve_audio_total(stored_total, extract_dir, zip_path)
 
     season_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(progress_path, {"total": stored_total, "done": sorted(done)})
 
     if stored_total > 0 and len(done) >= stored_total:
-        logger.info(
-            "All %d episode(s) of season %d done — clearing zip cache.", stored_total, season
+        _cleanup_completed_season(zip_cache_dir, season_dir, zip_path, season, stored_total)
+
+
+def _resolve_audio_total(stored_total: int, extract_dir: Path, zip_path: Path) -> int:
+    """Decide the canonical audio-entry count for a season's cleanup gate.
+
+    Returns *stored_total* unchanged if it's already set; otherwise tries
+    the live extract_dir first (cheap, no zip open), then the zip namelist
+    as a fallback so legacy-format .done files can still trigger cleanup
+    after the extract_dir has been cleaned.
+    """
+    if stored_total > 0:
+        return stored_total
+    if extract_dir.exists():
+        live = sum(
+            1 for f in extract_dir.rglob("*")
+            if f.is_file() and f.suffix.lower() in _AUDIO_EXTS
         )
-        zip_path.unlink(missing_ok=True)
-        # Remove zip from the download manifest.
-        manifest_path = zip_cache_dir / "manifest.json"
-        if manifest_path.exists():
+        if live > 0:
+            return live
+    if zip_path.exists():
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                return sum(
+                    1 for n in zf.namelist()
+                    if Path(n).suffix.lower() in _AUDIO_EXTS
+                )
+        except (zipfile.BadZipFile, OSError) as exc:
+            logger.warning("Could not read zip %s for total count: %s", zip_path, exc)
+    return 0
+
+
+def _cleanup_completed_season(
+    zip_cache_dir: Path,
+    season_dir: Path,
+    zip_path: Path,
+    season: int,
+    total: int,
+) -> None:
+    """Delete the zip + extract dir for a fully-processed season and prune
+    the download manifest entry. Called from `_mark_episode_done` and from
+    the midnight `prune_completed_seasons` sweep."""
+    logger.info(
+        "All %d episode(s) of season %d done — clearing zip cache.", total, season
+    )
+    zip_path.unlink(missing_ok=True)
+    manifest_path = zip_cache_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            manifest = {k: v for k, v in manifest.items() if Path(v) != zip_path}
+            _atomic_write_json(manifest_path, manifest)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    shutil.rmtree(season_dir, ignore_errors=True)
+
+
+def prune_completed_seasons(cache_dir: Path) -> None:
+    """Scan every show's `.done_sNN.json` and reclaim zip+extract for any
+    season whose done-set already covers the zip's audio entries.
+
+    Designed for the midnight drain: completed seasons whose .done files
+    pre-date the dict-format / cleanup logic never get a new alignment
+    that would trigger the lazy cleanup path. Without this, their zips
+    sit on disk indefinitely. Safe to run alongside the worker because
+    the only seasons it touches are those whose done-set is already
+    saturated (no in-flight work can race a finished season).
+    """
+    shows_root = cache_dir / "shows"
+    if not shows_root.is_dir():
+        return
+    reclaimed = 0
+    for show_dir in shows_root.iterdir():
+        if not show_dir.is_dir():
+            continue
+        for done_path in show_dir.glob(".done_s*.json"):
+            m = re.match(r"\.done_s(\d+)\.json$", done_path.name)
+            if not m:
+                continue
+            season = int(m.group(1))
             try:
-                manifest = json.loads(manifest_path.read_text())
-                manifest = {k: v for k, v in manifest.items() if Path(v) != zip_path}
-                _atomic_write_json(manifest_path, manifest)
-            except (json.JSONDecodeError, KeyError):
-                pass
-        # Delete the extracted dirs and progress file for this season.
-        shutil.rmtree(season_dir, ignore_errors=True)
+                raw = json.loads(done_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if isinstance(raw, list):
+                done = set(raw)
+                stored_total = 0
+            else:
+                done = set(raw.get("done", []))
+                stored_total = int(raw.get("total", 0))
+            if not done:
+                continue
+            season_dir = show_dir / f"season_{season:02d}"
+            # Find any zip in the show dir whose name names this season. The
+            # manifest maps URLs → local paths; we don't have the URL here,
+            # but the zip filename embeds the season number.
+            zip_candidates = [
+                z for z in show_dir.glob("*.zip")
+                if re.search(rf"\bseason\s*0?{season}\b", z.name, re.IGNORECASE)
+            ]
+            for zip_path in zip_candidates:
+                total = _resolve_audio_total(stored_total, season_dir, zip_path)
+                if total > 0 and len(done) >= total:
+                    _cleanup_completed_season(
+                        show_dir, season_dir, zip_path, season, total
+                    )
+                    # Re-write the .done file in dict format so the next pass
+                    # doesn't re-evaluate this season.
+                    _atomic_write_json(
+                        done_path, {"total": total, "done": sorted(done)}
+                    )
+                    reclaimed += 1
+    if reclaimed:
+        logger.info("prune_completed_seasons: reclaimed %d zip(s).", reclaimed)
