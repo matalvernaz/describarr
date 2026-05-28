@@ -512,16 +512,77 @@ def _ffprobe_json(path: Path, extra_args: Optional[list[str]] = None) -> Optiona
         return None
 
 
-def _primary_video_stream(probe: dict) -> Optional[dict]:
+def _primary_video_stream(probe: dict) -> tuple[Optional[dict], int]:
+    """Return (stream_dict, video_specifier_index) for the first non-cover-art
+    video stream in *probe*.
+
+    The video_specifier_index is the ffmpeg ``v:N`` index (i.e. position
+    among video streams, NOT the absolute stream index in the container).
+    Returns (None, -1) if no real video stream exists. Callers that
+    select a stream via ffprobe ``-select_streams v:N`` MUST use this
+    index — hardcoding ``v:0`` lets cover art at position 0 hijack the
+    selection while ``_primary_video_stream`` correctly picks v:1.
+    """
+    video_specifier_index = 0
     for s in probe.get("streams", []):
-        if s.get("codec_type") == "video" and s.get("codec_name") not in {"mjpeg", "png", "bmp", "gif"}:
+        if s.get("codec_type") != "video":
+            continue
+        if s.get("codec_name") not in {"mjpeg", "png", "bmp", "gif"}:
             # mjpeg/png/etc. in a video stream slot are usually cover art, not real video.
-            return s
-    return None
+            return s, video_specifier_index
+        video_specifier_index += 1
+    return None, -1
 
 
 def _audio_stream_count(probe: dict) -> int:
     return sum(1 for s in probe.get("streams", []) if s.get("codec_type") == "audio")
+
+
+def _has_expected_audio_disposition(probe: dict) -> bool:
+    """Verify the AD track ended up as the default audio with the
+    visual_impaired flag and no original-audio track was left as default.
+
+    describealaign sets ``disposition:a:0=default+visual_impaired`` for the
+    AD it just muxed in, and ``disposition:a:N=0`` for every original audio
+    track. A future ffmpeg-python option-ordering quirk or a manually-
+    intervened mux could break that contract and produce a file that
+    auto-plays the wrong track on Apple TV / webOS / Jellyfin clients —
+    structurally valid, semantically wrong. Reject those before publish.
+    """
+    audio_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
+    if not audio_streams:
+        logger.error("Output has no audio streams.")
+        return False
+
+    ad_stream = audio_streams[0]
+    disp = ad_stream.get("disposition", {}) or {}
+    if not disp.get("visual_impaired"):
+        logger.error(
+            "Output a:0 is missing visual_impaired disposition — AD muxing "
+            "contract violated. disposition=%r", disp,
+        )
+        return False
+    if not disp.get("default"):
+        logger.error(
+            "Output a:0 is not default — players will not auto-play the AD. "
+            "disposition=%r", disp,
+        )
+        return False
+
+    # No other audio stream may carry the default flag. If one does, the
+    # file has two "default" audio streams and player behaviour is undefined
+    # (often: the lower-index one wins, which is the AD here, so it works
+    # by accident — but we refuse to rely on that).
+    for i, s in enumerate(audio_streams[1:], start=1):
+        s_disp = s.get("disposition", {}) or {}
+        if s_disp.get("default"):
+            logger.error(
+                "Output a:%d unexpectedly has default disposition; only the "
+                "AD track (a:0) should. disposition=%r", i, s_disp,
+            )
+            return False
+
+    return True
 
 
 def _container_duration(probe: dict) -> Optional[float]:
@@ -554,17 +615,23 @@ def _parse_fps(stream: dict) -> float:
     return 24.0  # film-rate default; conservative for the absolute-loss floor
 
 
-def _video_packet_count(path: Path) -> Optional[int]:
-    """Number of packets in the primary video stream of *path*.
+def _video_packet_count(path: Path, video_specifier_index: int = 0) -> Optional[int]:
+    """Number of packets in video stream ``v:N`` of *path*, where N is
+    *video_specifier_index*.
 
     Returns None on probe failure rather than 0, so the caller can
     distinguish "actually empty stream" (0) from "couldn't tell" (None) and
     treat the latter as a validation failure.
+
+    The index must match the stream that ``_primary_video_stream`` picked,
+    or cover art at position 0 will produce a misleading packet count
+    (~1 packet) and either fail validation on good output or pass it on
+    truncated output.
     """
     cmd = [
         "ffprobe",
         "-v", "error",
-        "-select_streams", "v:0",
+        "-select_streams", f"v:{video_specifier_index}",
         "-count_packets",
         "-show_entries", "stream=nb_read_packets",
         "-print_format", "json",
@@ -620,8 +687,8 @@ def _validate_media_output(source: Path, output: Path) -> bool:
         logger.error("Cannot ffprobe alignment output %s — refusing to publish.", output)
         return False
 
-    src_video = _primary_video_stream(src_probe)
-    out_video = _primary_video_stream(out_probe)
+    src_video, src_video_idx = _primary_video_stream(src_probe)
+    out_video, out_video_idx = _primary_video_stream(out_probe)
     if src_video is None:
         logger.error("Source has no primary video stream: %s", source)
         return False
@@ -649,6 +716,15 @@ def _validate_media_output(source: Path, output: Path) -> bool:
         )
         return False
 
+    # describealaign mux contract: output a:0 is the AD track with
+    # `default+visual_impaired` disposition, every other audio is non-default.
+    # If that contract is broken (e.g. ffmpeg-python option-ordering shift
+    # demoted the AD track or left the source's default disposition intact),
+    # Apple TV / Jellyfin clients will auto-play the wrong track even though
+    # the file is structurally valid. Refuse to publish in that case.
+    if not _has_expected_audio_disposition(out_probe):
+        return False
+
     src_duration = _container_duration(src_probe)
     out_duration = _container_duration(out_probe)
     if src_duration is None or out_duration is None:
@@ -672,8 +748,11 @@ def _validate_media_output(source: Path, output: Path) -> bool:
             )
             return False
 
-    src_packets = _video_packet_count(source)
-    out_packets = _video_packet_count(output)
+    # Count packets in the *primary* video stream — not v:0 — so a file
+    # whose v:0 is cover art doesn't validate the 1-frame cover stream
+    # while the real video is silently truncated.
+    src_packets = _video_packet_count(source, src_video_idx)
+    out_packets = _video_packet_count(output, out_video_idx)
     if src_packets is None or out_packets is None:
         logger.error(
             "Could not packet-count one of the files (src=%r out=%r) — refusing to publish.",

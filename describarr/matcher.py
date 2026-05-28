@@ -261,6 +261,18 @@ _STOPWORDS = frozenset({"the", "a", "an", "and", "of", "in", "to", "for", "seaso
 # preserved so the sequel-mismatch guard below can do its job.
 _YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
 
+# Roman numerals 1-20 cover almost every theatrical sequel naming convention
+# (Rocky I-V, Final Destination II, Saw V/VI/VII/VIII, etc.). Normalising
+# these to digits BEFORE the sequel-mismatch guard runs catches the
+# "Rocky II vs Rocky V" class of misrouting that the digit-only check
+# previously missed entirely.
+_ROMAN_TO_INT = {
+    "i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5",
+    "vi": "6", "vii": "7", "viii": "8", "ix": "9", "x": "10",
+    "xi": "11", "xii": "12", "xiii": "13", "xiv": "14", "xv": "15",
+    "xvi": "16", "xvii": "17", "xviii": "18", "xix": "19", "xx": "20",
+}
+
 
 def _title_similarity(a: str, b: str) -> float:
     """Jaccard similarity on word tokens with sequel-aware digit handling.
@@ -279,7 +291,14 @@ def _title_similarity(a: str, b: str) -> float:
     """
     def tokenize(s: str) -> set[str]:
         s = re.sub(r"[^\w\s]", " ", s.lower())
-        return {t for t in s.split() if t not in _STOPWORDS}
+        # Normalise roman numerals to digits so the sequel-mismatch guard
+        # below can catch "Rocky II vs Rocky V" the same way it catches
+        # "Iron Man 2 vs Iron Man 3". Only converts tokens that are
+        # exclusively roman numerals — a real word like "I" is in
+        # _STOPWORDS so it gets dropped anyway. "V" alone (not in
+        # stopwords) becomes "5", which is the desired behaviour for a
+        # title token meaning "fifth in the series."
+        return {_ROMAN_TO_INT.get(t, t) for t in s.split() if t not in _STOPWORDS}
 
     tokens_a = tokenize(a)
     tokens_b = tokenize(b)
