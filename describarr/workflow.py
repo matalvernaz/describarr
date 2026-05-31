@@ -286,16 +286,26 @@ _BACKUP_SUBDIR = ".describarr_backup"
 def _prune_old_backups(backup_dir: Path, retention_days: int) -> None:
     """Delete ``*.bak`` files in *backup_dir* older than *retention_days*.
 
-    retention_days ≤ 0 keeps backups indefinitely (manual cleanup)."""
+    Age is read from the ``<name>.<epoch>.bak`` timestamp embedded in the
+    filename, NOT from ``st_mtime``. A backup is a hardlink, so it shares the
+    *original* file's mtime — which for a library file is usually far older
+    than the retention window. Pruning by mtime would therefore delete every
+    backup the instant it was created. Names without a parseable timestamp are
+    left untouched. retention_days ≤ 0 keeps backups indefinitely.
+    """
     if retention_days <= 0 or not backup_dir.is_dir():
         return
     cutoff = time.time() - retention_days * 86400
     for p in backup_dir.glob("*.bak"):
         try:
-            if p.is_file() and p.stat().st_mtime < cutoff:
+            ts = int(p.name.rsplit(".", 2)[-2])
+        except (ValueError, IndexError):
+            continue  # unparseable name — don't touch it
+        if ts < cutoff:
+            try:
                 p.unlink(missing_ok=True)
-        except OSError:
-            continue
+            except OSError:
+                continue
 
 
 def _backup_original(

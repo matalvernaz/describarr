@@ -31,15 +31,34 @@ def test_backup_into_configured_dir(tmp_path):
     assert backup.stat().st_ino == video.stat().st_ino
 
 
-def test_prune_removes_old_backups(tmp_path):
+def test_backup_of_old_file_survives_its_own_prune(tmp_path):
+    # Regression: a backup is a hardlink, so it inherits the original file's
+    # (old) mtime. Pruning by mtime would delete the backup the instant it was
+    # created. The just-made backup of a 90-day-old file must survive.
+    video = tmp_path / "Old.Show.S01E01.mkv"
+    video.write_bytes(b"z" * 100)
+    ancient = time.time() - 90 * 86400
+    os.utime(video, (ancient, ancient))
+
+    backup = _backup_original(video, None, 14)  # prune runs inside
+
+    assert backup is not None
+    assert backup.exists()
+
+
+def test_prune_uses_filename_timestamp_not_mtime(tmp_path):
     bdir = tmp_path / "b"
     bdir.mkdir()
-    old = bdir / "old.bak"
+    old_ts = int(time.time() - 30 * 86400)
+    new_ts = int(time.time())
+    old = bdir / f"old.mkv.{old_ts}.bak"
     old.write_bytes(b"1")
-    fresh = bdir / "fresh.bak"
+    fresh = bdir / f"fresh.mkv.{new_ts}.bak"
     fresh.write_bytes(b"2")
-    stale = time.time() - 30 * 86400
-    os.utime(old, (stale, stale))
+    # Give both a fresh mtime to prove the decision is by filename, not mtime.
+    now = time.time()
+    os.utime(old, (now, now))
+    os.utime(fresh, (now, now))
 
     _prune_old_backups(bdir, retention_days=14)
 
@@ -47,13 +66,22 @@ def test_prune_removes_old_backups(tmp_path):
     assert fresh.exists()
 
 
+def test_prune_leaves_unparseable_names(tmp_path):
+    bdir = tmp_path / "b"
+    bdir.mkdir()
+    weird = bdir / "no-timestamp.bak"
+    weird.write_bytes(b"1")
+
+    _prune_old_backups(bdir, retention_days=14)
+
+    assert weird.exists()
+
+
 def test_prune_zero_retention_keeps_everything(tmp_path):
     bdir = tmp_path / "b"
     bdir.mkdir()
-    old = bdir / "old.bak"
+    old = bdir / f"old.mkv.{int(time.time() - 365 * 86400)}.bak"
     old.write_bytes(b"1")
-    stale = time.time() - 365 * 86400
-    os.utime(old, (stale, stale))
 
     _prune_old_backups(bdir, retention_days=0)
 
