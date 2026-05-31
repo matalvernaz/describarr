@@ -1,45 +1,54 @@
 """
-Pushover notifier for describarr.
+ntfy notifier for describarr.
 
-Reads PUSHOVER_TOKEN and PUSHOVER_USER from the environment. When unset, send()
-is a no-op so the server still works for users who haven't configured Pushover.
+Reads NTFY_URL (base server URL, e.g. http://ntfy:2586) and NTFY_TOPIC from the
+environment; NTFY_TOKEN is optional bearer auth. When NTFY_URL or NTFY_TOPIC is
+unset, send() is a no-op so the server still works for users who haven't
+configured notifications.
+
+Publishing uses ntfy's JSON endpoint rather than the header-based API so that
+unicode titles and messages (media names with accents, CJK, etc.) survive — the
+HTTP Title header is ASCII-only, but a JSON body is not.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
-_API_URL = "https://api.pushover.net/1/messages.json"
+_REQUEST_TIMEOUT_SEC = 10
 
 
-def _creds() -> tuple[str, str] | None:
-    token = os.environ.get("PUSHOVER_TOKEN", "").strip()
-    user = os.environ.get("PUSHOVER_USER", "").strip()
-    if not token or not user:
+def _config() -> tuple[str, str, str] | None:
+    base = os.environ.get("NTFY_URL", "").strip().rstrip("/")
+    topic = os.environ.get("NTFY_TOPIC", "").strip()
+    if not base or not topic:
         return None
-    return token, user
+    token = os.environ.get("NTFY_TOKEN", "").strip()
+    return base, topic, token
 
 
 def send(title: str, message: str) -> None:
-    """Fire-and-forget Pushover notification. Logs and swallows any failure."""
-    creds = _creds()
-    if creds is None:
+    """Fire-and-forget ntfy notification. Logs and swallows any failure."""
+    config = _config()
+    if config is None:
         return
-    token, user = creds
-    data = urlencode({
-        "token": token,
-        "user": user,
+    base, topic, token = config
+    body = json.dumps({
+        "topic": topic,
         "title": title,
         "message": message,
-    }).encode()
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        with urlopen(Request(_API_URL, data=data), timeout=10) as resp:
+        with urlopen(Request(base, data=body, headers=headers), timeout=_REQUEST_TIMEOUT_SEC) as resp:
             if resp.status >= 400:
-                logger.warning("Pushover returned HTTP %d", resp.status)
+                logger.warning("ntfy returned HTTP %d", resp.status)
     except Exception:
-        logger.warning("Pushover notification failed.", exc_info=True)
+        logger.warning("ntfy notification failed.", exc_info=True)
