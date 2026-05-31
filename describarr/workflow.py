@@ -683,8 +683,14 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
     """
     Process items that were previously skipped due to the daily download limit.
 
-    Stops as soon as the limit is hit again, leaving remaining items in the
-    queue for the next day.
+    Once AudioVault's daily download cap is hit, only items that would need a
+    *new* download are deferred — items whose season zip is already cached
+    keep processing, because a cache hit never charges the limiter. (One
+    AudioVault download is a whole season zip, so a single download clears
+    every queued episode of that season.) A season that hits the cap is
+    remembered for the rest of this drain so its other episodes skip straight
+    to the deferred pile instead of re-searching AudioVault for a download
+    that can't happen yet.
 
     Transient network errors re-queue the item with an attempt counter so a
     flaky AudioVault response can't silently drop a Sonarr-queued episode;
@@ -695,15 +701,27 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
         return
     logger.info("Draining %d queued item(s).", len(items))
     remaining: list[dict] = []
-    limit_hit = False
+    # (type, title, season/year) keys that needed a download we couldn't make
+    # under the cap; their siblings are deferred without a wasted search.
+    capped_keys: set[tuple] = set()
+    deferred = 0
     for item in items:
-        if limit_hit:
-            remaining.append(item)
-            continue
         video_path = Path(item["video_path"])
         if not video_path.is_file():
             logger.warning("Queued file no longer exists, dropping: %s", video_path)
             continue
+
+        if item.get("type") == "episode":
+            cap_key = ("episode", item.get("series_title"), item.get("season"))
+        elif item.get("type") == "movie":
+            cap_key = ("movie", item.get("movie_title"), item.get("movie_year", ""))
+        else:
+            cap_key = None
+        if cap_key is not None and cap_key in capped_keys:
+            remaining.append(item)
+            deferred += 1
+            continue
+
         try:
             if item["type"] == "episode":
                 # ``extra_episodes`` carries the rest of a Sonarr multi-episode
@@ -732,10 +750,13 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                 continue
         except DailyLimitReached:
             remaining.append(item)
-            limit_hit = True
+            deferred += 1
+            if cap_key is not None:
+                capped_keys.add(cap_key)
             logger.info(
-                "Daily limit hit during queue drain — %d item(s) remain queued.",
-                len(items) - items.index(item),
+                "Download cap reached for %s — deferring it (and its season's "
+                "other episodes) to the next drain; cache-served items continue.",
+                item["video_path"],
             )
         except _TRANSIENT_ERRORS as exc:
             attempts = int(item.get("drain_attempts", 0)) + 1
@@ -791,6 +812,8 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                 item["video_path"], exc_info=True,
             )
             remaining.append(item)
+    if deferred:
+        logger.info("%d item(s) deferred to the next drain (download cap).", deferred)
     if remaining:
         queue.save(remaining)
     else:
