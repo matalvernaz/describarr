@@ -585,6 +585,29 @@ def _has_expected_audio_disposition(probe: dict) -> bool:
     return True
 
 
+def source_has_ad_track(path: Path) -> bool:
+    """True if *path* already carries an audio stream flagged
+    ``visual_impaired`` — i.e. an audio description has already been muxed in.
+
+    Used to skip re-aligning an already-described file. Without this guard a
+    duplicate webhook or a mid-drain restart re-aligns the file and stacks a
+    *second* AD track, because ``_validate_media_output`` only requires
+    ``audio_count >= source + 1`` and a double-mux satisfies that.
+
+    Returns False on a probe failure: a transient ffprobe error must never
+    block a legitimate first-time alignment.
+    """
+    probe = _ffprobe_json(path)
+    if probe is None:
+        return False
+    for s in probe.get("streams", []):
+        if s.get("codec_type") != "audio":
+            continue
+        if (s.get("disposition", {}) or {}).get("visual_impaired"):
+            return True
+    return False
+
+
 def _container_duration(probe: dict) -> Optional[float]:
     fmt = probe.get("format") or {}
     raw = fmt.get("duration")

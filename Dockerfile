@@ -1,6 +1,8 @@
 FROM python:3.13-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git \
+# tzdata lets the TZ env var resolve to a real zone (the slim base is UTC-only),
+# so the daily-limit reset and the midnight drain run on local time, not UTC.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

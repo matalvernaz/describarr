@@ -26,7 +26,7 @@ from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, Lo
 from .config import Config
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
-from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, _safe_dirname
+from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +200,18 @@ def _midnight_drain_loop() -> None:
         # Pruning is read-only relative to the worker (touches a different
         # subtree) so it's safe to run here without blocking the queue.
         prune_alignment_artifacts(config.cache_dir / "alignments")
+        # Sweep orphaned alignment scratch (run-* dirs / stray outputs left by
+        # a crash mid-alignment). Age-gated at 2h so it can't touch a live run.
+        try:
+            prune_output_scratch(config.cache_dir)
+        except Exception:
+            logger.exception("prune_output_scratch failed; continuing.")
+        # Expire aged backups in every folder we've ever backed up into, so a
+        # finished show's .describarr_backup dir doesn't linger past retention.
+        try:
+            prune_registered_backups(config.cache_dir, config.backup_retention_days)
+        except Exception:
+            logger.exception("prune_registered_backups failed; continuing.")
         # Reclaim zips for long-completed seasons whose .done file pre-dates
         # the dict-format/cleanup logic. Operates only on seasons whose
         # done-set already covers the zip's audio count, so it can't race

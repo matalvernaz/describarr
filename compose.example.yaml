@@ -6,6 +6,8 @@ services:
       - AUDIOVAULT_EMAIL=${AUDIOVAULT_EMAIL}
       - AUDIOVAULT_PASSWORD=${AUDIOVAULT_PASSWORD}
       - DESCRIBARR_MIN_SCORE=${DESCRIBARR_MIN_SCORE:-65}
+      # Run the daily-limit reset and overnight drain on local time, not UTC.
+      - TZ=${TZ:-America/Vancouver}
       # Optional: per-episode Pushover notification when describarr finishes.
       # Leave unset to disable.
       - PUSHOVER_TOKEN=${PUSHOVER_TOKEN:-}

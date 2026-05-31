@@ -180,6 +180,11 @@ def extract_episode(zip_path: Path, extract_dir: Path, episode: int) -> Optional
         # number is the episode. Anchored to stem start to avoid false matches
         # against episode numbers embedded in titles.
         re.compile(rf"^\d+\s*-\s*0*{episode}(?!\d)"),
+        # AudioVault season.episode disc format: "4.09 Title.mp3" (season 4,
+        # episode 9). Anchored to stem start; the dot separates season from a
+        # zero-padded episode. Without this the positional fallback was the
+        # only thing matching these and could pick the wrong file.
+        re.compile(rf"^\d+\.0*{episode}(?!\d)"),
     ]
 
     for audio in audio_files:

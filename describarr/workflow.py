@@ -26,7 +26,14 @@ from typing import Optional
 
 import requests
 
-from .aligner import run as align, parse_score, content_score, slope_stability, sync_quality
+from .aligner import (
+    run as align,
+    parse_score,
+    content_score,
+    slope_stability,
+    sync_quality,
+    source_has_ad_track,
+)
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
 from .matcher import extract_episode, find_movie, find_season
@@ -45,6 +52,20 @@ _TRANSIENT_ERRORS = (
 # After this many failed drain attempts the item is dropped — protects against
 # truly bad URLs that would otherwise loop forever.
 _MAX_DRAIN_ATTEMPTS = 5
+
+# A queued item that keeps deferring (its season never gets a download slot,
+# or it has no obtainable AD) is abandoned after this many drain passes —
+# roughly this many days at one drain/day — so the retry queue can't
+# accumulate permanent residents that will never succeed.
+_MAX_DRAIN_PASSES = 30
+
+
+def _should_abandon_stale(item: dict) -> bool:
+    """Increment *item*'s deferral counter; return True once it has been
+    deferred too many times and should be dropped instead of re-queued."""
+    passes = int(item.get("drain_passes", 0)) + 1
+    item["drain_passes"] = passes
+    return passes > _MAX_DRAIN_PASSES
 
 # Trailing "(YYYY)" tokens in the title break AudioVault's search index. The
 # year stripping is applied defensively here even though callers usually pass
@@ -91,6 +112,11 @@ def process_episode(
     Returns True if a combined file was produced with an acceptable score.
     """
     all_episodes = [episode] + list(extra_episodes or [])
+    # Idempotency guard: never re-align a file that already has an AD track,
+    # or we stack a second one (duplicate webhook / mid-drain restart).
+    if source_has_ad_track(video_path):
+        logger.info("%s already has an audio-description track — skipping.", video_path.name)
+        return True
     if len(all_episodes) == 1:
         logger.info("Looking up: %s S%02dE%02d", series_title, season, episode)
     else:
@@ -161,6 +187,9 @@ def process_movie(
 
     Returns True if a combined file was produced with an acceptable score.
     """
+    if source_has_ad_track(video_path):
+        logger.info("%s already has an audio-description track — skipping.", video_path.name)
+        return True
     logger.info("Looking up movie: %s (%s)", movie_title, movie_year)
 
     search_title = _strip_year_suffix(movie_title)
@@ -309,7 +338,8 @@ def _prune_old_backups(backup_dir: Path, retention_days: int) -> None:
 
 
 def _backup_original(
-    video_path: Path, backup_dir: Optional[Path], retention_days: int
+    video_path: Path, backup_dir: Optional[Path], retention_days: int,
+    registry_path: Optional[Path] = None,
 ) -> Optional[Path]:
     """Hardlink *video_path* aside before it's overwritten, returning the
     backup path (or None if no backup could be made).
@@ -364,8 +394,95 @@ def _backup_original(
             logger.error("Could not back up %s before overwrite: %s", video_path, exc2)
             return None
 
+    if registry_path is not None:
+        _register_backup_dir(registry_path, target_dir)
     _prune_old_backups(target_dir, retention_days)
     return backup_path
+
+
+def _register_backup_dir(registry_path: Path, backup_dir: Path) -> None:
+    """Record *backup_dir* in a JSON registry so the nightly sweep can prune
+    backups in folders no future publish will revisit (sibling
+    ``.describarr_backup`` dirs are scattered across the library). Best-effort:
+    never blocks a publish."""
+    try:
+        dirs: list = []
+        if registry_path.exists():
+            loaded = json.loads(registry_path.read_text())
+            if isinstance(loaded, list):
+                dirs = loaded
+        s = str(backup_dir)
+        if s not in dirs:
+            dirs.append(s)
+            _atomic_write_json(registry_path, dirs)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+def prune_registered_backups(cache_dir: Path, retention_days: int) -> None:
+    """Prune aged backups in every registered backup dir, then drop dead
+    entries from the registry.
+
+    Run from the midnight loop so backups in a finished show's folder expire
+    on schedule even though no later publish revisits that folder. Without
+    this, sibling ``.describarr_backup`` dirs only get pruned when the same
+    folder gets another publish — so a wrapped-up season's backups would
+    linger past the retention window forever.
+    """
+    registry_path = cache_dir / "backup_dirs.json"
+    if not registry_path.exists():
+        return
+    try:
+        dirs = json.loads(registry_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(dirs, list):
+        return
+    live: list[str] = []
+    for d in dirs:
+        p = Path(d)
+        if not p.is_dir():
+            continue  # folder gone — drop the registry entry
+        _prune_old_backups(p, retention_days)
+        if any(p.glob("*.bak")):
+            live.append(d)  # keep only entries that still hold backups
+    if live != dirs:
+        _atomic_write_json(registry_path, live)
+
+
+# Orphaned alignment scratch older than this has no live run behind it: the
+# worker aligns one file at a time and the subprocess hard-times-out at 1h, so
+# 2h is a safe floor that can never race an in-progress run.
+_SCRATCH_ORPHAN_AGE_SEC = 7200
+
+
+def prune_output_scratch(cache_dir: Path) -> None:
+    """Delete orphaned alignment scratch under ``<cache>/output``: ``run-*``
+    dirs and stray ``ad_*`` / ``.tmp.*`` files left behind when an alignment
+    died mid-flight (e.g. a container restart at Watchtower's 04:00 pull).
+
+    The happy path cleans its own run dir on completion; this sweeps what
+    crashes leave. Called from the midnight loop.
+    """
+    output_dir = cache_dir / "output"
+    if not output_dir.is_dir():
+        return
+    cutoff = time.time() - _SCRATCH_ORPHAN_AGE_SEC
+    removed = 0
+    for p in output_dir.iterdir():
+        try:
+            if p.stat().st_mtime >= cutoff:
+                continue
+        except OSError:
+            continue
+        if p.is_dir() and p.name.startswith("run-"):
+            shutil.rmtree(p, ignore_errors=True)
+            removed += 1
+        elif p.is_file() and (p.name.startswith("ad_") or p.name.startswith(".tmp.")):
+            p.unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        logger.info("Pruned %d orphaned output-scratch item(s).", removed)
 
 
 def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
@@ -449,6 +566,7 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
             backup_originals=config.backup_originals,
             backup_dir=config.backup_dir,
             backup_retention_days=config.backup_retention_days,
+            backup_registry=config.cache_dir / "backup_dirs.json",
         )
     finally:
         # Whether publish succeeded or failed, the run dir is no longer needed.
@@ -506,6 +624,7 @@ def _publish_in_place(
     backup_originals: bool = False,
     backup_dir: Optional[Path] = None,
     backup_retention_days: int = 14,
+    backup_registry: Optional[Path] = None,
 ) -> None:
     """
     Atomically replace *video_path* with the contents of *combined*.
@@ -585,7 +704,8 @@ def _publish_in_place(
             # a backup failure logs but does not block the replacement.
             if backup_originals:
                 backup_path = _backup_original(
-                    video_path, backup_dir, backup_retention_days
+                    video_path, backup_dir, backup_retention_days,
+                    registry_path=backup_registry,
                 )
                 if backup_path is not None:
                     logger.info("Backed up original → %s", backup_path)
@@ -728,8 +848,14 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
         else:
             cap_key = None
         if cap_key is not None and cap_key in capped_keys:
-            remaining.append(item)
-            deferred += 1
+            if _should_abandon_stale(item):
+                logger.error(
+                    "Abandoning %s after %d drain passes — never serviceable.",
+                    item.get("video_path"), item.get("drain_passes"),
+                )
+            else:
+                remaining.append(item)
+                deferred += 1
             continue
 
         try:
@@ -759,15 +885,21 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                 remaining.append(item)
                 continue
         except DailyLimitReached:
-            remaining.append(item)
-            deferred += 1
             if cap_key is not None:
                 capped_keys.add(cap_key)
-            logger.info(
-                "Download cap reached for %s — deferring it (and its season's "
-                "other episodes) to the next drain; cache-served items continue.",
-                item["video_path"],
-            )
+            if _should_abandon_stale(item):
+                logger.error(
+                    "Abandoning %s after %d drain passes — never serviceable.",
+                    item["video_path"], item.get("drain_passes"),
+                )
+            else:
+                remaining.append(item)
+                deferred += 1
+                logger.info(
+                    "Download cap reached for %s — deferring it (and its season's "
+                    "other episodes) to the next drain; cache-served items continue.",
+                    item["video_path"],
+                )
         except _TRANSIENT_ERRORS as exc:
             attempts = int(item.get("drain_attempts", 0)) + 1
             if attempts >= _MAX_DRAIN_ATTEMPTS:
