@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -62,6 +63,17 @@ class Config:
     # Describarr refuses to run that path for an in-place library mutation
     # unless this flag is explicitly opted in.
     allow_video_retime: bool = False
+    # In-place replacement is destructive. Before overwriting the original we
+    # hardlink it into a backup location so a mis-accepted alignment is always
+    # recoverable. A hardlink is instant and costs no extra space until the
+    # original content has no other links. backup_dir=None ⇒ a
+    # ".describarr_backup" dir beside each file (guaranteed same filesystem,
+    # so the hardlink can't fail cross-device). Set DESCRIBARR_BACKUP_DIR to
+    # collect every backup in one place — it must be on the same filesystem as
+    # the media or the code falls back to the per-file sibling dir.
+    backup_originals: bool = True
+    backup_dir: Optional[Path] = None
+    backup_retention_days: int = 14
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -86,6 +98,19 @@ class Config:
         stretch_audio = _parse_bool("DESCRIBARR_STRETCH_AUDIO", default=True)
         allow_video_retime = _parse_bool("DESCRIBARR_ALLOW_VIDEO_RETIME", default=False)
 
+        backup_originals = _parse_bool("DESCRIBARR_BACKUP_ORIGINALS", default=True)
+        raw_backup_dir = os.environ.get("DESCRIBARR_BACKUP_DIR", "").strip()
+        backup_dir = Path(raw_backup_dir).expanduser() if raw_backup_dir else None
+        raw_retention = os.environ.get("DESCRIBARR_BACKUP_RETENTION_DAYS", "14").strip()
+        try:
+            backup_retention_days = int(raw_retention)
+        except ValueError:
+            raise ValueError(
+                f"DESCRIBARR_BACKUP_RETENTION_DAYS must be an integer; got {raw_retention!r}"
+            )
+        if backup_retention_days < 0:
+            raise ValueError("DESCRIBARR_BACKUP_RETENTION_DAYS must be ≥ 0.")
+
         return cls(
             email=email,
             password=password,
@@ -93,4 +118,7 @@ class Config:
             cache_dir=cache_dir,
             stretch_audio=stretch_audio,
             allow_video_retime=allow_video_retime,
+            backup_originals=backup_originals,
+            backup_dir=backup_dir,
+            backup_retention_days=backup_retention_days,
         )

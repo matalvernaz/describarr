@@ -7,7 +7,7 @@ When Sonarr or Radarr imports a new file, describarr:
 1. Searches AudioVault for a matching audio description track.
 2. Downloads the file (caching season ZIPs so they are only fetched once per season).
 3. Runs [describealaign](https://github.com/julbean/describealaign) to align and combine the audio description with the video.
-4. If the alignment score is **65 % or above**, replaces the original file in-place with the combined version. Otherwise the audio description is discarded and the original is untouched.
+4. If the alignment is confident enough that the description lands at the right time, replaces the original file in-place with the combined version. The primary gate is the **similarity score (default ≥ 65 %)**, which measures how well the description track's embedded program audio locked onto the video — i.e. how confidently the narration was placed in time. A secondary *drift rescue* accepts a lower similarity only when the time-mapping is uniform and the cause is known (commercial-break seams, or a PAL/NTSC rate conversion). Otherwise the description is discarded and the original is untouched. As a safety net, the original is hardlinked into a backup before any overwrite (see `DESCRIBARR_BACKUP_*`), so a bad alignment is always recoverable.
 
 ---
 
@@ -219,7 +219,7 @@ If the folder name doesn't include the year (or the AudioVault title differs), p
 
 **"No AudioVault results"** — The show or movie may not have an audio description on AudioVault yet. Use the [manual retry](#manual-retry) endpoint once it becomes available.
 
-**"Score X% is below threshold"** — The audio description didn't align well with the video (possibly a different version/cut). The original file is untouched.
+**"Discarding … no trusted sync signal"** — The audio description didn't align confidently with the video (possibly a different version/cut), so describarr won't risk publishing a description that plays at the wrong moment. The original file is untouched.
 
 **Green tick on Test but nothing happens on import** — Check that the hook script is executable and that the `describarr` container is on the same Docker network as Sonarr/Radarr.
 

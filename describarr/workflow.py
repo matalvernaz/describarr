@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -212,6 +213,151 @@ def process_movie(
 # Internal helpers
 # ------------------------------------------------------------------
 
+# Acceptance gate tuning. similarity (describealaign's match-confidence
+# metric) is the sync signal and is the only thing trusted on its own. The
+# rescue path exists for sources whose similarity is depressed by a *known*
+# cause while the time-mapping stays clean, and is bounded so a "stably wrong"
+# alignment can't slip through:
+_RESCUE_MIN_SCORE = 30.0          # describealaign warns < 20% = mismatched; stay clear of it
+_RESCUE_MIN_STABLE_FRACTION = 90.0
+_RESCUE_MIN_RUNTIME_SEC = 300.0
+_NATIVE_RATE_TOLERANCE = 0.5      # |median_rate| ≤ this ⇒ native-rate (commercial-seam) rescue
+_DRIFT_RATE_MIN = 2.0             # PAL/NTSC rate conversion is ~4.27%
+_DRIFT_RATE_MAX = 6.0             # anything past this is not a standard rate shift → reject
+
+
+def _acceptance_decision(
+    *,
+    score: float,
+    content_coverage: float,
+    stable_fraction: float,
+    median_rate: float,
+    total_runtime: float,
+    sync_ok: bool,
+    min_score: float,
+) -> tuple[bool, str, str]:
+    """Decide whether an alignment is good enough to overwrite the original.
+
+    Pure function (no I/O) so the acceptance matrix can be unit-tested
+    directly. Returns ``(accepted, path, detail)`` where *path* is
+    ``"similarity"`` / ``"drift-rescue"`` / ``"reject"`` and *detail* is a
+    human-readable reason for the log.
+
+    similarity is the sync gate: it measures how much of the AD release's
+    embedded program audio matched the video, i.e. how confidently the
+    description was placed in time. The rescue path NEVER accepts on
+    structure alone — it requires a minimum of real matched anchors
+    (*score* ≥ ``_RESCUE_MIN_SCORE``), a tight low-variance time-mapping
+    (``stable_fraction`` high AND ``sync_ok``), and a rate that is either
+    native (commercial-break-seam case) or a *bounded* known drift
+    (PAL/NTSC). content_coverage is informational only — "few seam
+    artifacts" says nothing about whether the narration lands on time.
+    """
+    if score >= min_score:
+        return True, "similarity", f"similarity {score:.1f}% ≥ {min_score:.0f}% (sync confident)"
+
+    rate_ok = (
+        abs(median_rate) <= _NATIVE_RATE_TOLERANCE
+        or _DRIFT_RATE_MIN <= abs(median_rate) <= _DRIFT_RATE_MAX
+    )
+    rescue_ok = (
+        sync_ok
+        and stable_fraction >= _RESCUE_MIN_STABLE_FRACTION
+        and score >= _RESCUE_MIN_SCORE
+        and total_runtime >= _RESCUE_MIN_RUNTIME_SEC
+        and rate_ok
+    )
+    if rescue_ok:
+        return True, "drift-rescue", (
+            f"similarity {score:.1f}% below {min_score:.0f}% but stable trunk "
+            f"{stable_fraction:.1f}% at median rate {median_rate:.2f}% with a passing "
+            f"sync-quality check — accepting consistent-drift alignment"
+        )
+    return False, "reject", (
+        f"similarity {score:.1f}% (coverage {content_coverage:.1f}%, stable trunk "
+        f"{stable_fraction:.1f}%, median rate {median_rate:.2f}%, sync_ok={sync_ok}) "
+        f"— no trusted sync signal"
+    )
+
+
+_BACKUP_SUBDIR = ".describarr_backup"
+
+
+def _prune_old_backups(backup_dir: Path, retention_days: int) -> None:
+    """Delete ``*.bak`` files in *backup_dir* older than *retention_days*.
+
+    retention_days ≤ 0 keeps backups indefinitely (manual cleanup)."""
+    if retention_days <= 0 or not backup_dir.is_dir():
+        return
+    cutoff = time.time() - retention_days * 86400
+    for p in backup_dir.glob("*.bak"):
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def _backup_original(
+    video_path: Path, backup_dir: Optional[Path], retention_days: int
+) -> Optional[Path]:
+    """Hardlink *video_path* aside before it's overwritten, returning the
+    backup path (or None if no backup could be made).
+
+    A hardlink is instant and consumes no extra space until the original
+    content has no other links, so this is cheap insurance against a
+    mis-accepted alignment clobbering a good file. The backup is best-effort:
+    a failure logs and returns None rather than blocking the core
+    align-and-publish flow.
+
+    backup_dir=None ⇒ a sibling ``.describarr_backup`` dir, always on the
+    same filesystem as the video so the hardlink can't fail EXDEV. A
+    configured backup_dir collects every backup in one place but must be on
+    the same filesystem as the media; if it isn't, we fall back to the
+    sibling dir.
+    """
+    ts = int(time.time())
+    if backup_dir is not None:
+        # Short hash of the full source path so two identically-named files
+        # from different folders can't collide in the shared backup dir.
+        digest = hashlib.md5(str(video_path).encode()).hexdigest()[:8]
+        target_dir = backup_dir
+        backup_name = f"{digest}.{video_path.name}.{ts}.bak"
+    else:
+        target_dir = video_path.parent / _BACKUP_SUBDIR
+        backup_name = f"{video_path.name}.{ts}.bak"
+
+    def _link_into(d: Path, name: str) -> Path:
+        d.mkdir(parents=True, exist_ok=True)
+        dst = d / name
+        os.link(video_path, dst)
+        return dst
+
+    try:
+        backup_path = _link_into(target_dir, backup_name)
+    except OSError as exc:
+        # Most likely EXDEV: configured backup_dir is on a different
+        # filesystem than the media. Fall back to the sibling dir, which is
+        # guaranteed same-fs.
+        if backup_dir is None:
+            logger.error("Could not back up %s before overwrite: %s", video_path, exc)
+            return None
+        logger.warning(
+            "Backup hardlink into %s failed (%s); falling back to a sibling dir.",
+            target_dir, exc,
+        )
+        target_dir = video_path.parent / _BACKUP_SUBDIR
+        backup_name = f"{video_path.name}.{ts}.bak"
+        try:
+            backup_path = _link_into(target_dir, backup_name)
+        except OSError as exc2:
+            logger.error("Could not back up %s before overwrite: %s", video_path, exc2)
+            return None
+
+    _prune_old_backups(target_dir, retention_days)
+    return backup_path
+
+
 def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     """Run alignment and either keep or discard the combined output."""
     alignment_dir = config.cache_dir / "alignments"
@@ -261,70 +407,57 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
         video_path.name, score, cscore, stable_fraction, median_rate, total_runtime,
     )
 
-    # Three independent acceptance paths:
-    #   1. similarity score ≥ min_score (the headline describealaign metric).
-    #   2. content coverage ≥ 90% (rescues episodes where commercial-break
-    #      seams depress similarity but the trunk content lines up cleanly).
-    #   3. slope stability ≥ 90% with a consistent non-trivial drift
-    #      (rescues PAL/NTSC content where the 4.27% rate change correctly
-    #      describes the entire alignment, but the inherited pitch shift
-    #      drags the feature-match similarity score below threshold).
-    #      The drift gate accepts either a *known* rate shift (|median_rate|
-    #      ≥ 2, covering PAL/NTSC at 4.27% and similar) OR a near-perfect
-    #      sync (|median_rate| ≤ 0.5, covering native-rate alignments
-    #      depressed below the similarity threshold by commercial-break
-    #      noise). The middle band (0.5 < |median_rate| < 2) is the
-    #      "wobbly low-similarity" zone where neither perfect sync nor a
-    #      known frame-rate shift explains the low score — those are
-    #      almost certainly bad alignments and stay rejected.
-    desc_ok = score >= config.min_score
-    coverage_ok = cscore >= 90.0
-    slope_ok = (
-        stable_fraction >= 90.0
-        and score >= 30.0
-        and total_runtime >= 300.0
-        and (abs(median_rate) <= 0.5 or abs(median_rate) >= 2.0)
+    # similarity is describealaign's match-confidence metric: the fraction of
+    # the AD release's embedded program audio that aligned against the video.
+    # High similarity means the description lands at the right time, so it is
+    # the sync gate and is the only signal trusted on its own. The rescue path
+    # (see _acceptance_decision) only covers similarity depressed by a *known*
+    # cause — commercial-break seams on a native-rate source, or the pitch
+    # shift on a PAL/NTSC rate-converted source — and demands a tight,
+    # low-variance, bounded-rate time-mapping. Bare content-coverage acceptance
+    # was removed: "few seam artifacts" says nothing about whether the
+    # narration is on time, which is the entire point of the alignment.
+    sync_ok, sync_reason = sync_quality(report)
+    accepted, accept_path, decision_detail = _acceptance_decision(
+        score=score,
+        content_coverage=cscore,
+        stable_fraction=stable_fraction,
+        median_rate=median_rate,
+        total_runtime=total_runtime,
+        sync_ok=sync_ok,
+        min_score=config.min_score,
     )
-
-    accepted = desc_ok or coverage_ok or slope_ok
     if not accepted:
-        logger.warning(
-            "Score %.1f%%, coverage %.1f%%, slope stability %.1f%% (median %.2f%%) "
-            "— all below thresholds, discarding.",
-            score, cscore, stable_fraction, median_rate,
-        )
+        logger.warning("Discarding %s — %s", video_path.name, decision_detail)
         _cleanup_combined(combined)
         return False
-
-    if not desc_ok and not coverage_ok and slope_ok:
-        logger.info(
-            "Score %.1f%% and coverage %.1f%% below thresholds, but slope "
-            "stability %.1f%% at median %.2f%% — accepting (consistent-drift alignment).",
-            score, cscore, stable_fraction, median_rate,
-        )
-    elif not desc_ok:
-        logger.info(
-            "Low similarity score (%.1f%%) but content coverage %.1f%% passes — accepting.",
-            score, cscore,
-        )
-
-    sync_ok, sync_reason = sync_quality(report)
+    logger.info("Accepting %s via %s path — %s", video_path.name, accept_path, decision_detail)
 
     try:
-        _publish_in_place(combined, video_path, expected_fp=pre_fp)
+        _publish_in_place(
+            combined, video_path, expected_fp=pre_fp,
+            backup_originals=config.backup_originals,
+            backup_dir=config.backup_dir,
+            backup_retention_days=config.backup_retention_days,
+        )
     finally:
         # Whether publish succeeded or failed, the run dir is no longer needed.
         # Cleaning it here keeps the per-run isolation tidy and prevents a
         # ~1-2 GB orphan sitting in the cache forever.
         _cleanup_combined(combined)
 
-    if not sync_ok:
+    # The rescue path already required sync_ok, so this only fires on the
+    # high-similarity path — where a wobbly rate is unusual but worth flagging.
+    if accept_path == "similarity" and not sync_ok:
         logger.warning(
-            "SYNC QUALITY WARNING for %s — description may be out of sync: %s",
+            "SYNC QUALITY WARNING for %s — high similarity but %s",
             video_path, sync_reason,
         )
 
-    logger.info("Success (score=%.1f%% coverage=%.1f%%): replaced %s", score, cscore, video_path)
+    logger.info(
+        "Success: replaced %s (similarity=%.1f%%, stable trunk=%.1f%%)",
+        video_path, score, stable_fraction,
+    )
     return True
 
 
@@ -359,6 +492,10 @@ def _publish_in_place(
     combined: Path,
     video_path: Path,
     expected_fp: Optional[tuple[int, int, int]] = None,
+    *,
+    backup_originals: bool = False,
+    backup_dir: Optional[Path] = None,
+    backup_retention_days: int = 14,
 ) -> None:
     """
     Atomically replace *video_path* with the contents of *combined*.
@@ -421,6 +558,27 @@ def _publish_in_place(
             # leave a metadata-renamed-but-data-empty file.
             with tmp_dest.open("rb") as fh:
                 os.fsync(fh.fileno())
+
+            # shutil.copy2 above can run for a minute on a multi-GB output.
+            # The check at the top of the lock only covers the alignment
+            # window; re-check here so a Sonarr/Radarr upgrade that landed
+            # during the copy isn't silently clobbered.
+            final_fp = _file_fingerprint(video_path)
+            if final_fp != pre_fp:
+                raise RuntimeError(
+                    f"Source video changed during publish copy window "
+                    f"(fp {pre_fp!r} → {final_fp!r}); refusing to overwrite {video_path}."
+                )
+
+            # Insurance: hardlink the original aside before replacing it so a
+            # mis-accepted alignment can always be rolled back. Best-effort —
+            # a backup failure logs but does not block the replacement.
+            if backup_originals:
+                backup_path = _backup_original(
+                    video_path, backup_dir, backup_retention_days
+                )
+                if backup_path is not None:
+                    logger.info("Backed up original → %s", backup_path)
 
             os.replace(tmp_dest, video_path)
 
