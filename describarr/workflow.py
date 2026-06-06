@@ -825,16 +825,26 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
     Transient network errors re-queue the item with an attempt counter so a
     flaky AudioVault response can't silently drop a Sonarr-queued episode;
     items that hit `_MAX_DRAIN_ATTEMPTS` consecutive failures are dropped.
+
+    Returns a summary dict (described / described_labels / no_match /
+    abandoned / deferred / remaining) for the caller to notify on, or None
+    if the queue was empty.
     """
     items = queue.load()
     if not items:
-        return
+        return None
     logger.info("Draining %d queued item(s).", len(items))
     remaining: list[dict] = []
     # (type, title, season/year) keys that needed a download we couldn't make
     # under the cap; their siblings are deferred without a wasted search.
     capped_keys: set[tuple] = set()
     deferred = 0
+    # Outcome tallies returned to the caller so it can fire a single
+    # drain-summary notification (the per-item live-webhook path notifies
+    # elsewhere; the bulk drain stays notify-agnostic itself).
+    described_labels: list[str] = []
+    no_match = 0
+    abandoned = 0
     for item in items:
         video_path = Path(item["video_path"])
         if not video_path.is_file():
@@ -849,6 +859,7 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
             cap_key = None
         if cap_key is not None and cap_key in capped_keys:
             if _should_abandon_stale(item):
+                abandoned += 1
                 logger.error(
                     "Abandoning %s after %d drain passes — never serviceable.",
                     item.get("video_path"), item.get("drain_passes"),
@@ -865,13 +876,13 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                 # against the primary episode's audio; the helper marks every
                 # covered episode done in the same call.
                 extra_episodes = list(item.get("extra_episodes") or [])
-                process_episode(
+                described = process_episode(
                     client, config, video_path,
                     item["series_title"], item["season"], item["episode"],
                     extra_episodes=extra_episodes,
                 )
             elif item["type"] == "movie":
-                process_movie(
+                described = process_movie(
                     client, config, video_path,
                     item["movie_title"], item.get("movie_year", ""),
                 )
@@ -884,10 +895,17 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                 )
                 remaining.append(item)
                 continue
+            # Reached only on a non-exception episode/movie pass. The item
+            # leaves the queue either way; we only tally which it was.
+            if described:
+                described_labels.append(_queue_item_label(item))
+            else:
+                no_match += 1
         except DailyLimitReached:
             if cap_key is not None:
                 capped_keys.add(cap_key)
             if _should_abandon_stale(item):
+                abandoned += 1
                 logger.error(
                     "Abandoning %s after %d drain passes — never serviceable.",
                     item["video_path"], item.get("drain_passes"),
@@ -961,6 +979,27 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
     else:
         queue.clear()
         logger.info("Retry queue drained successfully.")
+
+    return {
+        "described": len(described_labels),
+        "described_labels": described_labels,
+        "no_match": no_match,
+        "abandoned": abandoned,
+        "deferred": deferred,
+        "remaining": len(remaining),
+    }
+
+
+def _queue_item_label(item: dict) -> str:
+    """Human label for a retry-queue item, for logs and notifications."""
+    if item.get("type") == "movie":
+        year = item.get("movie_year", "")
+        title = item.get("movie_title", "?")
+        return f"{title} ({year})" if year else title
+    try:
+        return f"{item.get('series_title', '?')} S{int(item['season']):02d}E{int(item['episode']):02d}"
+    except (KeyError, ValueError, TypeError):
+        return str(item.get("video_path", "?"))
 
 
 def _safe_dirname(name: str) -> str:

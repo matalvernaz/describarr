@@ -41,7 +41,7 @@ def test_capped_season_defers_but_cached_seasons_drain(monkeypatch):
     monkeypatch.setattr(wf, "process_episode", fake_process_episode)
     queue = _FakeQueue(items)
 
-    wf.drain_retry_queue(queue, client=None, config=None)
+    summary = wf.drain_retry_queue(queue, client=None, config=None)
 
     # Season 2 (cached) both processed; season 1 ep1 tried once and capped;
     # season 1 ep2 skipped via capped_keys (no wasted re-search).
@@ -50,3 +50,15 @@ def test_capped_season_defers_but_cached_seasons_drain(monkeypatch):
     assert queue.saved is not None
     deferred = {(i["season"], i["episode"]) for i in queue.saved}
     assert deferred == {(1, 1), (1, 2)}
+
+    # Summary drives the drain-completion notification.
+    assert summary["described"] == 2
+    assert set(summary["described_labels"]) == {"Show S02E01", "Show S02E02"}
+    assert summary["no_match"] == 0
+    assert summary["abandoned"] == 0
+    assert summary["deferred"] == 2
+    assert summary["remaining"] == 2
+
+
+def test_drain_empty_queue_returns_none():
+    assert wf.drain_retry_queue(_FakeQueue([]), client=None, config=None) is None

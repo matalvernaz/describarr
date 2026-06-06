@@ -26,7 +26,7 @@ from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, Lo
 from .config import Config
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
-from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname
+from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _MAX_DRAIN_PASSES
 
 logger = logging.getLogger(__name__)
 
@@ -952,7 +952,48 @@ def _worker_handle_drain(item: dict, config: Config, pending: PendingQueue) -> N
         return
     client = _get_client(config)
     with _set_current_job({"type": "drain", "title": "retry queue drain"}):
-        drain_retry_queue(queue, client, config)
+        summary = drain_retry_queue(queue, client, config)
+    _notify_drain_summary(summary)
+
+
+# How many described titles to name in the drain notification before
+# collapsing the rest into a "+N more" tail, so a big drain stays readable.
+_DRAIN_NOTIFY_LABEL_CAP = 8
+
+
+def _notify_drain_summary(summary: dict | None) -> None:
+    """Fire one Pushover summary after a drain — only when something actually
+    changed (a queued title got described, or an item was abandoned). A drain
+    that only deferred under the download cap stays silent to avoid noise."""
+    if not summary:
+        return
+    described = summary.get("described", 0)
+    abandoned = summary.get("abandoned", 0)
+    if not described and not abandoned:
+        return
+
+    if described:
+        labels = summary.get("described_labels", [])
+        shown = ", ".join(labels[:_DRAIN_NOTIFY_LABEL_CAP])
+        extra = len(labels) - _DRAIN_NOTIFY_LABEL_CAP
+        if extra > 0:
+            shown += f", +{extra} more"
+        title = f"describarr: described {described} queued title(s)"
+        body = shown or f"{described} title(s)"
+    else:
+        title = "describarr: drain complete"
+        body = ""
+
+    remaining = summary.get("remaining", 0)
+    tail = []
+    if abandoned:
+        tail.append(f"{abandoned} abandoned (no AD after {_MAX_DRAIN_PASSES} tries)")
+    if remaining:
+        tail.append(f"{remaining} still queued")
+    if tail:
+        body = f"{body}\n{'; '.join(tail)}" if body else "; ".join(tail)
+
+    notify.send(title, body)
 
 
 def _label_from_env(env: dict[str, str]) -> str | None:
