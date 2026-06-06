@@ -36,6 +36,32 @@ def _natsort_paths(paths) -> list[Path]:
 # Title / season matching
 # ------------------------------------------------------------------
 
+# AudioVault publishes a season's audio description in up to three variants,
+# distinguished only by a tag in the title: [New Description] and [Old
+# Description] are human-narrated AD; [TTS] is synthetic text-to-speech, the
+# lowest quality and the worst-aligning. The tag is the *only* part of the
+# name that differs between variants of one season, so it must not influence
+# which season we matched — it's stripped before title similarity is scored
+# (see _ranked_above) and only used afterwards to break ties between genuine
+# same-season variants.
+_VARIANT_TAG_RE = re.compile(r"\s*\[(?:new description|old description|tts)\]\s*", re.IGNORECASE)
+
+
+def _variant_quality(name: str) -> int:
+    """Rank a candidate's description variant; higher is preferred.
+
+    [New Description]/untagged human AD (2) > [Old Description] (1) > [TTS] (0).
+    Used only as a tiebreaker between variants whose stripped titles match the
+    same season equally well, so the best obtainable description is attempted
+    before TTS instead of by accident of tag-string length.
+    """
+    n = name.lower()
+    if "[tts]" in n:
+        return 0
+    if "[old description]" in n:
+        return 1
+    return 2
+
 def find_season(results: list[dict], title: str, season: int) -> list[dict]:
     """
     Return all results from *results* that plausibly match *title* and *season*,
@@ -64,17 +90,27 @@ def find_season(results: list[dict], title: str, season: int) -> list[dict]:
     title_lower = title.lower()
 
     def _ranked_above(candidates: list[dict], threshold: float) -> list[dict]:
-        scored = [(_title_similarity(title_lower, r["name"].lower()), r) for r in candidates]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        kept = [(s, r) for s, r in scored if s >= threshold]
-        for s, r in kept:
+        # Strip the variant tag before scoring so all variants of a season tie
+        # on title similarity; quality then breaks the tie (human AD before
+        # TTS). Title match stays the dominant key, so a wrong show/season can
+        # never be promoted over a near-exact match by quality alone. The
+        # similarity is rounded so a sub-0.01 wobble between otherwise-identical
+        # titles can't defeat the quality tiebreaker.
+        scored = [
+            (_title_similarity(title_lower, _VARIANT_TAG_RE.sub(" ", r["name"]).strip().lower()),
+             _variant_quality(r["name"]), r)
+            for r in candidates
+        ]
+        scored.sort(key=lambda x: (round(x[0], 2), x[1]), reverse=True)
+        kept = [(s, q, r) for s, q, r in scored if s >= threshold]
+        for s, q, r in kept:
             logger.info("Season candidate: %r (score %.2f)", r["name"], s)
         if scored and not kept:
             logger.warning(
                 "Best season match %r has low similarity (%.2f) — skipping.",
-                scored[0][1]["name"], scored[0][0],
+                scored[0][2]["name"], scored[0][0],
             )
-        return [r for _, r in kept]
+        return [r for _, _, r in kept]
 
     # Pass 1: results that explicitly name the season.
     with_token = [
