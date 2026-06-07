@@ -26,7 +26,8 @@ from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, Lo
 from .config import Config
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
-from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _MAX_DRAIN_PASSES
+from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _atomic_write_json, _MAX_DRAIN_PASSES
+from .aligner import source_has_ad_track
 
 logger = logging.getLogger(__name__)
 
@@ -910,6 +911,9 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
     show_cache_dir = config.cache_dir / "shows" / _safe_dirname(title)
     queued = 0
     skipped = 0
+    # season -> episodes whose .done entry is stale (file lost its AD track) and
+    # must be cleared so the season's completion is re-evaluated honestly.
+    stale_done: dict[int, set] = {}
     for video_path in video_files:
         m = _EPISODE_RE.search(video_path.name)
         if not m:
@@ -925,11 +929,19 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
             try:
                 raw = json.loads(done_path.read_text())
                 done = set(raw) if isinstance(raw, list) else set(raw.get("done", []))
-                if episode in done:
+            except (json.JSONDecodeError, ValueError):
+                done = set()
+            if episode in done:
+                # A done episode whose file still carries an AD track is
+                # genuinely finished — skip it. One that has lost its AD track
+                # (a Sonarr re-grab/upgrade replaced the merged file) is a stale
+                # ledger entry: queue it for reprocessing and clear it from
+                # .done below so the zip-cleanup transition fires once at the
+                # true end of the batch, not after every re-described episode.
+                if source_has_ad_track(video_path):
                     skipped += 1
                     continue
-            except (json.JSONDecodeError, ValueError):
-                pass
+                stale_done.setdefault(season, set()).add(episode)
 
         pending.push({
             "type": "retry_episode",
@@ -940,9 +952,28 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
         })
         queued += 1
 
+    # One write per affected season so the re-described episodes rejoin .done
+    # cleanly. total is preserved (recomputed from the zip on next mark if the
+    # file was legacy list-format).
+    cleared = 0
+    for season, episodes in stale_done.items():
+        done_path = show_cache_dir / f".done_s{season:02d}.json"
+        try:
+            raw = json.loads(done_path.read_text())
+        except (json.JSONDecodeError, ValueError, OSError):
+            continue
+        if isinstance(raw, list):
+            remaining, total = sorted(set(raw) - episodes), 0
+        else:
+            remaining = sorted(set(raw.get("done", [])) - episodes)
+            total = int(raw.get("total", 0))
+        _atomic_write_json(done_path, {"total": total, "done": remaining})
+        cleared += len(episodes)
+
     logger.info(
-        "Retry dir %s: queued %d episode(s), skipped %d already-done.",
-        scan_dir, queued, skipped,
+        "Retry dir %s: queued %d episode(s), skipped %d already-done, "
+        "cleared %d stale done-entrie(s).",
+        scan_dir, queued, skipped, cleared,
     )
 
 
