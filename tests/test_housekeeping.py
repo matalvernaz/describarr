@@ -75,6 +75,51 @@ def test_extract_episode_matches_season_dot_episode(tmp_path):
     assert got.name == "4.09 And the Past.mp3"
 
 
+def _seed_season_zip(tmp_path, total):
+    """Build a show cache dir with a season zip + full extract dir of *total*
+    audio files, plus a manifest mapping a URL to that zip. Returns
+    (zip_cache_dir, season_dir, zip_path)."""
+    zip_cache_dir = tmp_path / "shows" / "show"
+    season_dir = zip_cache_dir / "season_03"
+    extract_dir = season_dir / "show_-_season_3"
+    extract_dir.mkdir(parents=True)
+    (extract_dir / ".extracted").touch()
+    for n in range(1, total + 1):
+        (extract_dir / f"E{n:02d}.mp3").write_bytes(b"x")
+    zip_path = zip_cache_dir / "show - Season 3.zip"
+    zip_path.write_bytes(b"PK")
+    (zip_cache_dir / "manifest.json").write_text(
+        json.dumps({"https://example/dl/1": str(zip_path)})
+    )
+    return zip_cache_dir, season_dir, zip_path, extract_dir
+
+
+def test_mark_done_cleans_up_only_on_completion_transition(tmp_path):
+    # A season that completes exactly once should have its zip cleaned once.
+    zip_cache_dir, season_dir, zip_path, extract_dir = _seed_season_zip(tmp_path, 2)
+
+    wf._mark_episode_done(zip_cache_dir, 3, 1, extract_dir, zip_path)
+    assert zip_path.exists()  # 1/2 done — keep the zip for the sibling episode
+
+    wf._mark_episode_done(zip_cache_dir, 3, 2, extract_dir, zip_path)
+    assert not zip_path.exists()  # 2/2 — transition into complete → cleaned
+
+
+def test_mark_done_on_saturated_season_keeps_zip(tmp_path):
+    # Reprocessing an already-complete season (the download-cap-burning bug):
+    # the zip must survive so the season's other queued episodes hit cache
+    # instead of forcing a fresh AudioVault download per episode.
+    zip_cache_dir, season_dir, zip_path, extract_dir = _seed_season_zip(tmp_path, 2)
+    progress = zip_cache_dir / ".done_s03.json"
+    progress.write_text(json.dumps({"total": 2, "done": [1, 2]}))
+
+    wf._mark_episode_done(zip_cache_dir, 3, 1, extract_dir, zip_path)
+
+    assert zip_path.exists()  # already complete → no re-clean, zip preserved
+    manifest = json.loads((zip_cache_dir / "manifest.json").read_text())
+    assert "https://example/dl/1" in manifest  # manifest entry preserved → cache hit
+
+
 def test_source_has_ad_track_false_on_unprobeable(tmp_path):
     # A probe failure must be conservative (False) so it never blocks a real
     # first-time alignment.

@@ -1074,8 +1074,6 @@ def _mark_episode_done(
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
-    done.add(episode)
-
     # Determine the canonical episode count. Prefer the in-file `total` when
     # available so a partially-cleaned extract_dir on a later call doesn't
     # trigger premature zip deletion. When the file is legacy list-format
@@ -1086,10 +1084,22 @@ def _mark_episode_done(
     # before this fallback existed).
     stored_total = _resolve_audio_total(stored_total, extract_dir, zip_path)
 
+    # Capture saturation *before* adding this episode. Cleanup must fire only
+    # on the transition into "season complete", never on every call once the
+    # done-set is already full. Otherwise reprocessing an already-complete
+    # season — e.g. Sonarr re-grabs/upgrades episodes that were merged on a
+    # prior drain — deletes the freshly-downloaded season zip after *every*
+    # episode, turning one season into one AudioVault download per episode and
+    # burning the daily download cap on a single show. A season that stays
+    # complete is reclaimed by the midnight `prune_completed_seasons` sweep, so
+    # skipping the lazy delete here cannot leak disk.
+    was_complete = stored_total > 0 and len(done) >= stored_total
+    done.add(episode)
+
     season_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(progress_path, {"total": stored_total, "done": sorted(done)})
 
-    if stored_total > 0 and len(done) >= stored_total:
+    if stored_total > 0 and len(done) >= stored_total and not was_complete:
         _cleanup_completed_season(zip_cache_dir, season_dir, zip_path, season, stored_total)
 
 
