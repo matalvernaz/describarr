@@ -36,7 +36,7 @@ def test_capped_season_defers_but_cached_seasons_drain(monkeypatch):
         calls.append((season, episode))
         if season == 1:
             raise wf.DailyLimitReached("cap")
-        return True
+        return True, None
 
     monkeypatch.setattr(wf, "process_episode", fake_process_episode)
     queue = _FakeQueue(items)

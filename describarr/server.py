@@ -7,9 +7,11 @@ Request body is application/x-www-form-urlencoded (curl --data-urlencode).
 
 from __future__ import annotations
 
+import hmac
 import html
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -24,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 from . import notify
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, LoginError
 from .config import Config
+from .decision_log import DecisionLog
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
 from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _atomic_write_json, _MAX_DRAIN_PASSES
@@ -343,6 +346,24 @@ def _is_transient(exc: BaseException) -> bool:
 
 class _HookHandler(BaseHTTPRequestHandler):
     close_connection = True
+
+    def _authorized(self) -> bool:
+        """Gate mutating endpoints on an optional shared secret.
+
+        Open by default (relying on docker-network isolation, the historical
+        behaviour); when DESCRIBARR_API_KEY is set, mutating requests must
+        carry a matching ``X-Api-Key`` header. Read-only /status and /queue GET
+        stay open regardless. On mismatch responds 401 and returns False.
+        """
+        key = os.environ.get("DESCRIBARR_API_KEY", "").strip()
+        if not key:
+            return True
+        provided = self.headers.get("X-Api-Key", "")
+        if hmac.compare_digest(provided, key):
+            return True
+        self._respond(401, "Unauthorized.")
+        return False
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -357,6 +378,8 @@ class _HookHandler(BaseHTTPRequestHandler):
         elif path == "/queue":
             self._handle_queue_get()
         elif path == "/retry":
+            if not self._authorized():
+                return
             self._handle_retry(params)
         else:
             self._respond(404, "Not found.")
@@ -364,6 +387,8 @@ class _HookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/hook":
+            if not self._authorized():
+                return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             env = {k: v[0] for k, v in parse_qs(body.decode()).items()}
@@ -389,6 +414,8 @@ class _HookHandler(BaseHTTPRequestHandler):
             _get_pending_queue(config).push({"type": "hook", "env": env})
             self._respond(202, "Accepted — queued for background processing.")
         elif parsed.path == "/drain":
+            if not self._authorized():
+                return
             self._handle_drain()
         else:
             self._respond(404, "Not found.")
@@ -396,6 +423,8 @@ class _HookHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         parsed = urlparse(self.path)
         if parsed.path == "/queue":
+            if not self._authorized():
+                return
             self._handle_queue_delete()
         else:
             self._respond(404, "Not found.")
@@ -425,6 +454,9 @@ class _HookHandler(BaseHTTPRequestHandler):
         next_drain = (now + timedelta(days=1)).replace(
             hour=0, minute=5, second=0, microsecond=0
         )
+        recent = DecisionLog(
+            config.cache_dir / "decisions.json", config.history_size
+        ).recent(limit=20)
         data = {
             "date": today,
             "downloads_today": count,
@@ -434,6 +466,7 @@ class _HookHandler(BaseHTTPRequestHandler):
             "pending_queue": pending,
             "next_drain": next_drain.strftime("%Y-%m-%dT%H:%M:%S"),
             "current_job": _current_job,
+            "recent_decisions": recent,
         }
 
         accept = self.headers.get("Accept", "")
@@ -596,7 +629,32 @@ class _HookHandler(BaseHTTPRequestHandler):
         logger.info(fmt, *args)
 
 
+def _render_decisions_rows(decisions: list[dict]) -> str:
+    """Render the recent-decisions table rows, escaping every metadata-derived
+    field (titles/details originate from Sonarr/Radarr, i.e. TheTVDB/TMDB)."""
+    if not decisions:
+        return '      <tr><td colspan="5">No decisions recorded yet.</td></tr>'
+    rows = []
+    for d in decisions:
+        score = d.get("score")
+        score_str = f"{score:.0f}%" if isinstance(score, (int, float)) else "—"
+        rows.append(
+            "      <tr>"
+            f"<td>{html.escape(str(d.get('ts', '')))}</td>"
+            f"<td>{html.escape(str(d.get('title', '')))}</td>"
+            f"<td>{html.escape(str(d.get('outcome', '')))}</td>"
+            f"<td>{score_str}</td>"
+            f"<td>{html.escape(str(d.get('detail', '') or ''))}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
 def _render_status_html(data: dict) -> str:
+    """Render a semantic, screen-reader-friendly status page: heading
+    hierarchy for jump-by-heading, real tables with row/column headers, and no
+    full-page auto-refresh (which would reset a screen reader to the top every
+    tick). Poll ``/status?format=json`` for live data."""
     job = data["current_job"]
     if job:
         jtype = job.get("type", "")
@@ -607,72 +665,66 @@ def _render_status_html(data: dict) -> str:
             job_label = f"{job['title']} S{job['season']:02d}E{job['episode']:02d}"
         else:
             job_label = job.get("title", "unknown")
-        # Series/movie titles come from Sonarr/Radarr metadata (TheTVDB,
-        # TMDB) which we don't control. Escape before interpolating so a
-        # title like ``<script>alert(1)</script>`` can't execute in any
-        # admin's browser viewing /status.
-        job_label = html.escape(job_label)
-        elapsed = html.escape(_elapsed(job["started_at"]))
-        job_html = f"""
-  <div class="card active">
-    <h2>Currently converting</h2>
-    <div class="value">{job_label}</div>
-    <div class="meta">Running for {elapsed}</div>
-  </div>"""
+        # Titles come from Sonarr/Radarr metadata (TheTVDB, TMDB) we don't
+        # control; escape before interpolating so a crafted title can't inject
+        # markup into an admin's browser.
+        current = (
+            f"{html.escape(job_label)} — running for "
+            f"{html.escape(_elapsed(job['started_at']))}"
+        )
     else:
-        job_html = """
-  <div class="card">
-    <h2>Currently converting</h2>
-    <div class="value idle">Idle</div>
-  </div>"""
+        current = "Idle"
 
     next_drain_dt = datetime.fromisoformat(data["next_drain"])
     next_drain_str = next_drain_dt.strftime("%b %-d at %-I:%M %p")
+    decisions = data.get("recent_decisions", [])
+    decisions_rows = _render_decisions_rows(decisions)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="30">
   <title>describarr status</title>
   <style>
-    body {{ font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; color: #111; }}
-    h1 {{ margin-bottom: 0.1rem; }}
-    .subtitle {{ color: #666; margin-top: 0; font-size: 0.9rem; }}
-    .cards {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-top: 1rem; }}
-    .card {{ border: 1px solid #ddd; border-radius: 8px; padding: 0.85rem 1rem; }}
-    .card.wide {{ grid-column: 1 / -1; }}
-    .card.active {{ border-color: #f0a000; background: #fffbec; }}
-    h2 {{ margin: 0 0 0.35rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: #888; }}
-    .value {{ font-size: 1.35rem; font-weight: 600; }}
-    .value.idle {{ color: #aaa; font-weight: 400; }}
-    .meta {{ color: #888; font-size: 0.8rem; margin-top: 0.2rem; }}
-    .footer {{ color: #bbb; font-size: 0.75rem; margin-top: 1.5rem; }}
+    body {{ font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #111; }}
+    h1 {{ margin-bottom: 0.25rem; }}
+    .subtitle {{ color: #666; margin-top: 0; }}
+    table {{ border-collapse: collapse; width: 100%; margin: 0.4rem 0 1.6rem; }}
+    th, td {{ text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #ddd; vertical-align: top; }}
+    caption {{ text-align: left; font-weight: 600; margin-bottom: 0.3rem; }}
+    .footer {{ color: #888; font-size: 0.85rem; margin-top: 1.5rem; }}
   </style>
 </head>
 <body>
   <h1>describarr</h1>
-  <p class="subtitle">Audio description sync &mdash; {data['date']}</p>
-  <div class="cards">
-  <div class="card wide">{job_html.strip()}</div>
-  <div class="card">
-    <h2>Downloads today</h2>
-    <div class="value">{data['downloads_today']} <span style="font-size:1rem;color:#888">/ {data['limit']}</span></div>
-    <div class="meta">{data['remaining']} remaining</div>
-  </div>
-  <div class="card">
-    <h2>Pending queue</h2>
-    <div class="value">{data['pending_queue']}</div>
-    <div class="meta">Webhooks &amp; retries waiting</div>
-  </div>
-  <div class="card">
-    <h2>Retry queue</h2>
-    <div class="value">{data['retry_queue']}</div>
-    <div class="meta">Next drain: {next_drain_str}</div>
-  </div>
-  </div>
-  <p class="footer">Auto-refreshes every 30 seconds &middot; <a href="/status?format=json">JSON</a></p>
+  <p class="subtitle">Audio description sync &mdash; {html.escape(data['date'])}</p>
+
+  <h2>Currently converting</h2>
+  <p role="status" aria-live="polite">{current}</p>
+
+  <h2>Queues &amp; downloads</h2>
+  <table>
+    <caption>Current queue and download-cap state</caption>
+    <tbody>
+      <tr><th scope="row">Downloads today</th><td>{data['downloads_today']} of {data['limit']} ({data['remaining']} remaining)</td></tr>
+      <tr><th scope="row">Pending queue</th><td>{data['pending_queue']} (webhooks &amp; retries waiting)</td></tr>
+      <tr><th scope="row">Retry queue</th><td>{data['retry_queue']} (next drain {html.escape(next_drain_str)})</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Recent decisions</h2>
+  <table>
+    <caption>Last {len(decisions)} accept / reject / skip decisions, newest first</caption>
+    <thead>
+      <tr><th scope="col">Time</th><th scope="col">Title</th><th scope="col">Outcome</th><th scope="col">Score</th><th scope="col">Detail</th></tr>
+    </thead>
+    <tbody>
+{decisions_rows}
+    </tbody>
+  </table>
+
+  <p class="footer">Reload to refresh &middot; <a href="/status?format=json">JSON</a></p>
 </body>
 </html>"""
 
@@ -749,7 +801,7 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
     client = _get_client(config)
     try:
         with _set_current_job({"type": "episode", "title": series_title, "season": season, "episode": primary_episode}):
-            described = process_episode(
+            described, reason = process_episode(
                 client, config, video_path,
                 series_title, season, primary_episode,
                 extra_episodes=extra_episodes,
@@ -762,7 +814,11 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
         # — destructively re-align the merged file once per episode.
         _get_retry_queue(config).add_episodes(series_title, season, episodes, str(video_path))
         return {"label": label, "outcome": "queued"}
-    return {"label": label, "outcome": "described" if described else "no_match"}
+    return {
+        "label": label,
+        "outcome": "described" if described else "no_match",
+        "reason": reason,
+    }
 
 
 def _radarr(config: Config, env: dict[str, str]) -> dict | None:
@@ -783,11 +839,15 @@ def _radarr(config: Config, env: dict[str, str]) -> dict | None:
     client = _get_client(config)
     try:
         with _set_current_job({"type": "movie", "title": movie_title, "year": movie_year}):
-            described = process_movie(client, config, video_path, movie_title, movie_year)
+            described, reason = process_movie(client, config, video_path, movie_title, movie_year)
     except DailyLimitReached:
         _get_retry_queue(config).add_movie(movie_title, movie_year, str(video_path))
         return {"label": label, "outcome": "queued"}
-    return {"label": label, "outcome": "described" if described else "no_match"}
+    return {
+        "label": label,
+        "outcome": "described" if described else "no_match",
+        "reason": reason,
+    }
 
 
 # ------------------------------------------------------------------
@@ -800,6 +860,34 @@ _OUTCOME_MESSAGES = {
     "queued": "Added — description queued (AudioVault daily limit reached).",
     "error": "Added — describarr errored, check logs.",
 }
+
+
+def _log_terminal_decision(config: Config, label: str, outcome: str, reason: Optional[str]) -> None:
+    """Record a terminal outcome that had no alignment attempt of its own.
+
+    ``_align_and_keep`` already logs described/rejected/failed with scores, so
+    logging here would double-count them; we only add queued / error / a
+    genuine no-candidate no_match (reason is None ⇒ nothing to align was
+    found; a set reason means a rejection was already logged)."""
+    if outcome == "described":
+        return
+    if outcome == "no_match" and reason:
+        return
+    try:
+        DecisionLog(config.cache_dir / "decisions.json", config.history_size).append({
+            "title": label, "outcome": outcome, "detail": reason or "",
+        })
+    except Exception:
+        logger.debug("Terminal decision-log write failed.", exc_info=True)
+
+
+def _notify_outcome(config: Config, label: str, outcome: str, reason: Optional[str] = None) -> None:
+    """Send the Pushover for an outcome (with the specific cause appended when
+    known) and record the terminal decision for the /status audit trail."""
+    base = _OUTCOME_MESSAGES.get(outcome, outcome)
+    message = f"{base} ({reason})" if reason else base
+    notify.send(f"describarr: {label}", message)
+    _log_terminal_decision(config, label, outcome, reason)
 
 
 def _worker_handle_hook(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -817,16 +905,13 @@ def _worker_handle_hook(item: dict, config: Config, pending: PendingQueue) -> No
     if errored:
         label = _label_from_env(env)
         if label:
-            notify.send(f"describarr: {label}", _OUTCOME_MESSAGES["error"])
+            _notify_outcome(config, label, "error", "unhandled error — check logs")
         return
 
     if not result:
         return
 
-    notify.send(
-        f"describarr: {result['label']}",
-        _OUTCOME_MESSAGES.get(result["outcome"], result["outcome"]),
-    )
+    _notify_outcome(config, result["label"], result["outcome"], result.get("reason"))
 
 
 def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -848,13 +933,12 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
     label = f"{title} S{season:02d}E{episode:02d}"
     try:
         with _set_current_job({"type": "episode", "title": title, "season": season, "episode": episode}):
-            described = process_episode(client, config, video_path, title, season, episode)
+            described, reason = process_episode(client, config, video_path, title, season, episode)
     except DailyLimitReached:
         _get_retry_queue(config).add_episode(title, season, episode, str(video_path))
-        notify.send(f"describarr: {label}", _OUTCOME_MESSAGES["queued"])
+        _notify_outcome(config, label, "queued")
         return
-    outcome = "described" if described else "no_match"
-    notify.send(f"describarr: {label}", _OUTCOME_MESSAGES.get(outcome, outcome))
+    _notify_outcome(config, label, "described" if described else "no_match", reason)
 
 
 def _worker_handle_retry_movie(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -871,13 +955,12 @@ def _worker_handle_retry_movie(item: dict, config: Config, pending: PendingQueue
     label = f"{title} ({year_str})" if year_str else title
     try:
         with _set_current_job({"type": "movie", "title": title, "year": year_str}):
-            described = process_movie(client, config, video_path, title, year_str)
+            described, reason = process_movie(client, config, video_path, title, year_str)
     except DailyLimitReached:
         _get_retry_queue(config).add_movie(title, year_str, str(video_path))
-        notify.send(f"describarr: {label}", _OUTCOME_MESSAGES["queued"])
+        _notify_outcome(config, label, "queued")
         return
-    outcome = "described" if described else "no_match"
-    notify.send(f"describarr: {label}", _OUTCOME_MESSAGES.get(outcome, outcome))
+    _notify_outcome(config, label, "described" if described else "no_match", reason)
 
 
 def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) -> None:

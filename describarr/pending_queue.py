@@ -70,6 +70,11 @@ class PendingQueue:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(items, indent=2))
+        # fsync before the rename so the HTTP 202 "persisted" promise survives a
+        # power loss: os.replace is atomic but the tmp's *data* may still be in
+        # the page cache when we return without this.
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
 
     def _load(self) -> list[dict]:

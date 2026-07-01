@@ -74,6 +74,14 @@ class Config:
     backup_originals: bool = True
     backup_dir: Optional[Path] = None
     backup_retention_days: int = 14
+    # Optional shared secret. When set, mutating HTTP endpoints (/hook, /retry,
+    # /drain, DELETE /queue) require a matching X-Api-Key header. Unset ⇒ open,
+    # relying on docker-network isolation (the historical behaviour).
+    api_key: Optional[str] = None
+    # How many recent accept/reject/skip decisions to retain for /status. The
+    # log is a screen-reader-friendly audit trail replacing container-log
+    # grepping; it is capped so it can't grow without bound.
+    history_size: int = 50
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -111,6 +119,18 @@ class Config:
         if backup_retention_days < 0:
             raise ValueError("DESCRIBARR_BACKUP_RETENTION_DAYS must be ≥ 0.")
 
+        api_key = os.environ.get("DESCRIBARR_API_KEY", "").strip() or None
+
+        raw_history = os.environ.get("DESCRIBARR_HISTORY_SIZE", "50").strip()
+        try:
+            history_size = int(raw_history)
+        except ValueError:
+            raise ValueError(
+                f"DESCRIBARR_HISTORY_SIZE must be an integer; got {raw_history!r}"
+            )
+        if history_size < 0:
+            raise ValueError("DESCRIBARR_HISTORY_SIZE must be ≥ 0.")
+
         return cls(
             email=email,
             password=password,
@@ -121,4 +141,6 @@ class Config:
             backup_originals=backup_originals,
             backup_dir=backup_dir,
             backup_retention_days=backup_retention_days,
+            api_key=api_key,
+            history_size=history_size,
         )

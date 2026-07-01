@@ -121,13 +121,27 @@ def _read_metrics(report: Optional[Path]) -> Optional[dict]:
 
 
 class AlignResult:
-    """Outputs of a describealaign run."""
+    """Outputs of a describealaign run.
 
-    __slots__ = ("output", "report")
+    On success, *output* is the validated combined media and *report* the
+    metrics sidecar. On failure, *output* is None and *failure_reason* carries
+    a human-readable cause — from the engine's ``*.fail.json`` diagnosis when
+    available, else a generic description of the failure mode — so the caller
+    can tell a blind operator *why* nothing was produced instead of a bare
+    "errored".
+    """
 
-    def __init__(self, output: Path, report: Optional[Path]) -> None:
+    __slots__ = ("output", "report", "failure_reason")
+
+    def __init__(
+        self,
+        output: Optional[Path],
+        report: Optional[Path],
+        failure_reason: Optional[str] = None,
+    ) -> None:
         self.output = output
         self.report = report
+        self.failure_reason = failure_reason
 
 
 def run(
@@ -183,14 +197,17 @@ def run(
             "describealaign not found. Install it with: pip install describealaign"
         )
         _cleanup_run_dir(run_output_dir)
-        return None
+        return AlignResult(None, None, "describealign is not installed")
     except subprocess.TimeoutExpired:
         logger.error(
             "describealaign timed out after %d seconds — process group killed.",
             _SUBPROCESS_TIMEOUT_SEC,
         )
         _cleanup_run_dir(run_output_dir)
-        return None
+        return AlignResult(
+            None, None,
+            f"alignment timed out after {_SUBPROCESS_TIMEOUT_SEC // 60} minutes",
+        )
 
     if stdout:
         for line in stdout.splitlines():
@@ -200,19 +217,28 @@ def run(
             logger.debug("[describealaign stderr] %s", line)
 
     if returncode != 0:
-        logger.error("describealaign exited with code %d.", returncode)
+        # describealaign ≥2.1.9 writes a <stem>.fail.json diagnosing *why* an
+        # alignment was rejected (wrong/truncated episode, silent AD, …).
+        # Surface it at ERROR (the raw stderr stays at DEBUG) and hand the
+        # human summary back so the caller can tell the operator the cause.
+        reason = _read_failure_sidecar(video_path, alignment_dir, run_start)
+        if reason:
+            logger.error("describealaign could not align %s: %s", video_path.name, reason)
+        else:
+            reason = f"alignment failed (describealaign exit {returncode})"
+            logger.error("describealaign exited with code %d.", returncode)
         _cleanup_run_dir(run_output_dir)
-        return None
+        return AlignResult(None, None, reason)
 
     output = _find_output(video_path, run_output_dir, run_start)
     if output is None:
         _cleanup_run_dir(run_output_dir)
-        return None
+        return AlignResult(None, None, "describealign produced no output file")
 
     if not _validate_media_output(video_path, output):
         # The output is structurally broken — refuse to publish it.
         _cleanup_run_dir(run_output_dir)
-        return None
+        return AlignResult(None, None, "alignment output failed validation")
 
     report = _find_report(video_path, alignment_dir, min_mtime=run_start)
     # NOTE: caller is responsible for cleaning up `output` (and its parent
@@ -291,6 +317,34 @@ def _find_report(
     # Prefer a file whose name contains the video stem; break ties by mtime.
     candidates.sort(key=lambda p: (stem not in p.name.lower(), -p.stat().st_mtime))
     return candidates[0]
+
+
+def _read_failure_sidecar(
+    video_path: Path,
+    alignment_dir: Path,
+    min_mtime: float = 0.0,
+) -> Optional[str]:
+    """Return the human ``summary`` from describealaign's ``<stem>.fail.json``
+    for this run, or None if absent/unreadable.
+
+    Written by describealaign ≥2.1.9 when an alignment is rejected as a
+    mismatch. Mirrors :func:`_find_report`'s stem+mtime matching so a stale
+    sidecar from an earlier run against a different file is ignored.
+    """
+    candidates = [
+        p for p in alignment_dir.glob("*.fail.json")
+        if p.stat().st_mtime >= min_mtime
+    ]
+    if not candidates:
+        return None
+    stem = video_path.stem.lower()
+    candidates.sort(key=lambda p: (stem not in p.name.lower(), -p.stat().st_mtime))
+    try:
+        data = json.loads(candidates[0].read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    summary = data.get("summary") if isinstance(data, dict) else None
+    return summary or None
 
 
 def _segment_duration(seg: dict) -> float:
@@ -538,6 +592,10 @@ def _audio_stream_count(probe: dict) -> int:
     return sum(1 for s in probe.get("streams", []) if s.get("codec_type") == "audio")
 
 
+def _subtitle_stream_count(probe: dict) -> int:
+    return sum(1 for s in probe.get("streams", []) if s.get("codec_type") == "subtitle")
+
+
 def _has_expected_audio_disposition(probe: dict) -> bool:
     """Verify the AD track ended up as the default audio with the
     visual_impaired flag and no original-audio track was left as default.
@@ -746,6 +804,19 @@ def _validate_media_output(source: Path, output: Path) -> bool:
     # Apple TV / Jellyfin clients will auto-play the wrong track even though
     # the file is structurally valid. Refuse to publish in that case.
     if not _has_expected_audio_disposition(out_probe):
+        return False
+
+    # describealaign maps every source subtitle stream through the mux
+    # (original['s'] in each write path), so a drop means the mux went wrong
+    # and would silently strip subtitles from the library file. describarr
+    # only ever ADDS an audio track, so subtitle count must never regress.
+    src_subs = _subtitle_stream_count(src_probe)
+    out_subs = _subtitle_stream_count(out_probe)
+    if out_subs < src_subs:
+        logger.error(
+            "Output dropped subtitle streams: source had %d, output has %d — "
+            "refusing to publish.", src_subs, out_subs,
+        )
         return False
 
     src_duration = _container_duration(src_probe)

@@ -5,16 +5,28 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Serialises the load→mutate→save read-modify-write across threads. The single
+# worker drains the queue while HTTP handler threads can clear it (DELETE
+# /queue) or enqueue on a daily-limit hit; without this an interleaving could
+# lose an entry. Reentrant so _append can call load()/save() while holding it.
+# Module-level so it covers every RetryQueue instance constructed in-process.
+_LOCK = threading.RLock()
+
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Write *content* to *path* via a sibling .tmp + os.replace, so a crash
-    mid-write cannot leave a half-written/corrupt file at the destination."""
+    """Write *content* to *path* via a sibling .tmp + fsync + os.replace, so a
+    crash mid-write cannot leave a half-written/corrupt file at the destination
+    and the persisted data survives a power loss after we return."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content)
+    with open(tmp, "rb") as fh:
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
 
 
@@ -75,27 +87,31 @@ class RetryQueue:
         })
 
     def load(self) -> list[dict]:
-        if not self._path.exists():
-            return []
-        try:
-            return json.loads(self._path.read_text())
-        except (json.JSONDecodeError, ValueError):
-            logger.warning("Corrupt retry queue at %s — ignoring.", self._path)
-            return []
+        with _LOCK:
+            if not self._path.exists():
+                return []
+            try:
+                return json.loads(self._path.read_text())
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("Corrupt retry queue at %s — ignoring.", self._path)
+                return []
 
     def save(self, items: list[dict]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(self._path, json.dumps(items, indent=2))
+        with _LOCK:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(self._path, json.dumps(items, indent=2))
 
     def clear(self) -> None:
-        self._path.unlink(missing_ok=True)
+        with _LOCK:
+            self._path.unlink(missing_ok=True)
 
     def _append(self, item: dict) -> None:
-        items = self.load()
-        key = item.get("video_path", "")
-        if any(i.get("video_path") == key for i in items):
-            logger.debug("Already in retry queue, skipping: %s", key)
-            return
-        items.append(item)
-        self.save(items)
-        logger.info("Queued for retry (%d total): %s", len(items), key)
+        with _LOCK:
+            items = self.load()
+            key = item.get("video_path", "")
+            if any(i.get("video_path") == key for i in items):
+                logger.debug("Already in retry queue, skipping: %s", key)
+                return
+            items.append(item)
+            self.save(items)
+            logger.info("Queued for retry (%d total): %s", len(items), key)

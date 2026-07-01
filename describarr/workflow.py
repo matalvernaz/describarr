@@ -36,6 +36,7 @@ from .aligner import (
 )
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
+from .decision_log import DecisionLog
 from .matcher import extract_episode, find_movie, find_season
 from .retry_queue import RetryQueue
 
@@ -99,7 +100,7 @@ def process_episode(
     season: int,
     episode: int,
     extra_episodes: Optional[list[int]] = None,
-) -> bool:
+) -> tuple[bool, Optional[str]]:
     """
     Find and align the audio description for a single TV episode.
 
@@ -109,14 +110,17 @@ def process_episode(
     ``.done_sNN.json`` so the AudioVault zip-cleanup logic doesn't wait
     forever for episodes that share a file.
 
-    Returns True if a combined file was produced with an acceptable score.
+    Returns ``(described, reason)``: *described* is True if a combined file was
+    produced with an acceptable score; *reason* is a human-readable failure
+    cause when it wasn't (for the operator notification), else None.
     """
     all_episodes = [episode] + list(extra_episodes or [])
+    label = f"{series_title} S{season:02d}" + "".join(f"E{e:02d}" for e in all_episodes)
     # Idempotency guard: never re-align a file that already has an AD track,
     # or we stack a second one (duplicate webhook / mid-drain restart).
     if source_has_ad_track(video_path):
         logger.info("%s already has an audio-description track — skipping.", video_path.name)
-        return True
+        return True, None
     if len(all_episodes) == 1:
         logger.info("Looking up: %s S%02dE%02d", series_title, season, episode)
     else:
@@ -130,12 +134,12 @@ def process_episode(
         logger.warning(
             "AudioVault has no results for show: %r%s", series_title, stripped_note
         )
-        return False
+        return False, None
 
     candidates = find_season(results, series_title, season)
     if not candidates:
         logger.warning("No season %d entry found for %r.", season, series_title)
-        return False
+        return False, None
 
     # Season zips are cached by download URL so we only fetch each season once.
     # Each candidate gets its own extract subdirectory so different zips don't
@@ -143,6 +147,7 @@ def process_episode(
     zip_cache_dir = config.cache_dir / "shows" / _safe_dirname(series_title)
     limiter = DownloadLimiter(config.cache_dir / "daily_limit.json")
 
+    last_reason: Optional[str] = None
     for candidate in candidates:
         try:
             zip_path = _get_cached(client, candidate["url"], zip_cache_dir, limiter)
@@ -155,24 +160,35 @@ def process_episode(
                 "E%02d not found in %r — trying next candidate.", episode, candidate["name"]
             )
             continue
-        if _align_and_keep(config, video_path, audio_path):
+        published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+        if published:
             for ep in all_episodes:
                 _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
-            return True
+            return True, None
+        last_reason = reason
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
-    if not _LA_AVAILABLE:
-        return False
-    la = _la.LivingAudioClient()
-    if la.is_configured():
-        try:
-            audio_path = la.find_episode(config.cache_dir, series_title, season, episode)
-            if audio_path and _align_and_keep(config, video_path, audio_path):
-                return True
-        finally:
-            la.close()
+    if _LA_AVAILABLE:
+        la = _la.LivingAudioClient()
+        if la.is_configured():
+            try:
+                audio_path = la.find_episode(config.cache_dir, series_title, season, episode)
+                if audio_path:
+                    published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+                    if published:
+                        # LivingAudio is FTP-per-episode (no season zip), but
+                        # still record every covered episode in the season
+                        # ledger so zip-cleanup accounting and the /retry skip
+                        # logic stay correct. No zip/extract_dir ⇒ the cleanup
+                        # branch inside _mark_episode_done is a no-op.
+                        for ep in all_episodes:
+                            _mark_episode_done(zip_cache_dir, season, ep)
+                        return True, None
+                    last_reason = reason
+            finally:
+                la.close()
 
-    return False
+    return False, last_reason
 
 
 def process_movie(
@@ -181,15 +197,16 @@ def process_movie(
     video_path: Path,
     movie_title: str,
     movie_year: str,
-) -> bool:
+) -> tuple[bool, Optional[str]]:
     """
     Find and align the audio description for a movie.
 
-    Returns True if a combined file was produced with an acceptable score.
+    Returns ``(described, reason)`` — see :func:`process_episode`.
     """
+    label = f"{movie_title} ({movie_year})" if movie_year else movie_title
     if source_has_ad_track(video_path):
         logger.info("%s already has an audio-description track — skipping.", video_path.name)
-        return True
+        return True, None
     logger.info("Looking up movie: %s (%s)", movie_title, movie_year)
 
     search_title = _strip_year_suffix(movie_title)
@@ -199,43 +216,50 @@ def process_movie(
         logger.warning(
             "AudioVault has no results for movie: %r%s", movie_title, stripped_note
         )
-        return False
+        return False, None
 
     candidates = find_movie(results, movie_title, movie_year)
     if not candidates:
         logger.warning("No suitable movie match found for %r.", movie_title)
-        return False
+        return False, None
 
     movie_cache_dir = config.cache_dir / "movies"
     limiter = DownloadLimiter(config.cache_dir / "daily_limit.json")
 
+    last_reason: Optional[str] = None
     for candidate in candidates:
         try:
             audio_path = _get_cached(client, candidate["url"], movie_cache_dir, limiter)
         except DailyLimitReached:
             raise
-        if _align_and_keep(config, video_path, audio_path):
-            return True
+        published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+        if published:
+            return True, None
+        last_reason = reason
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
-    if not _LA_AVAILABLE:
-        return False
-    la = _la.LivingAudioClient()
-    if la.is_configured():
-        try:
-            la_cache = config.cache_dir / "la_movies"
-            for la_candidate in la.search_movies(movie_title, movie_year):
-                audio_path = la.download(la_candidate["url"], la_cache)
-                if audio_path and _align_and_keep(config, video_path, audio_path):
-                    return True
-                logger.info(
-                    "LivingAudio candidate %r below threshold — trying next.",
-                    la_candidate["name"],
-                )
-        finally:
-            la.close()
+    if _LA_AVAILABLE:
+        la = _la.LivingAudioClient()
+        if la.is_configured():
+            try:
+                la_cache = config.cache_dir / "la_movies"
+                for la_candidate in la.search_movies(movie_title, movie_year):
+                    audio_path = la.download(la_candidate["url"], la_cache)
+                    if audio_path:
+                        published, reason = _align_and_keep(
+                            config, video_path, audio_path, label=label
+                        )
+                        if published:
+                            return True, None
+                        last_reason = reason
+                    logger.info(
+                        "LivingAudio candidate %r below threshold — trying next.",
+                        la_candidate["name"],
+                    )
+            finally:
+                la.close()
 
-    return False
+    return False, last_reason
 
 
 # ------------------------------------------------------------------
@@ -485,10 +509,53 @@ def prune_output_scratch(cache_dir: Path) -> None:
         logger.info("Pruned %d orphaned output-scratch item(s).", removed)
 
 
-def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
-    """Run alignment and either keep or discard the combined output."""
+def _log_decision(
+    config: Config,
+    title: str,
+    outcome: str,
+    detail: str,
+    *,
+    score: Optional[float] = None,
+    coverage: Optional[float] = None,
+    stable_fraction: Optional[float] = None,
+    median_rate: Optional[float] = None,
+    runtime: Optional[float] = None,
+    path: Optional[str] = None,
+) -> None:
+    """Record one decision in the audit log. Best-effort: a logging failure
+    must never break the alignment path."""
+    try:
+        DecisionLog(config.cache_dir / "decisions.json", config.history_size).append({
+            "title": title,
+            "outcome": outcome,
+            "detail": detail,
+            "score": score,
+            "coverage": coverage,
+            "stable_fraction": stable_fraction,
+            "median_rate": median_rate,
+            "runtime": runtime,
+            "path": path,
+        })
+    except Exception:
+        logger.debug("Decision-log write failed.", exc_info=True)
+
+
+def _align_and_keep(
+    config: Config,
+    video_path: Path,
+    audio_path: Path,
+    label: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Run alignment and either keep or discard the combined output.
+
+    Returns ``(published, reason)``. On success *reason* is None; on failure it
+    is a human-readable cause (the engine's mismatch diagnosis or the rescue-
+    gate rejection detail) for the operator notification. Every attempt is
+    recorded in the decision log so the accept/reject judgment is auditable.
+    """
     alignment_dir = config.cache_dir / "alignments"
     tmp_output_dir = config.cache_dir / "output"
+    entry_title = label or video_path.name
 
     # Refuse the stretch-video path (config.stretch_audio is False) for an
     # in-place library replacement unless Matt has explicitly opted into the
@@ -503,7 +570,10 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
             "or DESCRIBARR_ALLOW_VIDEO_RETIME=true to override.",
             video_path,
         )
-        return False
+        reason = ("stretch-video path disabled; set DESCRIBARR_STRETCH_AUDIO=true "
+                  "or DESCRIBARR_ALLOW_VIDEO_RETIME=true")
+        _log_decision(config, entry_title, "error", reason)
+        return False, reason
 
     # Snapshot the source fingerprint BEFORE alignment, not after. Alignment
     # commonly runs 1–30 minutes; if Sonarr/Radarr upgrades the file during
@@ -514,12 +584,15 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
         pre_fp = _file_fingerprint(video_path)
     except FileNotFoundError:
         logger.error("Source video vanished before alignment could start: %s", video_path)
-        return False
+        return False, "source file vanished before alignment"
 
     result = align(video_path, audio_path, tmp_output_dir, alignment_dir, config.stretch_audio)
-    if result is None:
-        logger.error("Alignment produced no validated output file.")
-        return False
+    if result is None or result.output is None:
+        reason = (result.failure_reason if result is not None else None) \
+            or "alignment produced no validated output"
+        logger.error("Alignment produced no validated output file: %s", reason)
+        _log_decision(config, entry_title, "failed", reason)
+        return False, reason
 
     combined = result.output
     report = result.report
@@ -557,7 +630,12 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
     if not accepted:
         logger.warning("Discarding %s — %s", video_path.name, decision_detail)
         _cleanup_combined(combined)
-        return False
+        _log_decision(
+            config, entry_title, "rejected", decision_detail,
+            score=score, coverage=cscore, stable_fraction=stable_fraction,
+            median_rate=median_rate, runtime=total_runtime, path=accept_path,
+        )
+        return False, decision_detail
     logger.info("Accepting %s via %s path — %s", video_path.name, accept_path, decision_detail)
 
     try:
@@ -586,7 +664,12 @@ def _align_and_keep(config: Config, video_path: Path, audio_path: Path) -> bool:
         "Success: replaced %s (similarity=%.1f%%, stable trunk=%.1f%%)",
         video_path, score, stable_fraction,
     )
-    return True
+    _log_decision(
+        config, entry_title, "described", decision_detail,
+        score=score, coverage=cscore, stable_fraction=stable_fraction,
+        median_rate=median_rate, runtime=total_runtime, path=accept_path,
+    )
+    return True, None
 
 
 def _cleanup_combined(combined: Path) -> None:
@@ -876,13 +959,13 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                 # against the primary episode's audio; the helper marks every
                 # covered episode done in the same call.
                 extra_episodes = list(item.get("extra_episodes") or [])
-                described = process_episode(
+                described, _reason = process_episode(
                     client, config, video_path,
                     item["series_title"], item["season"], item["episode"],
                     extra_episodes=extra_episodes,
                 )
             elif item["type"] == "movie":
-                described = process_movie(
+                described, _reason = process_movie(
                     client, config, video_path,
                     item["movie_title"], item.get("movie_year", ""),
                 )
@@ -1039,8 +1122,8 @@ def _mark_episode_done(
     zip_cache_dir: Path,
     season: int,
     episode: int,
-    extract_dir: Path,
-    zip_path: Path,
+    extract_dir: Optional[Path] = None,
+    zip_path: Optional[Path] = None,
 ) -> None:
     """
     Record *episode* as successfully processed for this season.
@@ -1048,6 +1131,10 @@ def _mark_episode_done(
     When the set of done episodes equals the number of audio files in the
     extracted zip, the zip and its extracted directory are deleted — they're
     no longer needed and just waste disk space.
+
+    *extract_dir*/*zip_path* are None for a LivingAudio (FTP-per-episode)
+    source: there is no season zip to reclaim, so the episode is recorded in
+    the ledger and the zip-cleanup branch is skipped.
 
     The done-episodes file lives at the show level (not inside the season dir)
     so that the zip cache cleanup doesn't erase it.
@@ -1099,7 +1186,7 @@ def _mark_episode_done(
     season_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(progress_path, {"total": stored_total, "done": sorted(done)})
 
-    if stored_total > 0 and len(done) >= stored_total and not was_complete:
+    if zip_path is not None and stored_total > 0 and len(done) >= stored_total and not was_complete:
         _cleanup_completed_season(zip_cache_dir, season_dir, zip_path, season, stored_total)
 
 
@@ -1126,14 +1213,14 @@ def _resolve_audio_total(
     """
     if stored_total > 0:
         return stored_total
-    if trust_extract_dir and extract_dir.exists():
+    if trust_extract_dir and extract_dir is not None and extract_dir.exists():
         live = sum(
             1 for f in extract_dir.rglob("*")
             if f.is_file() and f.suffix.lower() in _AUDIO_EXTS
         )
         if live > 0:
             return live
-    if zip_path.exists():
+    if zip_path is not None and zip_path.exists():
         try:
             with zipfile.ZipFile(zip_path) as zf:
                 return sum(

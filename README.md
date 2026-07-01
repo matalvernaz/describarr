@@ -81,6 +81,14 @@ chmod +x /path/to/sonarr/config/describarr-hook.sh
 chmod +x /path/to/radarr/config/describarr-hook.sh
 ```
 
+If you set `DESCRIBARR_API_KEY` (optional; the server is open by default, relying on docker-network isolation), add a matching header to both hook scripts so the mutating endpoints accept them:
+
+```sh
+curl -sf -X POST http://describarr:8686/hook \
+  -H "X-Api-Key: your-secret" \
+  --data-urlencode ...
+```
+
 ### 4. Configure Sonarr and Radarr
 
 In each app: **Settings → Connect → + → Custom Script**
@@ -210,6 +218,14 @@ If the folder name doesn't include the year (or the AudioVault title differs), p
 > curl "http://describarr:8686/retry?dir=/tv/ted/Season%202"
 > ```
 > Or open a shell into the describarr container and use curl from there.
+
+---
+
+## Monitoring
+
+`GET /status` is a status page showing the current job, the download-cap and queue counts, and a **recent-decisions** table: the last N accept / reject / skip / no-match decisions with their scores and reasons (`DESCRIBARR_HISTORY_SIZE`, default 50). It's a plain semantic page — headings and real tables — so it reads cleanly with a screen reader, and there's a `?format=json` view for programmatic polling. It replaces grepping container logs to see what happened overnight.
+
+When an alignment can't be made, the Pushover notification carries the specific cause instead of a generic "errored" — e.g. *"AD is 22 min vs 45 min video — likely wrong/truncated episode"* or *"AD audio is 95% silence"* — so you know whether to swap the AD source or re-grab the video. (This relies on the failure diagnosis emitted by describealaign ≥ v2.1.9.)
 
 ---
 
