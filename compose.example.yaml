@@ -24,19 +24,12 @@ services:
     networks:
       - arr-network   # must be the same network as Sonarr/Radarr
     restart: unless-stopped
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.describarr.rule=Host(`describarr.example.com`)
-      - traefik.http.routers.describarr.entrypoints=websecure
-      - traefik.http.routers.describarr.tls=true
-      - traefik.http.routers.describarr.middlewares=sso@file
-      - traefik.http.services.describarr.loadbalancer.server.port=8686
-      # Favicon bypass — prevents SSO CSRF race condition on first load
-      - traefik.http.routers.describarr-favicon.rule=Host(`describarr.example.com`) && PathPrefix(`/favicon`)
-      - traefik.http.routers.describarr-favicon.priority=100
-      - traefik.http.routers.describarr-favicon.entrypoints=websecure
-      - traefik.http.routers.describarr-favicon.tls=true
-      - traefik.http.routers.describarr-favicon.service=describarr
+    # No published port and no reverse-proxy labels needed: Sonarr/Radarr reach
+    # describarr by name on the shared network (http://describarr:8686). To open
+    # the /status dashboard in a browser, add a `ports:` mapping or front it with
+    # your own reverse proxy — but the mutating endpoints (/hook, /retry, /drain,
+    # DELETE /queue) are unauthenticated unless you set DESCRIBARR_API_KEY, so
+    # don't expose it unprotected.
 
 networks:
   arr-network:

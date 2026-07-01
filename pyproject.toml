@@ -13,7 +13,11 @@ dependencies = [
     "requests>=2.31",
     "beautifulsoup4>=4.12",
     "python-dotenv>=1.0",
-    "describealaign>=2.0",
+    # describealaign is Matt's fork — git-only, not on PyPI. A direct reference
+    # lets `pip install git+…/describarr.git` resolve it. Keep the tag in sync
+    # with the Dockerfile pin. (The Docker image installs with --no-deps and
+    # pins the engine separately, so this only drives the bare-metal install.)
+    "describealaign @ git+https://github.com/matalvernaz/describealaign.git@v2.1.9",
 ]
 
 [project.scripts]

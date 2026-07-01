@@ -6,7 +6,7 @@ When Sonarr or Radarr imports a new file, describarr:
 
 1. Searches AudioVault for a matching audio description track.
 2. Downloads the file (caching season ZIPs so they are only fetched once per season).
-3. Runs [describealaign](https://github.com/julbean/describealaign) to align and combine the audio description with the video.
+3. Runs [describealaign](https://github.com/matalvernaz/describealaign) to align and combine the audio description with the video.
 4. If the alignment is confident enough that the description lands at the right time, replaces the original file in-place with the combined version. The primary gate is the **similarity score (default ≥ 65 %)**, which measures how well the description track's embedded program audio locked onto the video — i.e. how confidently the narration was placed in time. A secondary *drift rescue* accepts a lower similarity only when the time-mapping is uniform and the cause is known (commercial-break seams, or a PAL/NTSC rate conversion). Otherwise the description is discarded and the original is untouched. As a safety net, the original is hardlinked into a backup before any overwrite (see `DESCRIBARR_BACKUP_*`), so a bad alignment is always recoverable.
 
 ---
@@ -47,9 +47,19 @@ docker compose up -d
 
 The container starts a small webhook server on port 8686 (internal only — no need to expose it).
 
+Verify your credentials loaded:
+
+```bash
+docker exec describarr describarr --test-auth
+```
+
+You should see `Login successful.`
+
 ### 3. Add the hook script to Sonarr and Radarr
 
 Sonarr/Radarr execute Custom Scripts inside their own containers. The easiest place to drop a script that's already visible inside each container is their `config` volume (mounted at `/config`).
+
+> The script uses `curl`, which the LinuxServer.io Sonarr/Radarr images already include. On a minimal image without it, install `curl` in that container first (or rewrite the hook using `wget`).
 
 Create `/path/to/sonarr/config/describarr-hook.sh`:
 
@@ -114,11 +124,11 @@ If Sonarr and Radarr run directly on the host (not in Docker), you can install d
 pip install git+https://github.com/matalvernaz/describarr.git
 ```
 
-`describealaign` is a dependency but its GUI component (wxPython) is not needed and may fail to build on some platforms. If the install fails due to wxPython, install without it:
+This also pulls the `describealaign` engine straight from its git fork — it is **not published on PyPI**. Its optional GUI component (wxPython) isn't needed and can fail to build on some platforms; if the install trips on wxPython, install the engine `--no-deps` and add its runtime deps by hand:
 
 ```bash
-pip install --no-deps describealaign
-pip install "ffmpeg-python~=0.2.0" "static-ffmpeg~=3.0" "matplotlib~=3.9" \
+pip install --no-deps "git+https://github.com/matalvernaz/describealaign.git@v2.1.9"
+pip install "ffmpeg-python~=0.2.0" "static-ffmpeg~=3.0" \
     "numpy<3.0,>=1.21" "scipy~=1.10" "platformdirs~=4.2" \
     "natsort~=8.4.0" "sortedcontainers~=2.4.0" future
 pip install --no-deps git+https://github.com/matalvernaz/describarr.git
@@ -176,6 +186,8 @@ Downloaded season ZIPs are stored in `~/.cache/describarr/shows/<series>/` (or t
 ## Manual retry
 
 If AudioVault didn't have an audio description when a file was imported, use the `/retry` endpoint on the running server. All retry requests return **202 Accepted immediately** — processing happens in the background and progress is visible in the container logs.
+
+> **Base URL.** describarr publishes no host port by default (step 2), so the `http://localhost:8686` in the examples below works when you've `docker exec`'d into the container, or on a bare-metal install. From another container on the arr network, use `http://describarr:8686` instead (see the note at the end of this section).
 
 All paths must be paths *inside the describarr container*, which are the same as what Sonarr/Radarr see (i.e. the same volume mounts).
 
