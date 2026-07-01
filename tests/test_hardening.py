@@ -1,5 +1,5 @@
 """Regression tests for the 2026-07-01 audit fixes:
-  - _mark_episode_done tolerates a LivingAudio (no-zip) source.
+  - _mark_episode_done tolerates an extra (no-zip) source.
   - DecisionLog is a bounded, newest-last ring.
   - aligner._read_failure_sidecar surfaces the engine's mismatch cause.
   - RetryQueue serialises concurrent appends (no lost updates).
@@ -7,23 +7,26 @@
   - _validate_media_output rejects an output that dropped subtitle streams.
 """
 import json
+import sys
 import threading
+import types
 
 import pytest
 
 from describarr import aligner
+from describarr import sources
 from describarr import workflow as wf
 from describarr.config import Config
 from describarr.decision_log import DecisionLog
 from describarr.retry_queue import RetryQueue
 
 
-# --- Part 1: LivingAudio mark-done gap -------------------------------------
+# --- Part 1: extra-source (no-zip) mark-done gap ---------------------------
 
 def test_mark_episode_done_without_zip_records_and_skips_cleanup(tmp_path):
-    """The LivingAudio path passes no zip/extract_dir; the episode must still
-    land in the season ledger, and the (missing) zip cleanup must be skipped
-    without raising."""
+    """An extra source passes no zip/extract_dir; the episode must still land
+    in the season ledger, and the (missing) zip cleanup must be skipped without
+    raising."""
     wf._mark_episode_done(tmp_path, season=3, episode=5)
     progress = tmp_path / ".done_s03.json"
     assert progress.exists()
@@ -162,3 +165,49 @@ def test_validate_accepts_preserved_subtitles(monkeypatch):
 
     from pathlib import Path
     assert aligner._validate_media_output(Path("/tv/src.mkv"), Path("/tv/out.mkv")) is True
+
+
+# --- extra-source plugin loader (no provider specifics live in the repo) ----
+
+def _register_fake_source(name: str, *, configured: bool = True):
+    mod = types.ModuleType(name)
+
+    class _FakeSource:
+        def is_configured(self):
+            return configured
+
+        def episode_candidates(self, *a, **k):
+            return []
+
+        def movie_candidates(self, *a, **k):
+            return []
+
+        def close(self):
+            pass
+
+    mod.get_source = lambda: _FakeSource()
+    sys.modules[name] = mod
+
+
+def test_load_extra_sources_unset_is_empty(monkeypatch):
+    monkeypatch.delenv("DESCRIBARR_EXTRA_SOURCES", raising=False)
+    assert sources.load_extra_sources() == []
+
+
+def test_load_extra_sources_loads_configured_via_default_factory(monkeypatch):
+    _register_fake_source("_fake_src_ok")
+    monkeypatch.setenv("DESCRIBARR_EXTRA_SOURCES", "_fake_src_ok")  # default get_source
+    loaded = sources.load_extra_sources()
+    assert len(loaded) == 1
+    assert isinstance(loaded[0], sources.AudioSource)
+
+
+def test_load_extra_sources_skips_unconfigured(monkeypatch):
+    _register_fake_source("_fake_src_no", configured=False)
+    monkeypatch.setenv("DESCRIBARR_EXTRA_SOURCES", "_fake_src_no:get_source")
+    assert sources.load_extra_sources() == []
+
+
+def test_load_extra_sources_skips_unimportable(monkeypatch):
+    monkeypatch.setenv("DESCRIBARR_EXTRA_SOURCES", "no.such.module:get_source")
+    assert sources.load_extra_sources() == []  # logged and skipped, never fatal

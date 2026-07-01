@@ -39,6 +39,7 @@ from .config import Config
 from .decision_log import DecisionLog
 from .matcher import extract_episode, find_movie, find_season
 from .retry_queue import RetryQueue
+from .sources import load_extra_sources
 
 # Errors we treat as transient (re-queue and retry on next drain).
 # AudioVault occasional 5xx, a flaky Cloudflare edge, or a stalled CDN
@@ -78,16 +79,6 @@ _TITLE_YEAR_SUFFIX_RE = re.compile(r"\s*\(\d{4}\)\s*$")
 def _strip_year_suffix(title: str) -> str:
   """Return *title* with a trailing ``(YYYY)`` token removed."""
   return _TITLE_YEAR_SUFFIX_RE.sub("", title).strip()
-
-# LivingAudio FTP fallback is a private add-on kept off the public repo.
-# When the module is absent, describarr falls back to AudioVault-only and
-# logs a single info-level note on first attempt to use it.
-try:
-    from . import living_audio as _la  # type: ignore[import-not-found]
-    _LA_AVAILABLE = True
-except ImportError:
-    _la = None  # type: ignore[assignment]
-    _LA_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -168,25 +159,25 @@ def process_episode(
         last_reason = reason
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
-    if _LA_AVAILABLE:
-        la = _la.LivingAudioClient()
-        if la.is_configured():
-            try:
-                audio_path = la.find_episode(config.cache_dir, series_title, season, episode)
-                if audio_path:
-                    published, reason = _align_and_keep(config, video_path, audio_path, label=label)
-                    if published:
-                        # LivingAudio is FTP-per-episode (no season zip), but
-                        # still record every covered episode in the season
-                        # ledger so zip-cleanup accounting and the /retry skip
-                        # logic stay correct. No zip/extract_dir ⇒ the cleanup
-                        # branch inside _mark_episode_done is a no-op.
-                        for ep in all_episodes:
-                            _mark_episode_done(zip_cache_dir, season, ep)
-                        return True, None
-                    last_reason = reason
-            finally:
-                la.close()
+    # Extra (privately-supplied) sources, tried after AudioVault. Each yields
+    # candidate AD audio files; align in order, first acceptable wins.
+    for source in load_extra_sources():
+        try:
+            for audio_path in source.episode_candidates(
+                config.cache_dir, series_title, season, episode
+            ):
+                published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+                if published:
+                    # An extra source may deliver a bare per-episode file with
+                    # no season zip; still record every covered episode in the
+                    # ledger so zip-cleanup accounting and the /retry skip logic
+                    # stay correct. No zip/extract_dir ⇒ cleanup is a no-op.
+                    for ep in all_episodes:
+                        _mark_episode_done(zip_cache_dir, season, ep)
+                    return True, None
+                last_reason = reason
+        finally:
+            source.close()
 
     return False, last_reason
 
@@ -238,26 +229,18 @@ def process_movie(
         last_reason = reason
         logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
-    if _LA_AVAILABLE:
-        la = _la.LivingAudioClient()
-        if la.is_configured():
-            try:
-                la_cache = config.cache_dir / "la_movies"
-                for la_candidate in la.search_movies(movie_title, movie_year):
-                    audio_path = la.download(la_candidate["url"], la_cache)
-                    if audio_path:
-                        published, reason = _align_and_keep(
-                            config, video_path, audio_path, label=label
-                        )
-                        if published:
-                            return True, None
-                        last_reason = reason
-                    logger.info(
-                        "LivingAudio candidate %r below threshold — trying next.",
-                        la_candidate["name"],
-                    )
-            finally:
-                la.close()
+    # Extra (privately-supplied) sources, tried after AudioVault.
+    for source in load_extra_sources():
+        try:
+            for audio_path in source.movie_candidates(
+                config.cache_dir, movie_title, movie_year
+            ):
+                published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+                if published:
+                    return True, None
+                last_reason = reason
+        finally:
+            source.close()
 
     return False, last_reason
 
@@ -1132,7 +1115,7 @@ def _mark_episode_done(
     extracted zip, the zip and its extracted directory are deleted — they're
     no longer needed and just waste disk space.
 
-    *extract_dir*/*zip_path* are None for a LivingAudio (FTP-per-episode)
+    *extract_dir*/*zip_path* are None for an extra (per-episode, no-zip)
     source: there is no season zip to reclaim, so the episode is recorded in
     the ledger and the zip-cleanup branch is skipped.
 
