@@ -172,6 +172,12 @@ def run(
     run_output_dir = output_dir / f"run-{run_id}"
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # PAL-timebase AD rescue (see _conform_pal_audio): PAL-mastered AD sources
+    # run ~4.27% longer than a native NTSC/film video, so describealign emits an
+    # output at the AD's length that overshoots the duration gate. Conform the
+    # AD to the video's timebase first when the duration ratio says PAL.
+    align_audio_path = _conform_pal_audio(video_path, audio_path, run_output_dir)
+
     # Record the wall-clock time just before we launch the subprocess so that
     # _find_output can reject any files that pre-date this run (defence in
     # depth — the per-run dir already guarantees no cross-run contamination).
@@ -180,7 +186,7 @@ def run(
     cmd = [
         sys.executable, "-m", "describealaign",
         str(video_path),
-        str(audio_path),
+        str(align_audio_path),
         "--yes",
         "--output_dir", str(run_output_dir),
         "--alignment_dir", str(alignment_dir),
@@ -675,6 +681,69 @@ def _container_duration(probe: dict) -> Optional[float]:
         return float(raw)
     except (TypeError, ValueError):
         return None
+
+
+# PAL/NTSC timebase gap: 25fps PAL runs 4.27% faster than 23.976fps film, so a
+# PAL-mastered AD (slowed back to correct pitch) is ~4.27% *longer* than a
+# native video. Conform only when the AD/video total-duration ratio is clearly
+# in this band — a wider gap is a genuinely different cut and must not be
+# silently time-warped onto the picture.
+_PAL_CONFORM_MIN_RATIO = 1.02
+_PAL_CONFORM_MAX_RATIO = 1.07
+_FFMPEG_CONFORM_TIMEOUT_SEC = 600
+
+
+def _conform_pal_audio(video_path: Path, audio_path: Path, work_dir: Path) -> Path:
+    """Conform a PAL-timebase AD track to the video's duration.
+
+    Returns a tempo-adjusted copy of *audio_path* (written into *work_dir*)
+    whose total duration matches the video when the AD/video duration ratio
+    falls in the PAL band; otherwise returns *audio_path* unchanged. The tempo
+    change is pitch-preserving so narration stays natural. Any probe or encode
+    failure falls back to the original AD — the rescue is best-effort and must
+    never block an otherwise-normal alignment.
+    """
+    vprobe = _ffprobe_json(video_path)
+    aprobe = _ffprobe_json(audio_path)
+    if not vprobe or not aprobe:
+        return audio_path
+    vdur = _container_duration(vprobe)
+    adur = _container_duration(aprobe)
+    if not vdur or not adur or vdur <= 0:
+        return audio_path
+    ratio = adur / vdur
+    if not (_PAL_CONFORM_MIN_RATIO <= ratio <= _PAL_CONFORM_MAX_RATIO):
+        return audio_path
+
+    # Unique per-video name so describealign's feature cache can't collide
+    # across episodes that would otherwise share a generic scratch filename.
+    conformed = work_dir / f"{video_path.stem}.conformed.mp3"
+    logger.info(
+        "AD track is %.2f%% longer than video (PAL timebase) — conforming with "
+        "atempo=%.5f before alignment", (ratio - 1) * 100, ratio,
+    )
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", str(audio_path),
+        "-filter:a", f"atempo={ratio:.6f}",
+        "-c:a", "libmp3lame", "-q:a", "2",
+        str(conformed),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=_FFMPEG_CONFORM_TIMEOUT_SEC, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("AD conform failed (%s) — using original AD track", exc)
+        return audio_path
+    if proc.returncode != 0 or not conformed.exists():
+        logger.warning(
+            "AD conform ffmpeg exited %d — using original AD track: %s",
+            proc.returncode, proc.stderr.strip()[:300],
+        )
+        return audio_path
+    return conformed
 
 
 def _parse_fps(stream: dict) -> float:
