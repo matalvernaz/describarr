@@ -36,24 +36,38 @@ def _natsort_paths(paths) -> list[Path]:
 # Title / season matching
 # ------------------------------------------------------------------
 
-# AudioVault publishes a season's audio description in up to three variants,
-# distinguished only by a tag in the title: [New Description] and [Old
-# Description] are human-narrated AD; [TTS] is synthetic text-to-speech, the
-# lowest quality and the worst-aligning. The tag is the *only* part of the
-# name that differs between variants of one season, so it must not influence
-# which season we matched — it's stripped before title similarity is scored
-# (see _ranked_above) and only used afterwards to break ties between genuine
-# same-season variants.
-_VARIANT_TAG_RE = re.compile(r"\s*\[(?:new description|old description|tts)\]\s*", re.IGNORECASE)
+# AudioVault wraps catalog metadata in square brackets after the title:
+# description variant ([New Description], [Old Description], [TTS]), narration
+# region ([US], [UK]), or narration language ([Persian Description], [French
+# Description], …). Square brackets never appear in real titles, so every
+# bracketed tag is stripped before title similarity is scored — a region tag
+# must not token-match a title (the movie "Us" otherwise Jaccard-matches the
+# entire [US] catalog and the candidate walk burns the daily download cap).
+# Tags are consulted only afterwards: quality to break ties between genuine
+# variants, language to reject unusable narrations.
+_BRACKET_TAG_RE = re.compile(r"\s*\[[^\]]*\]\s*")
+
+# A "<language> Description" tag marks narration in that language. The program
+# audio underneath is still the right film, so alignment can PASS on a
+# non-English narration and publish it as the default track — reject the
+# candidate outright instead. "New"/"Old" are variant labels, not languages.
+_DESCRIPTION_LANG_RE = re.compile(r"\[\s*(\w+)\s+description\s*\]", re.IGNORECASE)
+_ALLOWED_DESCRIPTION_LANGS = frozenset({"new", "old", "english"})
+
+
+def _foreign_narration(name: str) -> bool:
+    """True when *name* carries a non-English narration-language tag."""
+    m = _DESCRIPTION_LANG_RE.search(name)
+    return bool(m) and m.group(1).lower() not in _ALLOWED_DESCRIPTION_LANGS
 
 
 def _variant_quality(name: str) -> int:
     """Rank a candidate's description variant; higher is preferred.
 
     [New Description]/untagged human AD (2) > [Old Description] (1) > [TTS] (0).
-    Used only as a tiebreaker between variants whose stripped titles match the
-    same season equally well, so the best obtainable description is attempted
-    before TTS instead of by accident of tag-string length.
+    Used only as a tiebreaker between variants whose stripped titles match
+    equally well, so the best obtainable description is attempted before TTS
+    instead of by accident of tag-string length.
     """
     n = name.lower()
     if "[tts]" in n:
@@ -87,17 +101,18 @@ def find_season(results: list[dict], title: str, season: int) -> list[dict]:
     # from the season-1 year-only fallback pool, regardless of zero-padding.
     any_season_marker = re.compile(r"\b(?:s|season|series)\s*0?\d+\b", re.IGNORECASE)
 
+    results = [r for r in results if not _foreign_narration(r["name"])]
     title_lower = title.lower()
 
     def _ranked_above(candidates: list[dict], threshold: float) -> list[dict]:
-        # Strip the variant tag before scoring so all variants of a season tie
+        # Strip bracketed tags before scoring so all variants of a season tie
         # on title similarity; quality then breaks the tie (human AD before
         # TTS). Title match stays the dominant key, so a wrong show/season can
         # never be promoted over a near-exact match by quality alone. The
         # similarity is rounded so a sub-0.01 wobble between otherwise-identical
         # titles can't defeat the quality tiebreaker.
         scored = [
-            (_title_similarity(title_lower, _VARIANT_TAG_RE.sub(" ", r["name"]).strip().lower()),
+            (_title_similarity(title_lower, _BRACKET_TAG_RE.sub(" ", r["name"]).strip().lower()),
              _variant_quality(r["name"]), r)
             for r in candidates
         ]
@@ -142,36 +157,48 @@ def find_season(results: list[dict], title: str, season: int) -> list[dict]:
 def find_movie(results: list[dict], title: str, year: str) -> list[dict]:
     """
     Return all results from *results* that plausibly match *title* (and
-    optionally *year*), ranked by score (best first).
+    optionally *year*), ranked by score (best first, human variants before
+    TTS within a tie).
+
+    Non-English narrations are rejected, and when *year* is known a candidate
+    whose parenthesised release year disagrees is rejected too — AudioVault
+    carries remakes and sequels under near-identical titles, and a wrong-year
+    download burns a daily download slot before alignment can reject it.
 
     The caller should try each candidate in order, stopping on the first that
     aligns above the score threshold.
     """
     title_lower = title.lower()
-    scored: list[tuple[float, dict]] = []
+    scored: list[tuple[float, int, dict]] = []
 
     for result in results:
-        name_lower = result["name"].lower()
-        score = _title_similarity(title_lower, name_lower)
-
-        if year and year in result["name"]:
+        name = result["name"]
+        if _foreign_narration(name):
+            continue
+        name_years = _PAREN_YEAR_RE.findall(name)
+        if year and name_years and year not in name_years:
+            continue  # conflicting release year — wrong film or wrong sequel
+        score = _title_similarity(
+            title_lower, _BRACKET_TAG_RE.sub(" ", name).strip().lower()
+        )
+        if year and year in name_years:
             score += 0.15  # small bonus for year match
 
-        scored.append((score, result))
+        scored.append((score, _variant_quality(name), result))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    kept = [(s, r) for s, r in scored if s >= 0.3]
+    scored.sort(key=lambda x: (round(x[0], 2), x[1]), reverse=True)
+    kept = [(s, q, r) for s, q, r in scored if s >= 0.3]
 
-    for s, r in kept:
+    for s, _, r in kept:
         logger.info("Movie candidate: %r (score %.2f)", r["name"], s)
 
     if scored and not kept:
         logger.warning(
             "Best movie match %r has low similarity (%.2f) — skipping.",
-            scored[0][1]["name"], scored[0][0],
+            scored[0][2]["name"], scored[0][0],
         )
 
-    return [r for _, r in kept]
+    return [r for _, _, r in kept]
 
 
 # ------------------------------------------------------------------
@@ -297,10 +324,14 @@ def _ensure_extracted(zip_path: Path, extract_dir: Path) -> None:
 
 _STOPWORDS = frozenset({"the", "a", "an", "and", "of", "in", "to", "for", "season", "series"})
 
-# Year-like digit tokens (1900–2099). Only these are pure metadata noise to
-# be stripped unconditionally; everything else (e.g. "2" in "Iron Man 2") is
-# preserved so the sequel-mismatch guard below can do its job.
-_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+# Parenthesised "(YYYY)" release-year tokens are catalog metadata and are
+# removed before tokenising. A BARE year-like number is title content and is
+# kept — "2012", "Wonder Woman 1984", "Blade Runner 2049", the show "1899".
+# The old strip-any-year-token rule collapsed those titles into their
+# neighbours ("Blade Runner 2049" → "Blade Runner") and let "2012 (2009)"
+# score a perfect match against the movie "Us" once a bracket tag kept the
+# token set non-empty.
+_PAREN_YEAR_RE = re.compile(r"\(\s*((?:19|20)\d{2})\s*\)")
 
 # Roman numerals 1-20 cover almost every theatrical sequel naming convention
 # (Rocky I-V, Final Destination II, Saw V/VI/VII/VIII, etc.). Normalising
@@ -318,10 +349,11 @@ _ROMAN_TO_INT = {
 def _title_similarity(a: str, b: str) -> float:
     """Jaccard similarity on word tokens with sequel-aware digit handling.
 
-    Year tokens are stripped (they're metadata noise: ``Charmed (1998)`` vs
-    ``Charmed - Season 8 (2005)`` shouldn't be penalised for disagreeing on
-    a year). Every other digit is kept as title content. If both titles
-    carry title-meaningful digits and *no* digit is shared, the score is
+    Parenthesised release years are removed before tokenising (metadata
+    noise: ``Charmed (1998)`` vs ``Charmed - Season 8 (2005)`` shouldn't be
+    penalised for disagreeing on a year). Every other digit — including a
+    bare year-like one — is kept as title content. If both titles carry
+    title-meaningful digits and *no* digit is shared, the score is
     hard-capped — that's what stops ``Iron Man 2`` and ``Iron Man 3`` from
     collapsing to 1.0 and routing the wrong sequel's audio to a Radarr grab.
 
@@ -331,6 +363,7 @@ def _title_similarity(a: str, b: str) -> float:
     pool already agrees on the season).
     """
     def tokenize(s: str) -> set[str]:
+        s = _PAREN_YEAR_RE.sub(" ", s)
         s = re.sub(r"[^\w\s]", " ", s.lower())
         # Normalise roman numerals to digits so the sequel-mismatch guard
         # below can catch "Rocky II vs Rocky V" the same way it catches
@@ -343,16 +376,6 @@ def _title_similarity(a: str, b: str) -> float:
 
     tokens_a = tokenize(a)
     tokens_b = tokenize(b)
-
-    # Strip year tokens — only when both sides retain something afterwards,
-    # so a pure-numeric title like ``2012`` doesn't disappear.
-    def strip_years(tokens: set[str]) -> set[str]:
-        return {t for t in tokens if not _YEAR_RE.match(t)}
-
-    stripped_a = strip_years(tokens_a)
-    stripped_b = strip_years(tokens_b)
-    if stripped_a and stripped_b:
-        tokens_a, tokens_b = stripped_a, stripped_b
 
     if not tokens_a or not tokens_b:
         return 0.0

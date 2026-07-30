@@ -129,19 +129,26 @@ class AlignResult:
     available, else a generic description of the failure mode — so the caller
     can tell a blind operator *why* nothing was produced instead of a bare
     "errored".
+
+    *returncode* is the describealaign exit status when the subprocess ran to
+    an exit (None when it never launched or timed out). Negative means killed
+    by a signal — under the container memory cap that's the memcg OOM SIGKILL,
+    a property of the video's decode footprint rather than of the AD candidate.
     """
 
-    __slots__ = ("output", "report", "failure_reason")
+    __slots__ = ("output", "report", "failure_reason", "returncode")
 
     def __init__(
         self,
         output: Optional[Path],
         report: Optional[Path],
         failure_reason: Optional[str] = None,
+        returncode: Optional[int] = None,
     ) -> None:
         self.output = output
         self.report = report
         self.failure_reason = failure_reason
+        self.returncode = returncode
 
 
 def run(
@@ -234,7 +241,7 @@ def run(
             reason = f"alignment failed (describealaign exit {returncode})"
             logger.error("describealaign exited with code %d.", returncode)
         _cleanup_run_dir(run_output_dir)
-        return AlignResult(None, None, reason)
+        return AlignResult(None, None, reason, returncode=returncode)
 
     output = _find_output(video_path, run_output_dir, run_start)
     if output is None:

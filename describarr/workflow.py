@@ -61,6 +61,21 @@ _MAX_DRAIN_ATTEMPTS = 5
 # accumulate permanent residents that will never succeed.
 _MAX_DRAIN_PASSES = 30
 
+# One movie must never walk enough of its candidate list to burn the whole
+# AudioVault daily download budget (25 = roughly one drain's worth of items).
+# After ranking, the genuine variants of the right film sit at the top, so
+# anything past the first few is a wrong film that alignment would reject at
+# the cost of a download slot each.
+_MAX_MOVIE_CANDIDATES = 3
+
+
+class AlignmentResourceKill(Exception):
+    """The alignment subprocess was killed by a signal — under the container
+    memory cap, the memcg OOM SIGKILL on an oversized decode. The kill is a
+    property of the video file's decode footprint, not of the AD candidate:
+    every further candidate for the same file dies the same way, each attempt
+    costing a download slot, so candidate loops abort instead of iterating."""
+
 
 def _should_abandon_stale(item: dict) -> bool:
     """Increment *item*'s deferral counter; return True once it has been
@@ -139,45 +154,49 @@ def process_episode(
     limiter = DownloadLimiter(config.cache_dir / "daily_limit.json")
 
     last_reason: Optional[str] = None
-    for candidate in candidates:
-        try:
-            zip_path = _get_cached(client, candidate["url"], zip_cache_dir, limiter)
-        except DailyLimitReached:
-            raise
-        extract_dir = zip_cache_dir / f"season_{season:02d}" / _safe_dirname(candidate["name"])
-        audio_path = extract_episode(zip_path, extract_dir, episode)
-        if not audio_path:
-            logger.warning(
-                "E%02d not found in %r — trying next candidate.", episode, candidate["name"]
-            )
-            continue
-        published, reason = _align_and_keep(config, video_path, audio_path, label=label)
-        if published:
-            for ep in all_episodes:
-                _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
-            return True, None
-        last_reason = reason
-        logger.info("Candidate %r below threshold — trying next.", candidate["name"])
+    try:
+        for candidate in candidates:
+            try:
+                zip_path = _get_cached(client, candidate["url"], zip_cache_dir, limiter)
+            except DailyLimitReached:
+                raise
+            extract_dir = zip_cache_dir / f"season_{season:02d}" / _safe_dirname(candidate["name"])
+            audio_path = extract_episode(zip_path, extract_dir, episode)
+            if not audio_path:
+                logger.warning(
+                    "E%02d not found in %r — trying next candidate.", episode, candidate["name"]
+                )
+                continue
+            published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+            if published:
+                for ep in all_episodes:
+                    _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
+                return True, None
+            last_reason = reason
+            logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
-    # Extra (privately-supplied) sources, tried after AudioVault. Each yields
-    # candidate AD audio files; align in order, first acceptable wins.
-    for source in load_extra_sources():
-        try:
-            for audio_path in source.episode_candidates(
-                config.cache_dir, series_title, season, episode
-            ):
-                published, reason = _align_and_keep(config, video_path, audio_path, label=label)
-                if published:
-                    # An extra source may deliver a bare per-episode file with
-                    # no season zip; still record every covered episode in the
-                    # ledger so zip-cleanup accounting and the /retry skip logic
-                    # stay correct. No zip/extract_dir ⇒ cleanup is a no-op.
-                    for ep in all_episodes:
-                        _mark_episode_done(zip_cache_dir, season, ep)
-                    return True, None
-                last_reason = reason
-        finally:
-            source.close()
+        # Extra (privately-supplied) sources, tried after AudioVault. Each yields
+        # candidate AD audio files; align in order, first acceptable wins.
+        for source in load_extra_sources():
+            try:
+                for audio_path in source.episode_candidates(
+                    config.cache_dir, series_title, season, episode
+                ):
+                    published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+                    if published:
+                        # An extra source may deliver a bare per-episode file with
+                        # no season zip; still record every covered episode in the
+                        # ledger so zip-cleanup accounting and the /retry skip logic
+                        # stay correct. No zip/extract_dir ⇒ cleanup is a no-op.
+                        for ep in all_episodes:
+                            _mark_episode_done(zip_cache_dir, season, ep)
+                        return True, None
+                    last_reason = reason
+            finally:
+                source.close()
+    except AlignmentResourceKill as exc:
+        logger.error("Aborting candidate walk for %s: %s", video_path.name, exc)
+        return False, str(exc)
 
     return False, last_reason
 
@@ -217,30 +236,40 @@ def process_movie(
     movie_cache_dir = config.cache_dir / "movies"
     limiter = DownloadLimiter(config.cache_dir / "daily_limit.json")
 
-    last_reason: Optional[str] = None
-    for candidate in candidates:
-        try:
-            audio_path = _get_cached(client, candidate["url"], movie_cache_dir, limiter)
-        except DailyLimitReached:
-            raise
-        published, reason = _align_and_keep(config, video_path, audio_path, label=label)
-        if published:
-            return True, None
-        last_reason = reason
-        logger.info("Candidate %r below threshold — trying next.", candidate["name"])
+    if len(candidates) > _MAX_MOVIE_CANDIDATES:
+        logger.info(
+            "Trying the top %d of %d ranked candidates.",
+            _MAX_MOVIE_CANDIDATES, len(candidates),
+        )
 
-    # Extra (privately-supplied) sources, tried after AudioVault.
-    for source in load_extra_sources():
-        try:
-            for audio_path in source.movie_candidates(
-                config.cache_dir, movie_title, movie_year
-            ):
-                published, reason = _align_and_keep(config, video_path, audio_path, label=label)
-                if published:
-                    return True, None
-                last_reason = reason
-        finally:
-            source.close()
+    last_reason: Optional[str] = None
+    try:
+        for candidate in candidates[:_MAX_MOVIE_CANDIDATES]:
+            try:
+                audio_path = _get_cached(client, candidate["url"], movie_cache_dir, limiter)
+            except DailyLimitReached:
+                raise
+            published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+            if published:
+                return True, None
+            last_reason = reason
+            logger.info("Candidate %r below threshold — trying next.", candidate["name"])
+
+        # Extra (privately-supplied) sources, tried after AudioVault.
+        for source in load_extra_sources():
+            try:
+                for audio_path in source.movie_candidates(
+                    config.cache_dir, movie_title, movie_year
+                ):
+                    published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+                    if published:
+                        return True, None
+                    last_reason = reason
+            finally:
+                source.close()
+    except AlignmentResourceKill as exc:
+        logger.error("Aborting candidate walk for %s: %s", video_path.name, exc)
+        return False, str(exc)
 
     return False, last_reason
 
@@ -575,6 +604,11 @@ def _align_and_keep(
             or "alignment produced no validated output"
         logger.error("Alignment produced no validated output file: %s", reason)
         _log_decision(config, entry_title, "failed", reason)
+        if result is not None and result.returncode is not None and result.returncode < 0:
+            raise AlignmentResourceKill(
+                f"{reason} — killed by signal, likely the container memory cap; "
+                "further candidates for this file would die the same way"
+            )
         return False, reason
 
     combined = result.output
