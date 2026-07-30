@@ -546,7 +546,12 @@ def _find_output(video_path: Path, run_output_dir: Path, min_mtime: float = 0.0)
 # Container/codec validation thresholds.
 _PACKET_RATIO_FLOOR = 0.95          # max fractional packet loss tolerated
 _MAX_MISSING_SECONDS_OF_VIDEO = 10  # absolute floor — never lose more than ~10 s of video
-_FFPROBE_TIMEOUT_SEC = 120          # long enough for a packet-count scan on a 4 GB BluRay
+_FFPROBE_TIMEOUT_SEC = 120          # metadata probes read only headers — fast at any size
+# -count_packets reads the WHOLE file: a 2160p UHD REMUX is 60-80 GB and the
+# source sits on NFS, so the scan runs for minutes. With the metadata budget
+# (120 s) the count timed out, returned None, and validation refused to
+# publish a correct alignment — the file could never be described.
+_FFPROBE_COUNT_TIMEOUT_SEC = 900
 
 
 def _ffprobe_json(path: Path, extra_args: Optional[list[str]] = None) -> Optional[dict]:
@@ -797,7 +802,7 @@ def _video_packet_count(path: Path, video_specifier_index: int = 0) -> Optional[
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=_FFPROBE_TIMEOUT_SEC, check=False,
+            timeout=_FFPROBE_COUNT_TIMEOUT_SEC, check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         logger.warning("ffprobe -count_packets failed on %s: %s", path, exc)
