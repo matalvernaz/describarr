@@ -19,6 +19,18 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://audiovault.net"
 
 
+# Punctuation collapsed to spaces when a literal search returns nothing.
+# AudioVault's search is a literal substring match, so a hyphenation or
+# colon difference between the request title and the catalog spelling
+# ("The 40 Year-Old Virgin" vs "The 40 Year Old Virgin") yields zero rows.
+_SEARCH_FALLBACK_PUNCT_RE = re.compile(r"[-–—:]")
+
+
+def _normalize_search_query(query: str) -> str:
+    """Collapse dashes/colons to spaces and squeeze runs of whitespace."""
+    return " ".join(_SEARCH_FALLBACK_PUNCT_RE.sub(" ", query).split())
+
+
 def _is_login_url(url: str) -> bool:
     """True iff *url* is the AudioVault login endpoint, with or without
     query string. ``url.endswith("/login")`` alone misses ``/login?next=…``
@@ -194,6 +206,20 @@ class AudioVaultClient:
         return self._search("/movies", title)
 
     def _search(self, path: str, query: str) -> list[dict]:
+        results = self._search_once(path, query)
+        if results:
+            return results
+        normalized = _normalize_search_query(query)
+        if normalized and normalized != query:
+            logger.info(
+                "No results for %r — retrying with punctuation stripped: %r",
+                query,
+                normalized,
+            )
+            return self._search_once(path, normalized)
+        return results
+
+    def _search_once(self, path: str, query: str) -> list[dict]:
         resp = self._session.get(
             f"{BASE_URL}{path}",
             params={"search": query},
