@@ -318,8 +318,7 @@ def _process_item(item: dict, config: Config, pending: PendingQueue) -> None:
 # else is treated as a terminal/programming bug and dropped after logging.
 import requests as _requests  # local alias to keep the public import surface clean
 _TRANSIENT_WORKER_ERRORS = (
-    _requests.ConnectionError,
-    _requests.Timeout,
+    _requests.RequestException,
     ConnectionError,
     TimeoutError,
 )
@@ -335,13 +334,23 @@ def _is_transient(exc: BaseException) -> bool:
     flaky upstream — the previous tuple-only check let HTTPError fall
     through to the generic Exception handler in `_worker_handle_hook`,
     which fired a Pushover "errored" message and ack'd the work.
+
+    The net is deliberately cast over the whole ``RequestException`` tree
+    rather than an enumerated tuple. A connection dropped mid-body raises
+    ``ChunkedEncodingError``, which descends from ``RequestException`` and
+    ``OSError`` but from none of the connection/timeout classes — the most
+    transient failure there is was being treated as a programming bug and the
+    episode abandoned. The two error costs are lopsided: a misjudged
+    "transient" burns at most ``_MAX_WORKER_ATTEMPTS`` cheap retries before
+    the item drops anyway, while a misjudged "terminal" silently loses work
+    that only a manual re-trigger recovers.
     """
-    if isinstance(exc, _TRANSIENT_WORKER_ERRORS):
-        return True
+    # HTTPError is itself a RequestException, so it has to be classified by
+    # status before the broad check below sweeps a 404 in as retryable.
     if isinstance(exc, _requests.HTTPError):
         status = getattr(exc.response, "status_code", 0) or 0
         return status >= 500 or status == 429
-    return False
+    return isinstance(exc, _TRANSIENT_WORKER_ERRORS)
 
 
 class _HookHandler(BaseHTTPRequestHandler):

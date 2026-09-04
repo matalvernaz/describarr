@@ -60,6 +60,37 @@ def _is_acceptable_media_type(content_type: str) -> bool:
         return True
     return content_type in _ACCEPTABLE_MEDIA_TYPES
 
+
+# Leading bytes of the container formats AudioVault serves. Checked when the
+# Content-Type header is not one we accept: the CDN has been observed labelling
+# a perfectly good MP3 ``application/x-font-gdos``, and rejecting on the header
+# alone stranded that title on every retry.
+_MEDIA_MAGIC = (
+    b"ID3",          # MP3 with an ID3v2 tag
+    b"\xff\xfb", b"\xff\xf3", b"\xff\xf2", b"\xff\xe3",  # bare MPEG frame sync
+    b"PK\x03\x04",   # zip (season bundles)
+    b"RIFF",         # wav
+    b"OggS",
+    b"fLaC",
+)
+
+
+def _looks_like_media(head: bytes) -> bool:
+    """True if *head* (the first bytes of a response body) begins with a known
+    media container signature.
+
+    The point is to tell a mislabelled media body from the login / error page
+    the Content-Type guard exists to catch, so markup is rejected outright
+    rather than falling through to the magic-number check.
+    """
+    if not head:
+        return False
+    if head.lstrip()[:1] == b"<":
+        return False  # markup — a login, quota or error page
+    if head.startswith(_MEDIA_MAGIC):
+        return True
+    return head[4:8] == b"ftyp"  # ISO-BMFF: mp4 / m4a / m4b
+
 # Mimic a real Firefox request so the server doesn't reject us outright.
 _HEADERS = {
     "User-Agent": (
@@ -266,16 +297,23 @@ class AudioVaultClient:
             # so they never get cached as ``.mp3``/``.zip``. The CDN
             # occasionally serves text/plain JSON-ish error pages too, so
             # we positively require audio/* or application/{zip,octet-stream}.
+            # One iterator for both the sniff and the write: the response is
+            # streamed, so bytes read here are gone from the download unless
+            # they're carried over into the first write.
+            chunks = resp.iter_content(chunk_size=65_536)
+            head = b""
             content_type = resp.headers.get("Content-Type", "").lower().split(";", 1)[0].strip()
             if content_type and not _is_acceptable_media_type(content_type):
-                snippet = ""
-                try:
-                    snippet = next(resp.iter_content(chunk_size=256), b"").decode("utf-8", errors="replace")
-                except Exception:  # noqa: BLE001
-                    pass
-                raise RuntimeError(
-                    f"AudioVault returned unexpected content-type {content_type!r} for {url}"
-                    + (f" — preview: {snippet[:120]!r}" if snippet else "")
+                head = next(chunks, b"")
+                if not _looks_like_media(head):
+                    snippet = head[:256].decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"AudioVault returned unexpected content-type {content_type!r} for {url}"
+                        + (f" — preview: {snippet[:120]!r}" if snippet else "")
+                    )
+                logger.warning(
+                    "AudioVault sent content-type %r for %s but the body is media; continuing.",
+                    content_type, url,
                 )
 
             content_disp = resp.headers.get("Content-Disposition", "")
@@ -299,7 +337,9 @@ class AudioVaultClient:
 
             try:
                 with tmp.open("wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=65_536):
+                    if head:
+                        fh.write(head)
+                    for chunk in chunks:
                         fh.write(chunk)
                 os.replace(tmp, dest)
             except Exception:

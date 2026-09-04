@@ -16,14 +16,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 if "requests" not in sys.modules:
     requests = types.ModuleType("requests")
 
-    class _Err(Exception):
+    # Mirror the real inheritance tree, not just the names. `_is_transient`
+    # classifies by isinstance, so a stub with flat sibling classes would hide
+    # exactly the bug these tests exist to catch: ChunkedEncodingError is a
+    # RequestException but is NOT a ConnectionError.
+    class _RequestException(OSError):
         pass
 
-    requests.ConnectionError = type("ConnectionError", (_Err,), {})
-    requests.Timeout = type("Timeout", (_Err,), {})
-    requests.HTTPError = type("HTTPError", (_Err,), {})
+    requests.RequestException = _RequestException
+    requests.ConnectionError = type("ConnectionError", (_RequestException,), {})
+    requests.Timeout = type("Timeout", (_RequestException,), {})
+    requests.HTTPError = type("HTTPError", (_RequestException,), {})
+    requests.ChunkedEncodingError = type("ChunkedEncodingError", (_RequestException,), {})
     requests.Session = type("Session", (), {})
+
+    exceptions = types.ModuleType("requests.exceptions")
+    for _name in ("RequestException", "ConnectionError", "Timeout", "HTTPError",
+                  "ChunkedEncodingError"):
+        setattr(exceptions, _name, getattr(requests, _name))
+    exceptions.ContentDecodingError = type(
+        "ContentDecodingError", (_RequestException,), {}
+    )
+    requests.exceptions = exceptions
     sys.modules["requests"] = requests
+    sys.modules["requests.exceptions"] = exceptions
 
 if "bs4" not in sys.modules:
     bs4 = types.ModuleType("bs4")
