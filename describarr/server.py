@@ -768,6 +768,7 @@ def _dispatch(env: dict[str, str]) -> dict | None:
 
 def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
     series_title = env.get("sonarr_series_title", "").strip()
+    series_year = env.get("sonarr_series_year", "").strip()
     season_str = env.get("sonarr_episodefile_seasonnumber", "0").strip()
     episode_str = env.get("sonarr_episodefile_episodenumbers", "1").strip()
     file_path_str = env.get("sonarr_episodefile_path", "").strip()
@@ -814,6 +815,7 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
                 client, config, video_path,
                 series_title, season, primary_episode,
                 extra_episodes=extra_episodes,
+                series_year=series_year,
             )
     except DailyLimitReached:
         # ONE retry item carries the full episode list so the drain runs ONE
@@ -821,7 +823,9 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
         # entries under the same video_path used to (a) silently lose E02..N
         # to the video_path-only dedup, and (b) — if dedup were ever loosened
         # — destructively re-align the merged file once per episode.
-        _get_retry_queue(config).add_episodes(series_title, season, episodes, str(video_path))
+        _get_retry_queue(config).add_episodes(
+            series_title, season, episodes, str(video_path), series_year=series_year,
+        )
         return {"label": label, "outcome": "queued"}
     return {
         "label": label,

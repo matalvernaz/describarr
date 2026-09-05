@@ -88,12 +88,22 @@ def _should_abandon_stale(item: dict) -> bool:
 # year stripping is applied defensively here even though callers usually pass
 # the title and year separately, because the /retry endpoint and some Sonarr/
 # Radarr setups can pass a year-suffixed title through verbatim.
-_TITLE_YEAR_SUFFIX_RE = re.compile(r"\s*\(\d{4}\)\s*$")
+_TITLE_YEAR_SUFFIX_RE = re.compile(r"\s*\((\d{4})\)\s*$")
 
 
 def _strip_year_suffix(title: str) -> str:
   """Return *title* with a trailing ``(YYYY)`` token removed."""
   return _TITLE_YEAR_SUFFIX_RE.sub("", title).strip()
+
+
+def _year_suffix(title: str) -> str:
+  """The trailing ``(YYYY)`` year in *title*, or "" if it has none.
+
+  Sonarr names some series with the disambiguating year already attached, so
+  this recovers a series year even where the webhook carries no explicit one.
+  """
+  match = _TITLE_YEAR_SUFFIX_RE.search(title)
+  return match.group(1) if match and match.groups() else ""
 
 logger = logging.getLogger(__name__)
 
@@ -106,9 +116,14 @@ def process_episode(
     season: int,
     episode: int,
     extra_episodes: Optional[list[int]] = None,
+    series_year: str = "",
 ) -> tuple[bool, Optional[str]]:
     """
     Find and align the audio description for a single TV episode.
+
+    *series_year* is the year the series began (Sonarr's ``sonarr_series_year``).
+    It disambiguates a reboot that shares its parent's title and season
+    numbering; absent, matching behaves exactly as it did before.
 
     *extra_episodes* covers Sonarr's multi-episode files (S01E01E02 etc.):
     one alignment runs against the primary *episode*'s AD audio, but every
@@ -142,7 +157,10 @@ def process_episode(
         )
         return False, None
 
-    candidates = find_season(results, series_title, season)
+    candidates = find_season(
+        results, series_title, season,
+        series_year or _year_suffix(series_title),
+    )
     if not candidates:
         logger.warning("No season %d entry found for %r.", season, series_title)
         return False, None
@@ -979,6 +997,7 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                 described, _reason = process_episode(
                     client, config, video_path,
                     item["series_title"], item["season"], item["episode"],
+                    series_year=item.get("series_year", ""),
                     extra_episodes=extra_episodes,
                 )
             elif item["type"] == "movie":

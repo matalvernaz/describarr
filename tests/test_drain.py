@@ -32,7 +32,7 @@ def test_capped_season_defers_but_cached_seasons_drain(monkeypatch):
     ]
     calls = []
 
-    def fake_process_episode(client, config, video_path, series, season, episode, extra_episodes=None):
+    def fake_process_episode(client, config, video_path, series, season, episode, extra_episodes=None, series_year=""):
         calls.append((season, episode))
         if season == 1:
             raise wf.DailyLimitReached("cap")

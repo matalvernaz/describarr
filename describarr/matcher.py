@@ -76,7 +76,9 @@ def _variant_quality(name: str) -> int:
         return 1
     return 2
 
-def find_season(results: list[dict], title: str, season: int) -> list[dict]:
+def find_season(
+    results: list[dict], title: str, season: int, series_year: str = "",
+) -> list[dict]:
     """
     Return all results from *results* that plausibly match *title* and *season*,
     ranked by title similarity (best first).
@@ -84,6 +86,19 @@ def find_season(results: list[dict], title: str, season: int) -> list[dict]:
     Pass 1 returns candidates that explicitly name the season (e.g. "Season 2").
     Pass 2 (season 1 only) appends year-only entries (e.g. "Ted (2024)") as
     lower-priority fallbacks, for shows AudioVault hasn't split into seasons yet.
+
+    *series_year* is the year the SERIES began, from Sonarr. A season entry's
+    parenthesised year is that season's air year, not the series', so it cannot
+    be compared for equality the way ``find_movie`` compares a film's — a
+    correct "Gossip Girl - Season 5 (2011)" belongs to a 2007 series. It is
+    used two softer ways instead, both of which leave a revival like a 2023
+    season 11 of a 1999 series alone:
+
+      * a candidate dated before the series began is dropped, which is sound
+        for any season; and
+      * candidates are ranked by how near their year sits to the season's
+        expected air year, then the walk is confined to the winner's year
+        (see ``_lock_to_release_year``).
 
     The caller should try each candidate in order, stopping on the first that
     aligns above the score threshold.
@@ -104,6 +119,26 @@ def find_season(results: list[dict], title: str, season: int) -> list[dict]:
     results = [r for r in results if not _foreign_narration(r["name"])]
     title_lower = title.lower()
 
+    start_year = int(series_year) if series_year.strip().isdigit() else None
+    if start_year is not None:
+        results = [
+            r for r in results
+            if (_release_year(r["name"]) or start_year) >= start_year
+        ]
+    # One season per year is the ceiling, so season N airs no earlier than
+    # this. Later is ordinary (hiatus, revival) and carries no penalty beyond
+    # the distance itself.
+    expected_year = None if start_year is None else start_year + season - 1
+
+    def _year_distance(name: str) -> int:
+        """Sort key: how far a candidate's year sits from the expected one.
+        Yearless candidates sort as an exact match so they are never demoted
+        below a wrong-year one."""
+        if expected_year is None:
+            return 0
+        year = _release_year(name)
+        return 0 if year is None else abs(year - expected_year)
+
     def _ranked_above(candidates: list[dict], threshold: float) -> list[dict]:
         # Strip bracketed tags before scoring so all variants of a season tie
         # on title similarity; quality then breaks the tie (human AD before
@@ -116,7 +151,14 @@ def find_season(results: list[dict], title: str, season: int) -> list[dict]:
              _variant_quality(r["name"]), r)
             for r in candidates
         ]
-        scored.sort(key=lambda x: (round(x[0], 2), x[1]), reverse=True)
+        # Year proximity outranks variant quality but never title similarity:
+        # a near-miss title must not be promoted for having a tidy year, while
+        # the human-before-TTS tiebreak still decides between variants of the
+        # same season.
+        scored.sort(
+            key=lambda x: (round(x[0], 2), -_year_distance(x[2]["name"]), x[1]),
+            reverse=True,
+        )
         kept = [(s, q, r) for s, q, r in scored if s >= threshold]
         for s, q, r in kept:
             logger.info("Season candidate: %r (score %.2f)", r["name"], s)
@@ -147,6 +189,14 @@ def find_season(results: list[dict], title: str, season: int) -> list[dict]:
         if pass2:
             logger.info("Season 1: also queued %d year-only fallback(s).", len(pass2))
         candidates = candidates + pass2
+
+    if start_year is not None:
+        # Only with a series year is the top-ranked candidate trustworthy
+        # enough to anchor on. Without one there is no signal separating a
+        # show from its reboot, and anchoring on the title/quality winner
+        # could silently exclude the right season instead of merely wasting a
+        # download on the wrong one.
+        candidates = _lock_to_release_year(candidates)
 
     if not candidates:
         logger.warning("No season %d candidates found for %r.", season, title)
@@ -332,6 +382,52 @@ _STOPWORDS = frozenset({"the", "a", "an", "and", "of", "in", "to", "for", "seaso
 # score a perfect match against the movie "Us" once a bracket tag kept the
 # token set non-empty.
 _PAREN_YEAR_RE = re.compile(r"\(\s*((?:19|20)\d{2})\s*\)")
+
+# A catalogue can date the same season a year either side of its air date
+# (air year vs upload year), so the walk tolerates that much drift before it
+# treats a candidate as a different work. A reboot sharing its parent's title
+# sits a decade or more away and is well clear of this.
+_SEASON_YEAR_LOCK_GAP = 2
+
+
+def _release_year(name: str) -> Optional[int]:
+    """The last parenthesised year in *name*, or None if it carries none.
+
+    Last rather than first: a title can contain its own year ("Gossip Girl -
+    Season 2 (2008)" has one, but "1917 (2019) [US]" has two and only the
+    trailing one is catalogue metadata."""
+    years = _PAREN_YEAR_RE.findall(name)
+    return int(years[-1]) if years else None
+
+
+def _lock_to_release_year(candidates: list[dict]) -> list[dict]:
+    """Drop candidates dated more than ``_SEASON_YEAR_LOCK_GAP`` years from the
+    best-ranked one.
+
+    Every AudioVault variant of one season shares a year, so this leaves the
+    human/TTS walk intact while stopping a fallback onto a different show that
+    happens to share a title and a season number — the live case being a 2007
+    series' Season 2 walking onto its 2021 reboot's Season 2 and spending a
+    665 MB download on it. Candidates without a year are always kept: absent
+    metadata is not evidence of a different work.
+    """
+    if not candidates:
+        return candidates
+    anchor = _release_year(candidates[0]["name"])
+    if anchor is None:
+        return candidates
+    kept = []
+    for r in candidates:
+        year = _release_year(r["name"])
+        if year is None or abs(year - anchor) <= _SEASON_YEAR_LOCK_GAP:
+            kept.append(r)
+        else:
+            logger.info(
+                "Dropping season candidate %r — dated %d against %d, a different work.",
+                r["name"], year, anchor,
+            )
+    return kept
+
 
 # Roman numerals 1-20 cover almost every theatrical sequel naming convention
 # (Rocky I-V, Final Destination II, Saw V/VI/VII/VIII, etc.). Normalising
