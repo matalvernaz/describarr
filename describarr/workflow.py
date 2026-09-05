@@ -77,6 +77,17 @@ class AlignmentResourceKill(Exception):
     costing a download slot, so candidate loops abort instead of iterating."""
 
 
+class SourceVanished(Exception):
+    """The source video disappeared while the alignment was running — an arr
+    upgrade replacing the file mid-run, which takes minutes.
+
+    Like AlignmentResourceKill this is a property of the file rather than of
+    the AD candidate, so the candidate walk aborts rather than spending a
+    download slot and another alignment on a file that is no longer there.
+    The replacement import fires its own webhook, which is what actually
+    describes the new file."""
+
+
 def _should_abandon_stale(item: dict) -> bool:
     """Increment *item*'s deferral counter; return True once it has been
     deferred too many times and should be dropped instead of re-queued."""
@@ -212,7 +223,7 @@ def process_episode(
                     last_reason = reason
             finally:
                 source.close()
-    except AlignmentResourceKill as exc:
+    except (AlignmentResourceKill, SourceVanished) as exc:
         logger.error("Aborting candidate walk for %s: %s", video_path.name, exc)
         return False, str(exc)
 
@@ -285,7 +296,7 @@ def process_movie(
                     last_reason = reason
             finally:
                 source.close()
-    except AlignmentResourceKill as exc:
+    except (AlignmentResourceKill, SourceVanished) as exc:
         logger.error("Aborting candidate walk for %s: %s", video_path.name, exc)
         return False, str(exc)
 
@@ -626,6 +637,15 @@ def _align_and_keep(
             raise AlignmentResourceKill(
                 f"{reason} — killed by signal, likely the container memory cap; "
                 "further candidates for this file would die the same way"
+            )
+        # Checked after the failure rather than before, because an alignment
+        # takes minutes and an arr upgrade can replace the file inside that
+        # window — the pre-flight fingerprint above cannot see it.
+        if not video_path.exists():
+            raise SourceVanished(
+                "source video was replaced while the alignment was running "
+                "(likely a Sonarr/Radarr upgrade); the replacement's own "
+                "import will trigger a fresh run"
             )
         return False, reason
 

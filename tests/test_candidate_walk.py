@@ -110,3 +110,53 @@ def test_align_and_keep_returns_on_ordinary_exit_failure(monkeypatch, tmp_path):
     published, reason = workflow._align_and_keep(config, video, audio)
     assert not published
     assert reason == "wrong-duration AD rejected"
+
+
+def test_align_and_keep_raises_when_source_vanishes_mid_alignment(monkeypatch, tmp_path):
+    """Live 2026-09-04, Gossip Girl S01E01: Sonarr upgraded the episode during
+    the four minutes the alignment was running, so `_validate_media_output`
+    could no longer ffprobe the source. The generic failure read as "candidate
+    below threshold" and the walk moved on to spend another download slot on a
+    file that no longer existed."""
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    video = tmp_path / "Movie (2020).mkv"
+    video.write_bytes(b"x")
+    audio = tmp_path / "ad.mp3"
+    audio.write_bytes(b"y")
+
+    def fake_align(*a, **k):
+        video.unlink()  # the arr upgrade lands mid-run
+        return AlignResult(None, None, "alignment produced no validated output", returncode=1)
+
+    monkeypatch.setattr(workflow, "align", fake_align)
+    with pytest.raises(workflow.SourceVanished):
+        workflow._align_and_keep(config, video, audio)
+
+
+def test_source_vanished_aborts_candidate_walk(monkeypatch, tmp_path):
+    def behavior(n):
+        raise workflow.SourceVanished("source video was replaced while the alignment was running")
+
+    config, video, client, downloads, _ = _setup(monkeypatch, tmp_path, 5, behavior)
+    described, reason = process_movie(client, config, video, "Movie", "2020")
+    assert not described
+    assert "replaced while the alignment was running" in reason
+    assert len(downloads) == 1  # no further download slots burned
+
+
+def test_ordinary_failure_still_walks_when_source_is_intact(monkeypatch, tmp_path):
+    """The abort must key on the file being gone, not on any failure — a real
+    quality rejection has to keep trying further candidates."""
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    video = tmp_path / "Movie (2020).mkv"
+    video.write_bytes(b"x")
+    audio = tmp_path / "ad.mp3"
+    audio.write_bytes(b"y")
+
+    monkeypatch.setattr(
+        workflow, "align",
+        lambda *a, **k: AlignResult(None, None, "score too low", returncode=1),
+    )
+    published, reason = workflow._align_and_keep(config, video, audio)
+    assert not published
+    assert video.exists()
