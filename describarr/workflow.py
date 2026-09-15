@@ -32,6 +32,7 @@ from .aligner import (
     content_score,
     slope_stability,
     sync_quality,
+    undescribed_seconds,
     source_has_ad_track,
 )
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
@@ -144,7 +145,9 @@ def process_episode(
 
     Returns ``(described, reason)``: *described* is True if a combined file was
     produced with an acceptable score; *reason* is a human-readable failure
-    cause when it wasn't (for the operator notification), else None.
+    cause when it wasn't (for the operator notification). On success it is
+    None, or a note worth passing on — currently only that the AD source is
+    a different cut and part of the picture has no description.
     """
     all_episodes = [episode] + list(extra_episodes or [])
     label = f"{series_title} S{season:02d}" + "".join(f"E{e:02d}" for e in all_episodes)
@@ -200,7 +203,7 @@ def process_episode(
             if published:
                 for ep in all_episodes:
                     _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
-                return True, None
+                return True, reason
             last_reason = reason
             logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
@@ -219,7 +222,7 @@ def process_episode(
                         # stay correct. No zip/extract_dir ⇒ cleanup is a no-op.
                         for ep in all_episodes:
                             _mark_episode_done(zip_cache_dir, season, ep)
-                        return True, None
+                        return True, reason
                     last_reason = reason
             finally:
                 source.close()
@@ -280,7 +283,7 @@ def process_movie(
                 raise
             published, reason = _align_and_keep(config, video_path, audio_path, label=label)
             if published:
-                return True, None
+                return True, reason
             last_reason = reason
             logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
@@ -292,7 +295,7 @@ def process_movie(
                 ):
                     published, reason = _align_and_keep(config, video_path, audio_path, label=label)
                     if published:
-                        return True, None
+                        return True, reason
                     last_reason = reason
             finally:
                 source.close()
@@ -372,6 +375,24 @@ def _acceptance_decision(
         f"{stable_fraction:.1f}%, median rate {median_rate:.2f}%, sync_ok={sync_ok}) "
         f"— no trusted sync signal"
     )
+
+
+# An accepted alignment whose unreplaced (no-narration) video adds up to at
+# least this many seconds gets a note in the success notification. Below it
+# the gaps are ordinary seams; above it the source is almost certainly a
+# different cut and the listener should expect undescribed stretches.
+_UNDESCRIBED_NOTE_MIN_SEC = 20.0
+
+
+def _undescribed_note(undescribed: float, dropped: float) -> Optional[str]:
+    """Human-readable success note for a different-cut source, or None."""
+    if undescribed < _UNDESCRIBED_NOTE_MIN_SEC:
+        return None
+    note = (f"AD source is a different cut: {undescribed:.0f} s of the picture "
+            f"has no description")
+    if dropped >= 2.0:
+        note += f", {dropped:.0f} s of narration could not be placed"
+    return note
 
 
 _BACKUP_SUBDIR = ".describarr_backup"
@@ -562,6 +583,8 @@ def _log_decision(
     median_rate: Optional[float] = None,
     runtime: Optional[float] = None,
     path: Optional[str] = None,
+    undescribed: Optional[float] = None,
+    dropped: Optional[float] = None,
 ) -> None:
     """Record one decision in the audit log. Best-effort: a logging failure
     must never break the alignment path."""
@@ -576,6 +599,8 @@ def _log_decision(
             "median_rate": median_rate,
             "runtime": runtime,
             "path": path,
+            "undescribed": undescribed,
+            "dropped": dropped,
         })
     except Exception:
         logger.debug("Decision-log write failed.", exc_info=True)
@@ -589,9 +614,10 @@ def _align_and_keep(
 ) -> tuple[bool, Optional[str]]:
     """Run alignment and either keep or discard the combined output.
 
-    Returns ``(published, reason)``. On success *reason* is None; on failure it
-    is a human-readable cause (the engine's mismatch diagnosis or the rescue-
-    gate rejection detail) for the operator notification. Every attempt is
+    Returns ``(published, reason)``. On success *reason* is None or an
+    informational note (see :func:`_undescribed_note`); on failure it is a
+    human-readable cause (the engine's mismatch diagnosis or the rescue-gate
+    rejection detail) for the operator notification. Every attempt is
     recorded in the decision log so the accept/reject judgment is auditable.
     """
     alignment_dir = config.cache_dir / "alignments"
@@ -692,6 +718,15 @@ def _align_and_keep(
         )
         return False, decision_detail
     logger.info("Accepting %s via %s path — %s", video_path.name, accept_path, decision_detail)
+    undescribed, dropped = undescribed_seconds(report)
+    note = _undescribed_note(undescribed, dropped)
+    if note:
+        logger.warning("%s: %s", video_path.name, note)
+    else:
+        logger.info(
+            "Unreplaced spans for %s: %.1fs of video without narration, %.1fs of narration unplaced",
+            video_path.name, undescribed, dropped,
+        )
 
     try:
         _publish_in_place(
@@ -722,9 +757,10 @@ def _align_and_keep(
     _log_decision(
         config, entry_title, "described", decision_detail,
         score=score, coverage=cscore, stable_fraction=stable_fraction,
+        undescribed=undescribed, dropped=dropped,
         median_rate=median_rate, runtime=total_runtime, path=accept_path,
     )
-    return True, None
+    return True, note
 
 
 def _cleanup_combined(combined: Path) -> None:

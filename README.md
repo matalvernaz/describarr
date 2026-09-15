@@ -239,6 +239,8 @@ If the folder name doesn't include the year (or the AudioVault title differs), p
 
 When an alignment can't be made, the Pushover notification carries the specific cause instead of a generic "errored" — e.g. *"AD is 22 min vs 45 min video — likely wrong/truncated episode"* or *"AD audio is 95% silence"* — so you know whether to swap the AD source or re-grab the video. (This relies on the failure diagnosis emitted by describealaign ≥ v2.1.9.)
 
+When an alignment *is* published but the AD source turns out to be a different cut of the film (an unrated video against a theatrical description, say), the success notification says so — *"Added and described. (AD source is a different cut: 75 s of the picture has no description)"* — because the inserted footage keeps its original soundtrack and you should expect stretches without narration. The same figures land in the `/status` decision log as `undescribed` and `dropped` seconds. Anything under 20 s is treated as ordinary seams and not mentioned.
+
 ---
 
 ## Troubleshooting

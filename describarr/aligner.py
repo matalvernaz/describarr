@@ -447,6 +447,38 @@ def slope_stability(report: Optional[Path]) -> tuple[float, float, float]:
     return median_rate, fraction, total_dur
 
 
+# Mirrors describealaign's MAX_RATE_RATIO_DIFF_ALIGN (0.1): a segment whose
+# video/audio rate differs from unity by more than this is never replaced by
+# the engine — the video keeps its original soundtrack there.
+_UNREPLACED_RATE_PCT = 10.0
+
+
+def undescribed_seconds(report: Optional[Path]) -> tuple[float, float]:
+    """
+    How much of an accepted alignment carries no narration, and how much
+    narration it threw away.
+
+    Returns ``(undescribed_video_sec, dropped_audio_sec)``. Both come from the
+    segments the engine does not replace (|rate| > 10 %): the video span of
+    such a segment plays the original soundtrack with no description, and any
+    audio span inside it is description that was never placed. Near zero for
+    a same-cut source; tens of seconds when the video is a longer cut than
+    the description (unrated vs theatrical), where the extra footage is
+    simply undescribed — worth telling the listener, not worth rejecting.
+    """
+    metrics = _read_metrics(report)
+    if metrics is None:
+        return 0.0, 0.0
+    undescribed = 0.0
+    dropped = 0.0
+    for seg in metrics.get("segments", []):
+        if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT:
+            continue
+        undescribed += max(0.0, _segment_duration(seg))
+        dropped += max(0.0, seg.get("audio_end_sec", 0.0) - seg.get("audio_start_sec", 0.0))
+    return undescribed, dropped
+
+
 def sync_quality(report: Optional[Path]) -> tuple[bool, str]:
     """
     Return (ok, reason) where ok=False means the alignment is likely unreliable.
