@@ -241,6 +241,8 @@ When an alignment can't be made, the Pushover notification carries the specific 
 
 When an alignment *is* published but the AD source turns out to be a different cut of the film (an unrated video against a theatrical description, say), the success notification says so — *"Added and described. (AD source is a different cut: 75 s of the picture has no description)"* — because the inserted footage keeps its original soundtrack and you should expect stretches without narration. The same figures land in the `/status` decision log as `undescribed` and `dropped` seconds. Anything under 20 s is treated as ordinary seams and not mentioned.
 
+A published file inherits the owner, group and permission bits of the file it replaces, and the sibling `.describarr_backup` folder and `.admerge.lock` file take the library folder's owner with group-writable modes. describarr runs as root in its container; without this every publish left root-owned entries behind, and a root-owned folder later blocks Sonarr/Radarr (uid 1000) from replacing the file on an upgrade.
+
 ---
 
 ## Troubleshooting

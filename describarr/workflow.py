@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import time
 import uuid
 import zipfile
@@ -398,6 +399,30 @@ def _undescribed_note(undescribed: float, dropped: float) -> Optional[str]:
 _BACKUP_SUBDIR = ".describarr_backup"
 
 
+# Mode for the sibling backup directory and lock file describarr creates inside a
+# library folder: owner+group writable, setgid so new entries inherit the media group.
+_LIBRARY_DIR_MODE = 0o2775
+_LIBRARY_FILE_MODE = 0o664
+
+
+def _match_ownership(path: Path, reference: os.stat_result, mode: Optional[int] = None) -> None:
+    """Give *path* the owner/group of *reference* and *mode* (default: the
+    reference's permission bits). Best-effort: describarr runs as root in its
+    container, so every file it published used to come out root-owned, and a
+    root-owned 755 folder or file later blocks the arr apps (uid 1000) from
+    replacing it on an upgrade ("Failed to import movie", 2026-09-15). When
+    not running as root the chown may be refused; that is logged and ignored
+    because the file is then already owned by the right user."""
+    try:
+        os.chmod(path, mode if mode is not None else stat.S_IMODE(reference.st_mode))
+    except OSError as exc:
+        logger.debug("chmod %s failed: %s", path, exc)
+    try:
+        os.chown(path, reference.st_uid, reference.st_gid)
+    except OSError as exc:
+        logger.debug("chown %s to %d:%d failed: %s", path, reference.st_uid, reference.st_gid, exc)
+
+
 def _prune_old_backups(backup_dir: Path, retention_days: int) -> None:
     """Delete ``*.bak`` files in *backup_dir* older than *retention_days*.
 
@@ -455,6 +480,7 @@ def _backup_original(
 
     def _link_into(d: Path, name: str) -> Path:
         d.mkdir(parents=True, exist_ok=True)
+        _match_ownership(d, video_path.parent.stat(), mode=_LIBRARY_DIR_MODE)
         dst = d / name
         os.link(video_path, dst)
         return dst
@@ -837,6 +863,7 @@ def _publish_in_place(
 
     parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a+")
+    _match_ownership(lock_path, parent.stat(), mode=_LIBRARY_FILE_MODE)
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
@@ -849,7 +876,11 @@ def _publish_in_place(
                     f"refusing to overwrite {video_path}."
                 )
 
+            original_stat = video_path.stat()
             shutil.copy2(combined, tmp_dest)
+            # The replacement must look like the file it replaces: same owner,
+            # group and permission bits, not root:root 644 from the container.
+            _match_ownership(tmp_dest, original_stat)
             actual_size = tmp_dest.stat().st_size
             if actual_size != expected_size:
                 raise RuntimeError(
