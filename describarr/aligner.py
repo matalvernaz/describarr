@@ -61,6 +61,9 @@ _STABLE_RATE_TOLERANCE_PP = 0.3
 _SUBPROCESS_TIMEOUT_SEC = 3600
 # Grace window between SIGTERM and SIGKILL when we kill a runaway subprocess.
 _SUBPROCESS_KILL_GRACE_SEC = 15
+# How many trailing stderr lines to surface at ERROR when the engine exits
+# non-zero without writing a *.fail.json diagnosis (i.e. it crashed).
+_STDERR_TAIL_LINES = 25
 
 
 def _read_metrics(report: Optional[Path]) -> Optional[dict]:
@@ -239,6 +242,16 @@ def run(
             logger.error("describealaign could not align %s: %s", video_path.name, reason)
         else:
             reason = f"alignment failed (describealaign exit {returncode})"
+            # No diagnosis sidecar means the engine crashed rather than rejected
+            # the inputs. Its traceback is in stderr; at DEBUG nobody sees it in
+            # production (Snow White, 2026-09-15: two "exit 1" runs with no cause
+            # in the log). Keep the tail at ERROR so the cause is in the log.
+            tail = [ln for ln in stderr.splitlines() if ln.strip()][-_STDERR_TAIL_LINES:]
+            if tail:
+                logger.error(
+                    "describealaign stderr (last %d lines) for %s:\n%s",
+                    len(tail), video_path.name, "\n".join(tail),
+                )
             logger.error("describealaign exited with code %d.", returncode)
         _cleanup_run_dir(run_output_dir)
         return AlignResult(None, None, reason, returncode=returncode)
