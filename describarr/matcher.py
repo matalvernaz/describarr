@@ -139,18 +139,43 @@ def find_season(
         year = _release_year(name)
         return 0 if year is None else abs(year - expected_year)
 
+    def _comparable(name: str) -> str:
+        """The candidate's name reduced to title content.
+
+        Bracketed tags go so all variants of a season tie on title similarity;
+        quality then breaks the tie (human AD before TTS). The season marker
+        goes too: ``season_patterns`` has already established the candidate is
+        for this season, so the number is metadata, and leaving it in depresses
+        every correct entry's score by one unpaired token — enough that a
+        two-word show's own entry scored the same 0.67 as a spin-off's.
+        """
+        name = _BRACKET_TAG_RE.sub(" ", name)
+        for pattern in season_patterns:
+            name = pattern.sub(" ", name)
+        return _RELEASE_PART_RE.sub(" ", name).strip().lower()
+
     def _ranked_above(candidates: list[dict], threshold: float) -> list[dict]:
-        # Strip bracketed tags before scoring so all variants of a season tie
-        # on title similarity; quality then breaks the tie (human AD before
-        # TTS). Title match stays the dominant key, so a wrong show/season can
-        # never be promoted over a near-exact match by quality alone. The
-        # similarity is rounded so a sub-0.01 wobble between otherwise-identical
-        # titles can't defeat the quality tiebreaker.
-        scored = [
-            (_title_similarity(title_lower, _BRACKET_TAG_RE.sub(" ", r["name"]).strip().lower()),
-             _variant_quality(r["name"]), r)
-            for r in candidates
-        ]
+        # Title match stays the dominant key, so a wrong show/season can never
+        # be promoted over a near-exact match by quality alone. The similarity
+        # is rounded so a sub-0.01 wobble between otherwise-identical titles
+        # can't defeat the quality tiebreaker.
+        scored: list[tuple[float, int, dict]] = []
+        for r in candidates:
+            comparable = _comparable(r["name"])
+            # A candidate that spells out the whole show name and then adds to
+            # it is a spin-off, not this show — and similarity cannot see that,
+            # because it rates such a name HIGHLY for containing every word.
+            extra = _extra_title_words(title_lower, comparable)
+            if extra:
+                logger.warning(
+                    "Rejecting season candidate %r — it names a different work "
+                    "(adds %s to the show's title).",
+                    r["name"], ", ".join(repr(w) for w in sorted(extra)),
+                )
+                continue
+            scored.append(
+                (_title_similarity(title_lower, comparable), _variant_quality(r["name"]), r)
+            )
         # Year proximity outranks variant quality but never title similarity:
         # a near-miss title must not be promoted for having a tidy year, while
         # the human-before-TTS tiebreak still decides between variants of the
@@ -383,6 +408,18 @@ _STOPWORDS = frozenset({"the", "a", "an", "and", "of", "in", "to", "for", "seaso
 # token set non-empty.
 _PAREN_YEAR_RE = re.compile(r"\(\s*((?:19|20)\d{2})\s*\)")
 
+# A catalogue splits one season across two uploads ("Season 1 Part 1"). That is
+# release structure, not a different work, so it is stripped from a candidate's
+# name alongside the season marker itself.
+_RELEASE_PART_RE = re.compile(r"\b(?:part|pt)\s*\d+\b", re.IGNORECASE)
+
+# Country qualifiers distinguish regional versions of one format ("The Office
+# UK" / "The Office US"). Unlike a spin-off's subtitle they add no title
+# content, so ``_extra_title_words`` does not count them — but they are left in
+# the token set, so an arr app that spells the region out still scores its own
+# region highest and the year lock separates the rest.
+_REGION_QUALIFIERS = frozenset({"uk", "us", "usa", "au", "nz", "ca"})
+
 # A catalogue can date the same season a year either side of its air date
 # (air year vs upload year), so the walk tolerates that much drift before it
 # treats a candidate as a different work. A reboot sharing its parent's title
@@ -442,6 +479,51 @@ _ROMAN_TO_INT = {
 }
 
 
+def _title_tokens(s: str) -> set[str]:
+    """Content words of a title, as the matcher compares them.
+
+    Parenthesised release years are dropped as metadata; every other digit is
+    kept as title content. Roman numerals are normalised to digits so the
+    sequel-mismatch guard catches "Rocky II vs Rocky V" the same way it catches
+    "Iron Man 2 vs Iron Man 3". Only tokens that are exclusively roman numerals
+    convert — a real word like "I" is in _STOPWORDS so it gets dropped anyway.
+    "V" alone (not in stopwords) becomes "5", which is the desired behaviour
+    for a title token meaning "fifth in the series."
+    """
+    s = _PAREN_YEAR_RE.sub(" ", s)
+    s = re.sub(r"[^\w\s]", " ", s.lower())
+    return {_ROMAN_TO_INT.get(t, t) for t in s.split() if t not in _STOPWORDS}
+
+
+def _extra_title_words(query: str, candidate: str) -> set[str]:
+    """Words *candidate* adds to a title that already contains all of *query*.
+
+    Empty when *candidate* is not a strict superset of *query*.
+
+    Catalogues name a spin-off by appending to its parent's title — "The Epic
+    Tales of Captain Underpants **in Space**", "The Fairly OddParents**: A New
+    Wish**", "Gilmore Girls **- A Year in the Life**". Symmetric Jaccard rates
+    those 0.5-0.67, well clear of the 0.3 floor, precisely *because* every word
+    of the query is present; and when the parent show is absent from the
+    catalogue the spin-off is the only candidate, so ranking cannot save us
+    either. The asymmetry is the signal: a show's own entry never carries title
+    words the show's name lacks.
+
+    The converse is left alone — a catalogue that drops a distributor prefix
+    the arr app carries ("Marvel's Daredevil" → "Daredevil") is ordinary
+    terseness, not a different work. Nor is a country qualifier: "The Office
+    UK" is the show Sonarr calls "The Office", so ``_REGION_QUALIFIERS`` are
+    not counted as added words.
+    """
+    query_tokens = _title_tokens(query)
+    candidate_tokens = _title_tokens(candidate)
+    if not query_tokens or not candidate_tokens:
+        return set()
+    if not query_tokens < candidate_tokens:  # strict subset ⇒ candidate adds words
+        return set()
+    return candidate_tokens - query_tokens - _REGION_QUALIFIERS
+
+
 def _title_similarity(a: str, b: str) -> float:
     """Jaccard similarity on word tokens with sequel-aware digit handling.
 
@@ -458,20 +540,8 @@ def _title_similarity(a: str, b: str) -> float:
     real sequel signal (or noise we don't care about because the candidate
     pool already agrees on the season).
     """
-    def tokenize(s: str) -> set[str]:
-        s = _PAREN_YEAR_RE.sub(" ", s)
-        s = re.sub(r"[^\w\s]", " ", s.lower())
-        # Normalise roman numerals to digits so the sequel-mismatch guard
-        # below can catch "Rocky II vs Rocky V" the same way it catches
-        # "Iron Man 2 vs Iron Man 3". Only converts tokens that are
-        # exclusively roman numerals — a real word like "I" is in
-        # _STOPWORDS so it gets dropped anyway. "V" alone (not in
-        # stopwords) becomes "5", which is the desired behaviour for a
-        # title token meaning "fifth in the series."
-        return {_ROMAN_TO_INT.get(t, t) for t in s.split() if t not in _STOPWORDS}
-
-    tokens_a = tokenize(a)
-    tokens_b = tokenize(b)
+    tokens_a = _title_tokens(a)
+    tokens_b = _title_tokens(b)
 
     if not tokens_a or not tokens_b:
         return 0.0
