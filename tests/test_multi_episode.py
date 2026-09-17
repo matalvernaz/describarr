@@ -240,3 +240,168 @@ def test_concat_audio_joins_real_files_and_reuses_the_result(tmp_path):
     assert not list(out.parent.glob("*.list")) and not list(out.parent.glob("*.part"))
     stamp = out.stat().st_mtime_ns
     assert _concat_audio(parts, out) == out and out.stat().st_mtime_ns == stamp   # reused, not rebuilt
+
+
+# ── extra sources cover a multi-episode file too ─────────────────────────────
+
+class _FakeSource:
+    """An extra source in the shape LivingAudio has: 0 or 1 candidate per episode."""
+
+    def __init__(self, have, root):
+        self.have = have
+        self.root = root
+        self.asked = []
+        self.closed = False
+
+    def is_configured(self):
+        return True
+
+    def episode_candidates(self, cache_dir, series_title, season, episode):
+        self.asked.append(episode)
+        if episode in self.have:
+            path = self.root / f"la_s{season:02d}e{episode:02d}.mp3"
+            path.write_bytes(b"x")
+            yield path
+
+    def close(self):
+        self.closed = True
+
+
+def test_extra_source_joins_every_covered_episode(monkeypatch, tmp_path):
+    source = _FakeSource({12, 13}, tmp_path)
+    monkeypatch.setattr(workflow, "_concat_audio", lambda parts, out: out)
+    donor = workflow._extra_source_multi_donor(
+        source, tmp_path / "cache", "Avatar: The Last Airbender", 2, [12, 13], "x",
+    )
+    assert source.asked == [12, 13]
+    assert donor == tmp_path / "cache" / "extra_multi" / workflow._safe_dirname(
+        "Avatar: The Last Airbender") / "s02E12E13.mp3"
+
+
+def test_extra_source_missing_a_part_offers_nothing(monkeypatch, tmp_path):
+    source = _FakeSource({12}, tmp_path)                     # no E13
+    monkeypatch.setattr(workflow, "_concat_audio",
+                        lambda parts, out: pytest.fail("must not join a partial set"))
+    assert workflow._extra_source_multi_donor(
+        source, tmp_path / "cache", "Avatar: The Last Airbender", 2, [12, 13], "x",
+    ) is None
+
+
+def test_multi_episode_falls_through_to_an_extra_source(monkeypatch, tmp_path):
+    """AudioVault has no entry; the extra source's joined donor is used."""
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    video = tmp_path / "Avatar (2005) - S02E12-E13.mkv"
+    video.write_bytes(b"x")
+    source = _FakeSource({12, 13}, tmp_path)
+    aligned, marked = [], []
+
+    class FakeClient:
+        def search_shows(self, title):
+            return []
+
+    monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
+    monkeypatch.setattr(workflow, "_concat_audio", lambda parts, out: out)
+    monkeypatch.setattr(workflow, "load_extra_sources", lambda: [source])
+    monkeypatch.setattr(workflow, "_align_and_keep",
+                        lambda config, video_path, audio_path, label=None:
+                            (aligned.append(audio_path), (True, None))[1])
+    monkeypatch.setattr(workflow, "_mark_episode_done",
+                        lambda cache, season, ep, *a, **k: marked.append((season, ep)))
+
+    described, _ = process_episode(FakeClient(), config, video, "Avatar: The Last Airbender",
+                                   2, 12, extra_episodes=[13], series_year="2005")
+    assert described
+    assert [p.name for p in aligned] == ["s02E12E13.mp3"]
+    assert marked == [(2, 12), (2, 13)]
+    assert source.closed
+
+
+def test_a_show_audiovault_never_heard_of_still_reaches_the_extra_source(monkeypatch, tmp_path):
+    """An empty AudioVault search used to return before the extra sources ran,
+    so a private provider could only ever cover shows AudioVault also had."""
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    video = tmp_path / "Show - S01E05.mkv"
+    video.write_bytes(b"x")
+    source = _FakeSource({5}, tmp_path)
+    aligned = []
+
+    class NoResults:
+        def search_shows(self, title):
+            return []
+
+    monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
+    monkeypatch.setattr(workflow, "load_extra_sources", lambda: [source])
+    monkeypatch.setattr(workflow, "_align_and_keep",
+                        lambda config, video_path, audio_path, label=None:
+                            (aligned.append(audio_path), (True, None))[1])
+    monkeypatch.setattr(workflow, "_mark_episode_done", lambda *a, **k: None)
+
+    described, _ = process_episode(NoResults(), config, video, "Show", 1, 5)
+    assert described and len(aligned) == 1 and source.closed
+
+
+def test_a_season_with_no_audiovault_entry_still_reaches_the_extra_source(monkeypatch, tmp_path):
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    video = tmp_path / "Show - S09E01.mkv"
+    video.write_bytes(b"x")
+    source = _FakeSource({1}, tmp_path)
+    aligned = []
+
+    class OnlyOtherSeasons:
+        def search_shows(self, title):
+            return [{"name": "Show - Season 1 (2001)", "url": "https://av/dl/1"}]
+
+    monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
+    monkeypatch.setattr(workflow, "load_extra_sources", lambda: [source])
+    monkeypatch.setattr(workflow, "_align_and_keep",
+                        lambda config, video_path, audio_path, label=None:
+                            (aligned.append(audio_path), (True, None))[1])
+    monkeypatch.setattr(workflow, "_mark_episode_done", lambda *a, **k: None)
+
+    described, _ = process_episode(OnlyOtherSeasons(), config, video, "Show", 9, 1)
+    assert described and len(aligned) == 1
+
+
+def test_a_movie_audiovault_lacks_still_reaches_the_extra_source(monkeypatch, tmp_path):
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    video = tmp_path / "Film (2020).mkv"
+    video.write_bytes(b"x")
+    ad = tmp_path / "la_film.mp3"
+    ad.write_bytes(b"x")
+    aligned = []
+
+    class NoResults:
+        def search_movies(self, title):
+            return []
+
+    class MovieSource(_FakeSource):
+        def movie_candidates(self, cache_dir, movie_title, movie_year):
+            yield ad
+
+    source = MovieSource(set(), tmp_path)
+    monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
+    monkeypatch.setattr(workflow, "load_extra_sources", lambda: [source])
+    monkeypatch.setattr(workflow, "_align_and_keep",
+                        lambda config, video_path, audio_path, label=None:
+                            (aligned.append(audio_path), (True, None))[1])
+
+    described, _ = workflow.process_movie(NoResults(), config, video, "Film", "2020")
+    assert described and aligned == [ad] and source.closed
+
+
+def test_no_extra_sources_configured_still_reports_no_match(monkeypatch, tmp_path):
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    video = tmp_path / "Show - S01E05.mkv"
+    video.write_bytes(b"x")
+
+    class NoResults:
+        def search_shows(self, title):
+            return []
+
+    monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
+    monkeypatch.setattr(workflow, "load_extra_sources", lambda: [])
+    monkeypatch.setattr(workflow, "_align_and_keep",
+                        lambda *a, **k: pytest.fail("nothing to align"))
+
+    described, reason = process_episode(NoResults(), config, video, "Show", 1, 5)
+    assert not described and reason is None

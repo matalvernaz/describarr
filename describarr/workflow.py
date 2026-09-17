@@ -167,20 +167,22 @@ def process_episode(
 
     search_title = _strip_year_suffix(series_title)
     stripped_note = " (year stripped)" if search_title != series_title else ""
+    # An empty AudioVault result is not the end of the search: extra sources
+    # are tried below and a show AudioVault has never heard of is exactly the
+    # case a private provider exists to cover. Returning here skipped them.
     results = client.search_shows(search_title)
+    candidates: list[dict] = []
     if not results:
         logger.warning(
             "AudioVault has no results for show: %r%s", series_title, stripped_note
         )
-        return False, None
-
-    candidates = find_season(
-        results, series_title, season,
-        series_year or _year_suffix(series_title),
-    )
-    if not candidates:
-        logger.warning("No season %d entry found for %r.", season, series_title)
-        return False, None
+    else:
+        candidates = find_season(
+            results, series_title, season,
+            series_year or _year_suffix(series_title),
+        )
+        if not candidates:
+            logger.warning("No season %d entry found for %r.", season, series_title)
 
     # Season zips are cached by download URL so we only fetch each season once.
     # Each candidate gets its own extract subdirectory so different zips don't
@@ -212,24 +214,22 @@ def process_episode(
 
         # Extra (privately-supplied) sources, tried after AudioVault. Each yields
         # candidate AD audio files; align in order, first acceptable wins.
-        # They supply one episode at a time, so a multi-episode file would come
-        # out half described — it is left alone instead.
-        if extra_episodes:
-            sources = load_extra_sources()
-            if sources:
-                logger.warning(
-                    "Extra sources supply one episode at a time — not used for %s.", label
-                )
-                for source in sources:
-                    source.close()
-            sources = []
-        else:
-            sources = load_extra_sources()
-        for source in sources:
+        for source in load_extra_sources():
             try:
-                for audio_path in source.episode_candidates(
-                    config.cache_dir, series_title, season, episode
-                ):
+                if len(all_episodes) > 1:
+                    # A source yields one episode at a time, so a
+                    # multi-episode video takes each covered episode's best
+                    # candidate and joins them — the same whole-picture rule
+                    # the AudioVault walk follows.
+                    joined = _extra_source_multi_donor(
+                        source, config.cache_dir, series_title, season, all_episodes, label
+                    )
+                    source_candidates = [joined] if joined else []
+                else:
+                    source_candidates = source.episode_candidates(
+                        config.cache_dir, series_title, season, episode
+                    )
+                for audio_path in source_candidates:
                     published, reason = _align_and_keep(config, video_path, audio_path, label=label)
                     if published:
                         # An extra source may deliver a bare per-episode file with
@@ -269,17 +269,18 @@ def process_movie(
 
     search_title = _strip_year_suffix(movie_title)
     stripped_note = " (year stripped)" if search_title != movie_title else ""
+    # As in process_episode: no AudioVault match means fall through to the
+    # extra sources, not give up.
     results = client.search_movies(search_title)
+    candidates: list[dict] = []
     if not results:
         logger.warning(
             "AudioVault has no results for movie: %r%s", movie_title, stripped_note
         )
-        return False, None
-
-    candidates = find_movie(results, movie_title, movie_year)
-    if not candidates:
-        logger.warning("No suitable movie match found for %r.", movie_title)
-        return False, None
+    else:
+        candidates = find_movie(results, movie_title, movie_year)
+        if not candidates:
+            logger.warning("No suitable movie match found for %r.", movie_title)
 
     movie_cache_dir = config.cache_dir / "movies"
     limiter = DownloadLimiter(config.cache_dir / "daily_limit.json")
@@ -400,7 +401,11 @@ def _acceptance_decision(
 _UNDESCRIBED_NOTE_MIN_SEC = 20.0
 # Above this share of the runtime the picture is not "a different cut" — most
 # of it simply has no description (a double episode aligned against one
-# episode's AD, or the wrong episode) and the note says so in those words.
+# episode's AD, or the wrong episode). Such an alignment is REFUSED rather
+# than published: the listener would get a file that goes silent for most of
+# its length, which is worse than no description at all. Real different-cut
+# sources sit far below it — the widest measured here is an unrated film
+# against a theatrical recording at ~8%.
 _UNDESCRIBED_MAJOR_FRACTION = 0.4
 # How many undescribed spans the note names before collapsing the rest.
 _UNDESCRIBED_SPANS_SHOWN = 3
@@ -520,6 +525,34 @@ def _concat_audio(parts: list[Path], out: Path) -> Optional[Path]:
     finally:
         tmp.unlink(missing_ok=True)
         list_file.unlink(missing_ok=True)
+
+
+def _extra_source_multi_donor(
+    source, cache_dir: Path, series_title: str, season: int,
+    episodes: list[int], label: str,
+) -> Optional[Path]:
+    """One extra source's AD for a multi-episode video, joined, or None.
+
+    Only each episode's FIRST candidate is taken: a join of one source's
+    second choices is not obviously better than the next source's first, and
+    every extra candidate costs a download. None when the source is missing
+    any part — half a double episode is what this exists to prevent.
+    """
+    parts: list[Path] = []
+    for ep in episodes:
+        part = next(
+            iter(source.episode_candidates(cache_dir, series_title, season, ep)), None
+        )
+        if part is None:
+            logger.info(
+                "Extra source has no E%02d — it cannot cover %s.", ep, label
+            )
+            return None
+        parts.append(part)
+    joined = cache_dir / "extra_multi" / _safe_dirname(series_title) / (
+        f"s{season:02d}" + "".join(f"E{e:02d}" for e in episodes) + ".mp3"
+    )
+    return _concat_audio(parts, joined)
 
 
 def _episode_donor(
@@ -873,6 +906,16 @@ def _align_and_keep(
         video_path.name, score, cscore, stable_fraction, median_rate, total_runtime,
     )
 
+    # Coverage is a separate question from sync. similarity says the narration
+    # lands at the right TIME; it says nothing about how much of the picture
+    # carries narration at all, because it is measured only over the part the
+    # donor covers. Avatar S02E12-E13 (2026-09-16) scored 72% — the half it
+    # described was perfect — while the other 23 minutes played silent. Any
+    # cause of that shape (a donor covering one episode of two, half a film,
+    # a truncated recording) is caught here, after the sync gate.
+    undescribed, dropped = undescribed_seconds(report)
+    note = _undescribed_note(undescribed, dropped, undescribed_spans(report), total_runtime)
+
     # similarity is describealaign's match-confidence metric: the fraction of
     # the AD release's embedded program audio that aligned against the video.
     # High similarity means the description lands at the right time, so it is
@@ -893,6 +936,9 @@ def _align_and_keep(
         sync_ok=sync_ok,
         min_score=config.min_score,
     )
+    if accepted and note and total_runtime > 0 \
+            and undescribed >= _UNDESCRIBED_MAJOR_FRACTION * total_runtime:
+        accepted, decision_detail = False, note
     if not accepted:
         logger.warning("Discarding %s — %s", video_path.name, decision_detail)
         _cleanup_combined(combined)
@@ -903,8 +949,6 @@ def _align_and_keep(
         )
         return False, decision_detail
     logger.info("Accepting %s via %s path — %s", video_path.name, accept_path, decision_detail)
-    undescribed, dropped = undescribed_seconds(report)
-    note = _undescribed_note(undescribed, dropped, undescribed_spans(report), total_runtime)
     if note:
         logger.warning("%s: %s", video_path.name, note)
     else:

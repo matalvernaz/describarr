@@ -155,3 +155,98 @@ def test_half_a_double_episode_is_called_what_it_is():
 
 def test_note_without_spans_or_runtime_keeps_the_old_shape():
     assert _undescribed_note(75.0, 0.0) == "AD source is a different cut: 75 s of the picture has no description"
+
+
+# ── an alignment that leaves most of the picture silent is refused ───────────
+
+def _align_report(tmp_path, segments, similarity=72.3):
+    """A realistic describealaign report pair on disk, parsed by the real code."""
+    report = tmp_path / "alignments" / "ep.txt"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(f"Input file similarity: {similarity}%\n")
+    report.with_suffix(".json").write_text(json.dumps({
+        "similarity_pct": similarity, "median_rate_pct": 0.0, "segments": segments,
+    }))
+    return report
+
+
+def _run_align_and_keep(monkeypatch, tmp_path, segments, similarity=72.3):
+    from describarr.aligner import AlignResult
+    from describarr.config import Config
+
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    video = tmp_path / "Avatar (2005) - S02E12-E13.mkv"
+    video.write_bytes(b"x")
+    audio = tmp_path / "ad.mp3"
+    audio.write_bytes(b"y")
+    combined = tmp_path / "out" / "ad_ep.mkv"
+    combined.parent.mkdir(parents=True, exist_ok=True)
+    combined.write_bytes(b"z")
+    report = _align_report(tmp_path, segments, similarity)
+
+    published_calls, cleaned = [], []
+    monkeypatch.setattr(workflow, "align",
+                        lambda *a, **k: AlignResult(combined, report, None, returncode=0))
+    monkeypatch.setattr(workflow, "_publish_in_place",
+                        lambda *a, **k: published_calls.append(a))
+    monkeypatch.setattr(workflow, "_cleanup_combined", lambda c: cleaned.append(c))
+
+    published, reason = workflow._align_and_keep(config, video, audio, label="Avatar S02E12E13")
+    decisions = json.loads((config.cache_dir / "decisions.json").read_text())
+    return published, reason, published_calls, cleaned, decisions
+
+
+# The real S02E12-E13 shape: a perfect first half, then 22 minutes of picture
+# the donor never covered, because the donor was one episode of two.
+_HALF_DESCRIBED = [
+    _seg(0.0, 1.5, 1451.9, 0.0, 1450.4),
+    _seg(47570.0, 1451.9, 2798.4, 1450.4, 1453.2),
+    _seg(0.0, 2798.4, 2844.1, 1453.2, 1498.9),
+]
+
+
+def test_half_described_alignment_is_refused_not_published(monkeypatch, tmp_path):
+    published, reason, publish_calls, cleaned, decisions = _run_align_and_keep(
+        monkeypatch, tmp_path, _HALF_DESCRIBED,
+    )
+    assert not published                     # nothing overwrote the library file
+    assert publish_calls == []
+    assert cleaned                           # the combined output was cleaned up
+    assert "covers only part of the picture" in reason
+    assert "24:12–46:38" in reason
+    assert decisions[-1]["outcome"] == "rejected"
+
+
+def test_the_refusal_survives_a_high_similarity_score(monkeypatch, tmp_path):
+    # 95% similarity over the half it does cover must not buy a publish.
+    published, reason, publish_calls, _, _ = _run_align_and_keep(
+        monkeypatch, tmp_path, _HALF_DESCRIBED, similarity=95.0,
+    )
+    assert not published and publish_calls == []
+
+
+def test_an_ordinary_different_cut_still_publishes(monkeypatch, tmp_path):
+    # 75 s of inserted footage in a 45-minute episode: published, with the note.
+    segments = [
+        _seg(0.0, 1.0, 1200.0, 0.0, 1199.0),
+        _seg(9000.0, 1200.0, 1275.0, 1199.0, 1199.5),
+        _seg(0.0, 1275.0, 2700.0, 1199.5, 2624.5),
+    ]
+    published, reason, publish_calls, _, decisions = _run_align_and_keep(
+        monkeypatch, tmp_path, segments,
+    )
+    assert published and len(publish_calls) == 1
+    assert reason.startswith("AD source is a different cut: 75 s")
+    assert decisions[-1]["outcome"] == "described"
+
+
+def test_a_fully_described_episode_publishes_with_no_note(monkeypatch, tmp_path):
+    segments = [
+        _seg(0.0, 1.0, 1400.0, 0.0, 1399.0),
+        _seg(120000.0, 1400.0, 1400.9, 1399.0, 1399.0),   # a sub-second seam
+        _seg(0.0, 1400.9, 2700.0, 1399.0, 2698.1),
+    ]
+    published, reason, publish_calls, _, _ = _run_align_and_keep(
+        monkeypatch, tmp_path, segments,
+    )
+    assert published and len(publish_calls) == 1 and reason is None
