@@ -110,6 +110,17 @@ _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
 _SEASON_DIR_RE = re.compile(r"^Season\s+\d+$", re.IGNORECASE)
 _YEAR_SUFFIX_RE = re.compile(r"^(.+?)\s*\((\d{4})\)\s*$")
+# Sonarr's default episode name is "{Series TitleYear} - S01E01 - <title>", so
+# the premiere year sits in parentheses directly before the episode marker.
+# Anchoring on the marker keeps a year inside the EPISODE title out of it.
+_FILENAME_SERIES_YEAR_RE = re.compile(r"\((\d{4})\)\s*-\s*[Ss]\d+[Ee]\d+")
+# Kodi/Jellyfin series metadata: <year>2005</year>, or failing that the
+# premiere date. A regex rather than an XML parser: these files carry BOMs and
+# CDATA, and a four-digit year is all that is wanted from them.
+_SERIES_NFO_NAME = "tvshow.nfo"
+_NFO_YEAR_RE = re.compile(
+    r"<year>\s*(\d{4})\s*</year>|<premiered>\s*(\d{4})-", re.IGNORECASE
+)
 
 
 def _split_title_year(name: str) -> tuple[str, str | None]:
@@ -118,6 +129,48 @@ def _split_title_year(name: str) -> tuple[str, str | None]:
     if m:
         return m.group(1).strip(), m.group(2)
     return name, None
+
+
+def _series_year_from_filename(name: str) -> str:
+    """The ``(YYYY)`` Sonarr writes before ``SxxExx`` in an episode filename, or ""."""
+    m = _FILENAME_SERIES_YEAR_RE.search(name)
+    return m.group(1) if m else ""
+
+
+def _series_year_from_nfo(series_dir: Path) -> str:
+    """The premiere year recorded in the series folder's ``tvshow.nfo``, or ""."""
+    try:
+        text = (series_dir / _SERIES_NFO_NAME).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = _NFO_YEAR_RE.search(text)
+    return (m.group(1) or m.group(2)) if m else ""
+
+
+def _infer_series_year(series_dir: Path, video_name: str = "") -> str:
+    """Best available premiere year for the series at *series_dir*, or "".
+
+    A manual ``/retry`` carries no ``sonarr_series_year``, and without one
+    ``find_season`` cannot tell a show from a same-titled reboot: "Season 1
+    (2005)" and "Season 1 (2024)" both score 1.00 and catalogue order picks
+    the winner. The year is usually on disk somewhere — the folder suffix
+    (``Archer (2009)``), the episode filename (``Avatar The Last Airbender
+    (2005) - S01E01``) or the ``tvshow.nfo`` a media server wrote — so look
+    in that order.
+    """
+    _, folder_year = _split_title_year(series_dir.name)
+    return (
+        (folder_year or "")
+        or _series_year_from_filename(video_name)
+        or _series_year_from_nfo(series_dir)
+    )
+
+
+def _series_dir_of(video_path: Path) -> Path:
+    """The series folder an episode file belongs to: the parent of its
+    ``Season N`` folder, or its own parent when there is no season layer."""
+    parent = video_path.parent
+    return parent.parent if _SEASON_DIR_RE.match(parent.name) else parent
 
 
 def _infer_retry_params(path_str: str, dir_str: str) -> dict:
@@ -148,19 +201,24 @@ def _infer_retry_params(path_str: str, dir_str: str) -> dict:
     if season_dir_idx is not None:
         # TV layout: parent of "Season N" is the series folder.
         series_folder = target.parts[season_dir_idx - 1] if season_dir_idx > 0 else ""
-        title, year = _split_title_year(series_folder)
+        title, _ = _split_title_year(series_folder)
         if title:
             out["title"] = title
-        if year:
-            out.setdefault("year", year)
+        if season_dir_idx > 0:
+            year = _infer_series_year(
+                Path(*target.parts[:season_dir_idx]), target.name if is_file else ""
+            )
+            if year:
+                out.setdefault("year", year)
         return out
 
     if "season" in out:
         # Filename has SxxExx but no "Season N" parent — assume parent dir is the series folder.
-        series_folder = target.parent.name if is_file else target.name
-        title, year = _split_title_year(series_folder)
+        series_dir = target.parent if is_file else target
+        title, _ = _split_title_year(series_dir.name)
         if title:
             out["title"] = title
+        year = _infer_series_year(series_dir, target.name if is_file else "")
         if year:
             out.setdefault("year", year)
         return out
@@ -561,13 +619,16 @@ class _HookHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     self._respond(400, "season and episode must be integers")
                     return
-                pending.push({
+                item = {
                     "type": "retry_episode",
                     "title": title,
                     "path": path_str,
                     "season": s,
                     "episode": e,
-                })
+                }
+                if year_str:
+                    item["series_year"] = year_str
+                pending.push(item)
                 label = f"S{s:02d}E{e:02d} of {title!r}"
             else:
                 pending.push({
@@ -594,12 +655,17 @@ class _HookHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     self._respond(400, "season must be an integer")
                     return
-            pending.push({
+            item = {
                 "type": "retry_dir",
                 "title": title,
                 "dir": str(scan_dir),
                 "season": season_filter,
-            })
+            }
+            if year_str:
+                # An explicit year= (or a folder suffix) outranks whatever the
+                # worker can read off each file.
+                item["year"] = year_str
+            pending.push(item)
             label = f"season {season_filter} of {title!r}" if season_filter else f"all seasons of {title!r}"
             self._respond(202, f"Accepted — queued {label}, check container logs for progress")
             return
@@ -941,14 +1007,24 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
     if not video_path.is_file():
         logger.error("Retry episode: file not found, dropping: %s", video_path)
         return
+    # Items queued before the year travelled with them carry no series_year;
+    # the disk layout still knows it.
+    series_year = item.get("series_year") or _infer_series_year(
+        _series_dir_of(video_path), video_path.name
+    )
 
     client = _get_client(config)
     label = f"{title} S{season:02d}E{episode:02d}"
     try:
         with _set_current_job({"type": "episode", "title": title, "season": season, "episode": episode}):
-            described, reason = process_episode(client, config, video_path, title, season, episode)
+            described, reason = process_episode(
+                client, config, video_path, title, season, episode,
+                series_year=series_year,
+            )
     except DailyLimitReached:
-        _get_retry_queue(config).add_episode(title, season, episode, str(video_path))
+        _get_retry_queue(config).add_episode(
+            title, season, episode, str(video_path), series_year=series_year,
+        )
         _notify_outcome(config, label, "queued")
         return
     _notify_outcome(config, label, "described" if described else "no_match", reason)
@@ -1005,6 +1081,8 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
         return
 
     show_cache_dir = config.cache_dir / "shows" / _safe_dirname(title)
+    requested_year = item.get("year") or ""
+    years_seen: set[str] = set()
     queued = 0
     skipped = 0
     # season -> episodes whose .done entry is stale (file lost its AD track) and
@@ -1039,13 +1117,20 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
                     continue
                 stale_done.setdefault(season, set()).add(episode)
 
-        pending.push({
+        series_year = requested_year or _infer_series_year(
+            _series_dir_of(video_path), video_path.name
+        )
+        entry = {
             "type": "retry_episode",
             "title": title,
             "path": str(video_path),
             "season": season,
             "episode": episode,
-        })
+        }
+        if series_year:
+            entry["series_year"] = series_year
+            years_seen.add(series_year)
+        pending.push(entry)
         queued += 1
 
     # One write per affected season so the re-described episodes rejoin .done
@@ -1071,6 +1156,15 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
         "cleared %d stale done-entrie(s).",
         scan_dir, queued, skipped, cleared,
     )
+    if queued and not years_seen:
+        logger.warning(
+            "Retry dir %s: no series year in the folder name, filenames or "
+            "tvshow.nfo — a same-titled reboot in the catalogue cannot be told "
+            "apart. Pass year= to pin it.",
+            scan_dir,
+        )
+    elif years_seen:
+        logger.info("Retry dir %s: series year %s.", scan_dir, ", ".join(sorted(years_seen)))
 
 
 def _worker_handle_drain(item: dict, config: Config, pending: PendingQueue) -> None:

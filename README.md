@@ -193,6 +193,8 @@ All paths must be paths *inside the describarr container*, which are the same as
 
 `title`, `year`, `season`, and `episode` are inferred from the path layout — Sonarr's `/tv/<series>/Season N/<file.SxxExx.mkv>` and Radarr's `/movies/<Title (Year)>/<file>` are recognised automatically. Pass any of those parameters explicitly to override what was inferred (e.g. when the series folder name doesn't match AudioVault).
 
+For TV, `year` is the year the series began and is what keeps a show apart from a same-titled reboot in the catalogue (`Season 1 (2005)` vs `Season 1 (2024)`). It is read from the series folder suffix (`Archer (2009)`), then from a Sonarr-style filename (`Show (2005) - S01E01 - …`), then from a `tvshow.nfo` in the series folder. If none of those carries it, the log says so — pass `year=` to pin it.
+
 ### Single TV episode
 
 ```

@@ -39,9 +39,12 @@ class RetryQueue:
     def __init__(self, state_path: Path) -> None:
         self._path = state_path
 
-    def add_episode(self, series_title: str, season: int, episode: int, video_path: str) -> None:
+    def add_episode(
+        self, series_title: str, season: int, episode: int, video_path: str,
+        series_year: str = "",
+    ) -> None:
         """Queue a single-episode retry."""
-        self.add_episodes(series_title, season, [episode], video_path)
+        self.add_episodes(series_title, season, [episode], video_path, series_year=series_year)
 
     def add_episodes(
         self,
