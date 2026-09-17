@@ -10,7 +10,7 @@ that fact into the decision log and the Pushover message.
 import json
 
 import describarr.workflow as workflow
-from describarr.aligner import undescribed_seconds
+from describarr.aligner import undescribed_seconds, undescribed_spans
 from describarr.config import Config
 from describarr.workflow import _undescribed_note, process_movie
 
@@ -105,3 +105,53 @@ def test_notification_carries_the_note(monkeypatch, tmp_path):
     sent.clear()
     server._notify_outcome(config, "Scary Movie 3 (2003)", "described", None)
     assert sent == [("describarr: Scary Movie 3 (2003)", "Added and described.")]
+
+
+# ── the note says where, and changes its words when most of the picture is bare ──
+
+def test_spans_are_the_unreplaced_video_ranges_in_order(tmp_path):
+    report = _write_report(tmp_path, [
+        _seg(0.0, 1.4, 50.2, 0.0, 48.9),
+        _seg(1619.8, 50.2, 94.4, 48.9, 51.4),           # the recap the AD omits
+        _seg(0.0, 94.4, 513.8, 51.4, 470.9),
+        _seg(118213.0, 513.8, 514.9, 470.9, 470.91),    # a seam
+        _seg(0.0, 514.9, 1449.2, 470.91, 1401.8),
+    ])
+    assert undescribed_spans(report) == [(50.2, 94.4), (513.8, 514.9)]
+
+
+def test_adjacent_spans_merge(tmp_path):
+    report = _write_report(tmp_path, [
+        _seg(500.0, 10.0, 20.0, 5.0, 6.0),
+        _seg(0.0, 20.0, 20.5, 6.0, 6.5),
+        _seg(500.0, 20.5, 30.0, 6.5, 7.5),
+    ])
+    assert undescribed_spans(report) == [(10.0, 30.0)]
+
+
+def test_note_names_the_recap_position():
+    note = _undescribed_note(44.2, 0.0, [(50.2, 94.4)], runtime=1449.0)
+    assert note == "AD source is a different cut: 44 s of the picture has no description at 0:50–1:34"
+
+
+def test_note_keeps_the_dropped_narration_tail():
+    note = _undescribed_note(51.0, 5.3, [(50.2, 94.4), (513.8, 520.0)], runtime=1449.0)
+    assert note.endswith("at 0:50–1:34, 8:34–8:40, 5 s of narration could not be placed")
+
+
+def test_note_lists_the_longest_three_spans_and_counts_the_rest():
+    spans = [(10.0, 30.0), (100.0, 101.0), (200.0, 240.0), (300.0, 302.0), (400.0, 470.0)]
+    note = _undescribed_note(133.0, 0.0, spans, runtime=5000.0)
+    assert " at 0:10–0:30, 3:20–4:00, 6:40–7:50 and 2 shorter" in note
+    assert "2 min of the picture" in note                # minutes past two minutes
+
+
+def test_half_a_double_episode_is_called_what_it_is():
+    # Avatar S02E12-E13 (2026-09-16): a 47 min file described with E12's AD only.
+    note = _undescribed_note(1371.7, 2.8, [(1451.9, 2798.4)], runtime=2842.6)
+    assert note == ("description covers only part of the picture: 23 min of 47 min "
+                    "has no description at 24:12–46:38, 3 s of narration could not be placed")
+
+
+def test_note_without_spans_or_runtime_keeps_the_old_shape():
+    assert _undescribed_note(75.0, 0.0) == "AD source is a different cut: 75 s of the picture has no description"

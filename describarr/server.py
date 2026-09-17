@@ -108,6 +108,12 @@ _MAX_WORKER_ATTEMPTS = 5
 
 _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
+# What may follow the first SxxEyy of a multi-episode name, in every style
+# Sonarr writes: E02 (Repeat), -E02 (Scene, Prefixed Range), -02 (Extend, Range).
+_EPISODE_CONTINUATION_RE = re.compile(r"-?[Ee](\d+)|-(\d+)")
+# A continuation further than this from the first episode is not an episode
+# number at all ("S01E01-1080p").
+_MAX_EPISODE_SPAN = 10
 _SEASON_DIR_RE = re.compile(r"^Season\s+\d+$", re.IGNORECASE)
 _YEAR_SUFFIX_RE = re.compile(r"^(.+?)\s*\((\d{4})\)\s*$")
 # Sonarr's default episode name is "{Series TitleYear} - S01E01 - <title>", so
@@ -129,6 +135,45 @@ def _split_title_year(name: str) -> tuple[str, str | None]:
     if m:
         return m.group(1).strip(), m.group(2)
     return name, None
+
+
+def _parse_episode_marker(name: str) -> Optional[tuple[int, list[int]]]:
+    """``(season, [episodes])`` named by *name*, or None without an SxxEyy.
+
+    A multi-episode file comes in every style Sonarr can write — ``S01E01E02``,
+    ``S01E01-E02``, ``S01E01-02``, ``S01E01-02-03``, ``S01E01.S01E02`` — and
+    every episode it covers is returned, because describing it with the first
+    episode's AD alone leaves the rest of the picture silent. A single
+    hyphen-joined pair is an inclusive range: ``S03E18-E21`` is four episodes.
+    """
+    m = _EPISODE_RE.search(name)
+    if not m:
+        return None
+    season = int(m.group(1))
+    first = int(m.group(2))
+    episodes = [first]
+    listed: list[int] = []
+    pos = m.end()
+    while True:
+        c = _EPISODE_CONTINUATION_RE.match(name, pos)
+        if not c:
+            break
+        number = int(c.group(1) or c.group(2))
+        if not first < number <= first + _MAX_EPISODE_SPAN:
+            break
+        listed.append(number)
+        pos = c.end()
+    if len(listed) == 1:
+        episodes.extend(range(first + 1, listed[0] + 1))
+    else:
+        episodes.extend(n for n in listed if n not in episodes)
+    # Duplicate style repeats the season for every episode: "S01E01.S01E02".
+    for again in _EPISODE_RE.finditer(name, pos):
+        number = int(again.group(2))
+        if int(again.group(1)) == season and first < number <= first + _MAX_EPISODE_SPAN \
+                and number not in episodes:
+            episodes.append(number)
+    return season, episodes
 
 
 def _series_year_from_filename(name: str) -> str:
@@ -188,10 +233,13 @@ def _infer_retry_params(path_str: str, dir_str: str) -> dict:
     out: dict = {}
 
     if is_file:
-        m = _EPISODE_RE.search(target.name)
-        if m:
-            out["season"] = str(int(m.group(1)))
-            out["episode"] = str(int(m.group(2)))
+        marker = _parse_episode_marker(target.name)
+        if marker:
+            season_number, episodes = marker
+            out["season"] = str(season_number)
+            out["episode"] = str(episodes[0])
+            if len(episodes) > 1:
+                out["extra_episodes"] = episodes[1:]
 
     season_dir_idx = next(
         (i for i, p in enumerate(target.parts) if _SEASON_DIR_RE.match(p)),
@@ -590,6 +638,7 @@ class _HookHandler(BaseHTTPRequestHandler):
             return
 
         inferred = _infer_retry_params(path_str, dir_str)
+        episode_str_given = bool(episode_str)
         title = title or inferred.get("title", "")
         year_str = year_str or inferred.get("year", "")
         season_str = season_str or inferred.get("season", "")
@@ -628,6 +677,10 @@ class _HookHandler(BaseHTTPRequestHandler):
                 }
                 if year_str:
                     item["series_year"] = year_str
+                # A multi-episode file is described with every covered
+                # episode's AD; an explicit episode= means just that one.
+                if not episode_str_given and inferred.get("extra_episodes"):
+                    item["extra_episodes"] = inferred["extra_episodes"]
                 pending.push(item)
                 label = f"S{s:02d}E{e:02d} of {title!r}"
             else:
@@ -999,7 +1052,8 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
     try:
         season = int(item["season"])
         episode = int(item["episode"])
-    except (KeyError, ValueError):
+        extra_episodes = [int(e) for e in item.get("extra_episodes") or []]
+    except (KeyError, ValueError, TypeError):
         logger.error("retry_episode item malformed: %r", item)
         return
 
@@ -1014,16 +1068,16 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
     )
 
     client = _get_client(config)
-    label = f"{title} S{season:02d}E{episode:02d}"
+    label = f"{title} S{season:02d}" + "".join(f"E{e:02d}" for e in [episode, *extra_episodes])
     try:
         with _set_current_job({"type": "episode", "title": title, "season": season, "episode": episode}):
             described, reason = process_episode(
                 client, config, video_path, title, season, episode,
-                series_year=series_year,
+                extra_episodes=extra_episodes, series_year=series_year,
             )
     except DailyLimitReached:
-        _get_retry_queue(config).add_episode(
-            title, season, episode, str(video_path), series_year=series_year,
+        _get_retry_queue(config).add_episodes(
+            title, season, [episode, *extra_episodes], str(video_path), series_year=series_year,
         )
         _notify_outcome(config, label, "queued")
         return
@@ -1089,12 +1143,12 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
     # must be cleared so the season's completion is re-evaluated honestly.
     stale_done: dict[int, set] = {}
     for video_path in video_files:
-        m = _EPISODE_RE.search(video_path.name)
-        if not m:
+        marker = _parse_episode_marker(video_path.name)
+        if not marker:
             logger.warning("Could not parse SxxExx from %s — skipping", video_path.name)
             continue
-        season = int(m.group(1))
-        episode = int(m.group(2))
+        season, episodes = marker
+        episode = episodes[0]
         if season_filter is not None and season != season_filter:
             continue
 
@@ -1115,7 +1169,7 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
                 if source_has_ad_track(video_path):
                     skipped += 1
                     continue
-                stale_done.setdefault(season, set()).add(episode)
+                stale_done.setdefault(season, set()).update(e for e in episodes if e in done)
 
         series_year = requested_year or _infer_series_year(
             _series_dir_of(video_path), video_path.name
@@ -1130,6 +1184,8 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
         if series_year:
             entry["series_year"] = series_year
             years_seen.add(series_year)
+        if len(episodes) > 1:
+            entry["extra_episodes"] = episodes[1:]
         pending.push(entry)
         queued += 1
 

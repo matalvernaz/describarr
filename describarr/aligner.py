@@ -492,6 +492,34 @@ def undescribed_seconds(report: Optional[Path]) -> tuple[float, float]:
     return undescribed, dropped
 
 
+def undescribed_spans(report: Optional[Path]) -> list[tuple[float, float]]:
+    """
+    The video spans of an accepted alignment that play with no narration, in
+    playback order, as ``(start_sec, end_sec)`` pairs.
+
+    The same segments :func:`undescribed_seconds` sums — the ones the engine
+    does not replace — kept apart so the success note can say WHERE the
+    picture is undescribed: "0:50–1:34" is recognisably a recap the AD
+    source omits, "24:12–46:38" is half a double episode. Spans closer than
+    a second are merged.
+    """
+    metrics = _read_metrics(report)
+    if metrics is None:
+        return []
+    spans: list[tuple[float, float]] = []
+    for seg in metrics.get("segments", []):
+        if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT:
+            continue
+        start, end = float(seg["video_start_sec"]), float(seg["video_end_sec"])
+        if end <= start:
+            continue
+        if spans and start - spans[-1][1] < 1.0:
+            spans[-1] = (spans[-1][0], end)
+        else:
+            spans.append((start, end))
+    return spans
+
+
 def sync_quality(report: Optional[Path]) -> tuple[bool, str]:
     """
     Return (ok, reason) where ok=False means the alignment is likely unreliable.

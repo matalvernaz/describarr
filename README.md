@@ -209,6 +209,8 @@ Point `dir=` at the season directory. describarr scans for video files and parse
 http://localhost:8686/retry?dir=/tv/ted/Season%201
 ```
 
+A multi-episode file (`S02E12-E13`, `S03E18-E21`) is described with every covered episode's AD joined in order. If a source lacks one of the parts the file is left alone rather than published half described.
+
 ### Whole show
 
 Point `dir=` at the show root. All seasons are queued and processed in order.
@@ -241,7 +243,7 @@ If the folder name doesn't include the year (or the AudioVault title differs), p
 
 When an alignment can't be made, the Pushover notification carries the specific cause instead of a generic "errored" — e.g. *"AD is 22 min vs 45 min video — likely wrong/truncated episode"* or *"AD audio is 95% silence"* — so you know whether to swap the AD source or re-grab the video. (This relies on the failure diagnosis emitted by describealaign ≥ v2.1.9.)
 
-When an alignment *is* published but the AD source turns out to be a different cut of the film (an unrated video against a theatrical description, say), the success notification says so — *"Added and described. (AD source is a different cut: 75 s of the picture has no description)"* — because the inserted footage keeps its original soundtrack and you should expect stretches without narration. The same figures land in the `/status` decision log as `undescribed` and `dropped` seconds. Anything under 20 s is treated as ordinary seams and not mentioned.
+When an alignment *is* published but the AD source turns out to be a different cut of the film (an unrated video against a theatrical description, say), the success notification says so and says where — *"Added and described. (AD source is a different cut: 75 s of the picture has no description at 1:19–1:45, 5:02–5:31)"* — because the inserted footage keeps its original soundtrack and you should expect stretches without narration. A stretch right after the title card is usually a recap the AD source omits. When most of the runtime is undescribed the wording changes to *"description covers only part of the picture: 23 min of 47 min has no description at 24:12–46:38"*, which is what a double episode aligned against a single episode's AD looks like. The same figures land in the `/status` decision log as `undescribed` and `dropped` seconds. Anything under 20 s is treated as ordinary seams and not mentioned.
 
 A published file inherits the owner, group and permission bits of the file it replaces, and the sibling `.describarr_backup` folder and `.admerge.lock` file take the library folder's owner with group-writable modes. describarr runs as root in its container; without this every publish left root-owned entries behind, and a root-owned folder later blocks Sonarr/Radarr (uid 1000) from replacing the file on an upgrade.
 

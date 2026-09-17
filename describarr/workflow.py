@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import time
 import uuid
 import zipfile
@@ -34,6 +35,7 @@ from .aligner import (
     slope_stability,
     sync_quality,
     undescribed_seconds,
+    undescribed_spans,
     source_has_ad_track,
 )
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
@@ -194,10 +196,10 @@ def process_episode(
             except DailyLimitReached:
                 raise
             extract_dir = zip_cache_dir / f"season_{season:02d}" / _safe_dirname(candidate["name"])
-            audio_path = extract_episode(zip_path, extract_dir, episode)
+            audio_path = _episode_donor(zip_path, extract_dir, all_episodes, label)
             if not audio_path:
                 logger.warning(
-                    "E%02d not found in %r — trying next candidate.", episode, candidate["name"]
+                    "%r cannot cover %s — trying next candidate.", candidate["name"], label
                 )
                 continue
             published, reason = _align_and_keep(config, video_path, audio_path, label=label)
@@ -210,7 +212,20 @@ def process_episode(
 
         # Extra (privately-supplied) sources, tried after AudioVault. Each yields
         # candidate AD audio files; align in order, first acceptable wins.
-        for source in load_extra_sources():
+        # They supply one episode at a time, so a multi-episode file would come
+        # out half described — it is left alone instead.
+        if extra_episodes:
+            sources = load_extra_sources()
+            if sources:
+                logger.warning(
+                    "Extra sources supply one episode at a time — not used for %s.", label
+                )
+                for source in sources:
+                    source.close()
+            sources = []
+        else:
+            sources = load_extra_sources()
+        for source in sources:
             try:
                 for audio_path in source.episode_candidates(
                     config.cache_dir, series_title, season, episode
@@ -383,17 +398,161 @@ def _acceptance_decision(
 # the gaps are ordinary seams; above it the source is almost certainly a
 # different cut and the listener should expect undescribed stretches.
 _UNDESCRIBED_NOTE_MIN_SEC = 20.0
+# Above this share of the runtime the picture is not "a different cut" — most
+# of it simply has no description (a double episode aligned against one
+# episode's AD, or the wrong episode) and the note says so in those words.
+_UNDESCRIBED_MAJOR_FRACTION = 0.4
+# How many undescribed spans the note names before collapsing the rest.
+_UNDESCRIBED_SPANS_SHOWN = 3
 
 
-def _undescribed_note(undescribed: float, dropped: float) -> Optional[str]:
-    """Human-readable success note for a different-cut source, or None."""
+def _fmt_clock(seconds: float) -> str:
+    """A position in the picture as ``m:ss``, or ``h:mm:ss`` past an hour."""
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Whole seconds below two minutes, whole minutes above: "44 s", "23 min"."""
+    if seconds < 120:
+        return f"{seconds:.0f} s"
+    return f"{seconds / 60:.0f} min"
+
+
+def _fmt_spans(spans) -> str:
+    """" at 0:50–1:34, 24:12–46:38": the longest few spans, in playback order."""
+    spans = [s for s in spans if s[1] > s[0]]
+    if not spans:
+        return ""
+    longest = sorted(spans, key=lambda s: s[1] - s[0], reverse=True)[:_UNDESCRIBED_SPANS_SHOWN]
+    shown = ", ".join(f"{_fmt_clock(a)}–{_fmt_clock(b)}" for a, b in sorted(longest))
+    more = len(spans) - len(longest)
+    return f" at {shown}" + (f" and {more} shorter" if more else "")
+
+
+def _undescribed_note(
+    undescribed: float, dropped: float, spans=(), runtime: float = 0.0,
+) -> Optional[str]:
+    """Human-readable success note for picture left without narration, or None.
+
+    Below the threshold the gaps are ordinary seams. Above it the note says
+    how much and WHERE, so a listener can tell a recap the AD source omits
+    ("44 s at 0:50–1:34") from a real hole. When most of the runtime is
+    undescribed the wording changes: that is not a different cut, that is a
+    description covering only part of the picture.
+    """
     if undescribed < _UNDESCRIBED_NOTE_MIN_SEC:
         return None
-    note = (f"AD source is a different cut: {undescribed:.0f} s of the picture "
-            f"has no description")
+    where = _fmt_spans(spans)
+    if runtime > 0 and undescribed >= _UNDESCRIBED_MAJOR_FRACTION * runtime:
+        note = (f"description covers only part of the picture: "
+                f"{_fmt_duration(undescribed)} of {_fmt_duration(runtime)} "
+                f"has no description{where}")
+    else:
+        note = (f"AD source is a different cut: {_fmt_duration(undescribed)} of the "
+                f"picture has no description{where}")
     if dropped >= 2.0:
         note += f", {dropped:.0f} s of narration could not be placed"
     return note
+
+
+# A joined multi-episode donor must come within this of the summed part
+# durations, or the join is treated as failed.
+_CONCAT_DURATION_TOLERANCE_SEC = 2.0
+
+
+def _audio_duration(path: Path) -> float:
+    """Container duration of *path* in seconds via ffprobe; 0.0 when unreadable."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60, check=False,
+        ).stdout.strip()
+        return float(out) if out else 0.0
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+def _concat_audio(parts: list[Path], out: Path) -> Optional[Path]:
+    """Join *parts* end to end into *out* with ffmpeg; None on failure.
+
+    Stream-copies when the parts share a codec (lossless, instant) and falls
+    back to a re-encode when they don't. Either result is checked against the
+    summed part durations, so a silently truncated join cannot reach the
+    aligner. An existing *out* of the right length is reused.
+    """
+    expected = sum(_audio_duration(p) for p in parts)
+    if out.exists() and abs(_audio_duration(out) - expected) <= _CONCAT_DURATION_TOLERANCE_SEC:
+        return out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    list_file = out.with_name(out.name + ".list")
+    # ffmpeg's concat demuxer quotes with single quotes; a quote inside a
+    # path ("The Serpent's Pass") is written as '\''.
+    list_file.write_text(
+        "".join("file '" + str(p).replace("'", "'\\''") + "'\n" for p in parts)
+    )
+    # Keep the audio extension on the temp name: ffmpeg picks the muxer from it.
+    tmp = out.with_name(f".{out.stem}.part{out.suffix}")
+    try:
+        for codec_args in (["-c", "copy"], ["-c:a", "libmp3lame", "-q:a", "2"]):
+            tmp.unlink(missing_ok=True)
+            cmd = ["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0",
+                   "-i", str(list_file), *codec_args, str(tmp)]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.error("ffmpeg could not join %s: %s", out.name, exc)
+                return None
+            got = _audio_duration(tmp) if tmp.exists() else 0.0
+            if proc.returncode == 0 and abs(got - expected) <= _CONCAT_DURATION_TOLERANCE_SEC:
+                tmp.replace(out)
+                logger.info("Joined %d AD files into %s (%.0f s).", len(parts), out.name, expected)
+                return out
+            logger.warning(
+                "Joining %s with %s gave %.0f s for an expected %.0f s%s",
+                out.name, " ".join(codec_args), got, expected,
+                f": {proc.stderr.strip()[-300:]}" if proc.stderr.strip() else "",
+            )
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+        list_file.unlink(missing_ok=True)
+
+
+def _episode_donor(
+    zip_path: Path, extract_dir: Path, episodes: list[int], label: str,
+) -> Optional[Path]:
+    """The AD audio for *episodes* from one catalogue entry, or None.
+
+    One episode: its own file. A multi-episode video (Sonarr's ``S02E12-E13``):
+    every covered episode's file joined in order, so the whole picture is
+    described. None when any part is missing — publishing half a double
+    episode is the failure this exists to prevent (Avatar S02E12-E13,
+    2026-09-16: E12's description alone left 23 minutes silent).
+
+    The joined file lives beside the extract dir, not inside it: the ledger
+    snaps a season's episode count from the extract dir's audio files, and
+    an extra file there would keep the season from ever completing.
+    """
+    parts: list[Path] = []
+    for ep in episodes:
+        part = extract_episode(zip_path, extract_dir, ep)
+        if not part:
+            logger.warning(
+                "E%02d not found in %s — cannot describe %s from this entry.",
+                ep, zip_path.name, label,
+            )
+            return None
+        parts.append(part)
+    if len(parts) == 1:
+        return parts[0]
+    joined = extract_dir.with_name(extract_dir.name + "_multi") / (
+        "".join(f"E{e:02d}" for e in episodes) + ".mp3"
+    )
+    return _concat_audio(parts, joined)
 
 
 _BACKUP_SUBDIR = ".describarr_backup"
@@ -745,7 +904,7 @@ def _align_and_keep(
         return False, decision_detail
     logger.info("Accepting %s via %s path — %s", video_path.name, accept_path, decision_detail)
     undescribed, dropped = undescribed_seconds(report)
-    note = _undescribed_note(undescribed, dropped)
+    note = _undescribed_note(undescribed, dropped, undescribed_spans(report), total_runtime)
     if note:
         logger.warning("%s: %s", video_path.name, note)
     else:
