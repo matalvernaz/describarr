@@ -1279,9 +1279,10 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
         if source_has_ad_track(video_path):
             skipped += 1
             if episode not in done:
-                # Self-heal: record what the file proves, so the next scan can
-                # skip it without an ffprobe and season completion is counted
-                # honestly.
+                # Self-heal. The probe stays unconditional on every scan — the
+                # ledger can be wrong in both directions, so it is never a
+                # fast path — but recording this keeps season completion, and
+                # with it the cached-zip cleanup accounting, honest.
                 healed_done.setdefault(season, set()).update(episodes)
             continue
 
