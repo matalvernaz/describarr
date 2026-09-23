@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import describarr.server as srv
+from conftest import fake_config
 import describarr.workflow as workflow
 from describarr.config import Config
 from describarr.workflow import _concat_audio, _episode_donor, process_episode
@@ -77,7 +78,7 @@ def test_retry_dir_queues_the_double_episode_as_one_item(tmp_path, monkeypatch):
     pending = _FakePending()
     srv._worker_handle_retry_dir(
         {"title": "Avatar: The Last Airbender", "dir": str(show)},
-        types.SimpleNamespace(cache_dir=tmp_path / "cache"), pending,
+        fake_config(tmp_path), pending,
     )
     [item] = pending.pushed
     assert (item["season"], item["episode"], item["extra_episodes"]) == (2, 12, [13])
@@ -92,7 +93,7 @@ def test_retry_dir_clears_every_covered_episode_from_a_stale_ledger(tmp_path, mo
     monkeypatch.setattr(srv, "source_has_ad_track", lambda p: False)   # AD track gone
     srv._worker_handle_retry_dir(
         {"title": "Avatar: The Last Airbender", "dir": str(show)},
-        types.SimpleNamespace(cache_dir=cache), _FakePending(),
+        fake_config(cache_dir=cache), _FakePending(),
     )
     assert json.loads(done_path.read_text())["done"] == [11]
 
@@ -111,7 +112,7 @@ def test_retry_episode_passes_the_extra_episodes_on(tmp_path, monkeypatch):
     srv._worker_handle_retry_episode(
         {"title": "Avatar: The Last Airbender", "path": str(video), "season": 2, "episode": 12,
          "extra_episodes": [13]},
-        types.SimpleNamespace(), _FakePending(),
+        fake_config(tmp_path), _FakePending(),
     )
     assert seen["episode"] == 12 and seen["extra_episodes"] == [13]
 
@@ -120,7 +121,7 @@ def test_handle_retry_on_a_double_episode_file(tmp_path, monkeypatch):
     _, video = _double(tmp_path)
     pending = _FakePending()
     monkeypatch.setattr(srv, "_get_pending_queue", lambda config: pending)
-    monkeypatch.setattr(srv, "Config", types.SimpleNamespace(from_env=lambda: types.SimpleNamespace()))
+    monkeypatch.setattr(srv, "Config", types.SimpleNamespace(from_env=lambda: fake_config(tmp_path)))
     handler = srv._HookHandler.__new__(srv._HookHandler)
     handler._respond = lambda code, msg: None
     handler._handle_retry({"path": str(video)})

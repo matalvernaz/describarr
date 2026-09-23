@@ -27,9 +27,10 @@ from . import notify
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, LoginError
 from .config import Config
 from .decision_log import DecisionLog
+from .nomatch_cache import NoMatchCache
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
-from .workflow import drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _atomic_write_json, _MAX_DRAIN_PASSES
+from .workflow import ALREADY_DESCRIBED, drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _atomic_write_json, _MAX_DRAIN_PASSES
 from .aligner import source_has_ad_track
 
 logger = logging.getLogger(__name__)
@@ -632,6 +633,10 @@ class _HookHandler(BaseHTTPRequestHandler):
         season_str = params.get("season", "").strip()
         episode_str = params.get("episode", "").strip()
         year_str = params.get("year", "").strip()
+        # force=1 re-searches even episodes remembered as having no source.
+        # The single-file path= form is already an explicit "try this again"
+        # and bypasses that memory unconditionally.
+        force = params.get("force", "").strip().lower() in {"1", "true", "yes", "on"}
 
         if not (path_str or dir_str):
             self._respond(400, "Provide path= (single file) or dir= (season or show directory)")
@@ -718,6 +723,8 @@ class _HookHandler(BaseHTTPRequestHandler):
                 # An explicit year= (or a folder suffix) outranks whatever the
                 # worker can read off each file.
                 item["year"] = year_str
+            if force:
+                item["force"] = True
             pending.push(item)
             label = f"season {season_filter} of {title!r}" if season_filter else f"all seasons of {title!r}"
             self._respond(202, f"Accepted — queued {label}, check container logs for progress")
@@ -753,8 +760,24 @@ class _HookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _caller(self) -> str:
+        """Best-known origin of this request.
+
+        Through Traefik ``client_address`` is always the proxy's container IP,
+        which identifies nothing; the forwarded header carries the real client.
+        Requests from inside the container (cron helpers hitting localhost)
+        have no forwarded header and report 127.0.0.1, which is exactly the
+        distinction worth logging — without it a mystery /retry cannot be
+        attributed at all (2026-09-22)."""
+        headers = getattr(self, "headers", None)
+        forwarded = headers.get("X-Forwarded-For", "") if headers else ""
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        address = getattr(self, "client_address", None)
+        return address[0] if address else "-"
+
     def log_message(self, fmt, *args):
-        logger.info(fmt, *args)
+        logger.info("%s " + fmt, self._caller(), *args)
 
 
 def _render_decisions_rows(decisions: list[dict]) -> str:
@@ -948,7 +971,7 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
         return {"label": label, "outcome": "queued"}
     return {
         "label": label,
-        "outcome": "described" if described else "no_match",
+        "outcome": _episode_outcome(described, reason),
         "reason": reason,
     }
 
@@ -977,9 +1000,28 @@ def _radarr(config: Config, env: dict[str, str]) -> dict | None:
         return {"label": label, "outcome": "queued"}
     return {
         "label": label,
-        "outcome": "described" if described else "no_match",
+        "outcome": _episode_outcome(described, reason),
         "reason": reason,
     }
+
+
+def _episode_outcome(described: bool, reason: Optional[str]) -> str:
+    """Map a (described, reason) pair onto a notification/decision outcome.
+
+    ``described=True`` with the ALREADY_DESCRIBED sentinel means the guard in
+    process_episode/process_movie found an existing AD track and returned
+    without doing anything. Reporting that as "described" claims a publish that
+    never happened.
+    """
+    if not described:
+        return "no_match"
+    return "already_described" if reason == ALREADY_DESCRIBED else "described"
+
+
+# Per-show record of episodes no source could cover, beside that show's
+# .done ledger in the cache. Dot-prefixed to match .done_sNN.json so a cache
+# listing stays readable.
+_NOMATCH_FILENAME = ".nomatch.json"
 
 
 # ------------------------------------------------------------------
@@ -988,6 +1030,7 @@ def _radarr(config: Config, env: dict[str, str]) -> dict | None:
 
 _OUTCOME_MESSAGES = {
     "described": "Added and described.",
+    "already_described": "Already had an audio description — left alone.",
     "no_match": "Added — no audio description available.",
     "queued": "Added — description queued (AudioVault daily limit reached).",
     "error": "Added — describarr errored, check logs.",
@@ -1016,6 +1059,9 @@ def _log_terminal_decision(config: Config, label: str, outcome: str, reason: Opt
 def _notify_outcome(config: Config, label: str, outcome: str, reason: Optional[str] = None) -> None:
     """Send the Pushover for an outcome (with the specific cause appended when
     known) and record the terminal decision for the /status audit trail."""
+    if reason == ALREADY_DESCRIBED:
+        # The sentinel is a signal to this function, not prose for the operator.
+        reason = None
     base = _OUTCOME_MESSAGES.get(outcome, outcome)
     message = f"{base} ({reason})" if reason else base
     notify.send(f"describarr: {label}", message)
@@ -1081,7 +1127,24 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
         )
         _notify_outcome(config, label, "queued")
         return
-    _notify_outcome(config, label, "described" if described else "no_match", reason)
+    nomatch = NoMatchCache(
+        config.cache_dir / "shows" / _safe_dirname(title) / _NOMATCH_FILENAME,
+        config.nomatch_ttl_days,
+    )
+    keys = [NoMatchCache.key(season, e) for e in [episode, *extra_episodes]]
+    if described:
+        # Whatever we believed about this episode is now out of date either way.
+        for key in keys:
+            nomatch.forget(key)
+    elif reason is None:
+        # reason is None ⇒ no candidate was found at all, as opposed to a
+        # candidate that aligned badly and was rejected. Only the former is a
+        # "nothing out there" result worth not re-asking; a rejection may well
+        # succeed next time with a better donor.
+        for key in keys:
+            nomatch.record_miss(key, video_path)
+
+    _notify_outcome(config, label, _episode_outcome(described, reason), reason)
 
 
 def _worker_handle_retry_movie(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -1103,7 +1166,43 @@ def _worker_handle_retry_movie(item: dict, config: Config, pending: PendingQueue
         _get_retry_queue(config).add_movie(title, year_str, str(video_path))
         _notify_outcome(config, label, "queued")
         return
-    _notify_outcome(config, label, "described" if described else "no_match", reason)
+    _notify_outcome(config, label, _episode_outcome(described, reason), reason)
+
+
+def _merge_done_entries(show_cache_dir: Path, season: int, episodes: set) -> int:
+    """Add *episodes* to the season's .done ledger, returning how many were new.
+
+    Used when the files themselves prove an episode is described but the ledger
+    never recorded it. ``total`` is preserved when present (and left at 0 for a
+    legacy list-format file, which the next _mark_episode_done recomputes from
+    the zip) so this cannot make a season look complete before it is.
+    """
+    done_path = show_cache_dir / f".done_s{season:02d}.json"
+    total = 0
+    existing: set = set()
+    if done_path.exists():
+        try:
+            raw = json.loads(done_path.read_text())
+        except (json.JSONDecodeError, ValueError, OSError):
+            return 0
+        if isinstance(raw, list):
+            existing = set(raw)
+        else:
+            existing = set(raw.get("done", []))
+            total = int(raw.get("total", 0))
+    added = set(episodes) - existing
+    if not added:
+        return 0
+    try:
+        # A show whose episodes were all described elsewhere may have no cache
+        # dir yet; _atomic_write_json writes a sibling .tmp and does not create
+        # parents.
+        done_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(done_path, {"total": total, "done": sorted(existing | added)})
+    except OSError:
+        logger.warning("Could not update done ledger %s", done_path, exc_info=True)
+        return 0
+    return len(added)
 
 
 def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -1139,9 +1238,17 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
     years_seen: set[str] = set()
     queued = 0
     skipped = 0
+    no_source = 0
     # season -> episodes whose .done entry is stale (file lost its AD track) and
     # must be cleared so the season's completion is re-evaluated honestly.
     stale_done: dict[int, set] = {}
+    # season -> episodes the files prove are described but the ledger never
+    # recorded; written back so the ledger stops disagreeing with the library.
+    healed_done: dict[int, set] = {}
+    force = bool(item.get("force"))
+    nomatch = NoMatchCache(
+        show_cache_dir / _NOMATCH_FILENAME, config.nomatch_ttl_days
+    )
     for video_path in video_files:
         marker = _parse_episode_marker(video_path.name)
         if not marker:
@@ -1153,23 +1260,46 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
             continue
 
         done_path = show_cache_dir / f".done_s{season:02d}.json"
+        done: set = set()
         if done_path.exists():
             try:
                 raw = json.loads(done_path.read_text())
                 done = set(raw) if isinstance(raw, list) else set(raw.get("done", []))
             except (json.JSONDecodeError, ValueError):
                 done = set()
-            if episode in done:
-                # A done episode whose file still carries an AD track is
-                # genuinely finished — skip it. One that has lost its AD track
-                # (a Sonarr re-grab/upgrade replaced the merged file) is a stale
-                # ledger entry: queue it for reprocessing and clear it from
-                # .done below so the zip-cleanup transition fires once at the
-                # true end of the batch, not after every re-described episode.
-                if source_has_ad_track(video_path):
-                    skipped += 1
-                    continue
-                stale_done.setdefault(season, set()).update(e for e in episodes if e in done)
+
+        # The file itself is the authority on whether the work is done; the
+        # ledger is only a record of it. Probing unconditionally (rather than
+        # only for episodes the ledger already claims) is the difference
+        # between skipping described work and re-queueing it: the ledger goes
+        # stale whenever an episode is described by a route that doesn't write
+        # it — a per-episode /retry?path= filed under a different source season
+        # left Futurama S11 with six described episodes and one ledger entry
+        # (2026-09-22).
+        if source_has_ad_track(video_path):
+            skipped += 1
+            if episode not in done:
+                # Self-heal. The probe stays unconditional on every scan — the
+                # ledger can be wrong in both directions, so it is never a
+                # fast path — but recording this keeps season completion, and
+                # with it the cached-zip cleanup accounting, honest.
+                healed_done.setdefault(season, set()).update(episodes)
+            continue
+
+        if episode in done:
+            # In the ledger but the AD track is gone — a Sonarr re-grab/upgrade
+            # replaced the merged file. Clear the entry below so the zip-cleanup
+            # transition fires once at the true end of the batch, not after
+            # every re-described episode.
+            stale_done.setdefault(season, set()).update(e for e in episodes if e in done)
+
+        # Nothing has an audio description for this file, it hasn't changed
+        # since we last looked, and the miss is recent: searching again would
+        # ask the same catalogues the same question for the same answer.
+        nomatch_key = NoMatchCache.key(season, episode)
+        if not force and nomatch.is_fresh_miss(nomatch_key, video_path):
+            no_source += 1
+            continue
 
         series_year = requested_year or _infer_series_year(
             _series_dir_of(video_path), video_path.name
@@ -1192,6 +1322,10 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
     # One write per affected season so the re-described episodes rejoin .done
     # cleanly. total is preserved (recomputed from the zip on next mark if the
     # file was legacy list-format).
+    healed = 0
+    for season, episodes in healed_done.items():
+        healed += _merge_done_entries(show_cache_dir, season, episodes)
+
     cleared = 0
     for season, episodes in stale_done.items():
         done_path = show_cache_dir / f".done_s{season:02d}.json"
@@ -1208,9 +1342,10 @@ def _worker_handle_retry_dir(item: dict, config: Config, pending: PendingQueue) 
         cleared += len(episodes)
 
     logger.info(
-        "Retry dir %s: queued %d episode(s), skipped %d already-done, "
-        "cleared %d stale done-entrie(s).",
-        scan_dir, queued, skipped, cleared,
+        "Retry dir %s: queued %d episode(s), skipped %d already-described, "
+        "skipped %d with no known source, cleared %d stale done-entrie(s), "
+        "recorded %d missing done-entrie(s).",
+        scan_dir, queued, skipped, no_source, cleared, healed,
     )
     if queued and not years_seen:
         logger.warning(

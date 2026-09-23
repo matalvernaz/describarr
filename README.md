@@ -219,6 +219,15 @@ Point `dir=` at the show root. All seasons are queued and processed in order.
 http://localhost:8686/retry?dir=/tv/ted
 ```
 
+### What a directory scan skips
+
+A rescan is meant to be cheap to repeat, so it queues only episodes that still need work. It skips:
+
+- **Episodes whose file already carries an audio-description track.** The file is the authority, not the `.done` ledger — an episode described by any route is left alone even if the ledger never recorded it, and the ledger is repaired as the scan goes.
+- **Episodes no source could cover**, for `DESCRIBARR_NOMATCH_TTL_DAYS` (default 30) after the miss. Otherwise every rescan re-runs the same fruitless search against every catalogue for a show none of them carry.
+
+Both are self-correcting. An episode whose file loses its AD track (an arr re-grab replaced the merged file) is reprocessed and cleared from the ledger. A remembered miss is discarded as soon as the file changes, so an upgrade is always searched again, and it expires anyway because catalogues do gain titles. To override the memory for one scan, add `force=1`; a single-file `path=` retry always searches.
+
 ### Movie
 
 ```
