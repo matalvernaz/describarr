@@ -113,3 +113,36 @@ def test_describing_an_episode_forgets_an_earlier_miss(tmp_path, monkeypatch):
     )
     assert not srv.NoMatchCache(cache_path, 30).is_fresh_miss(
         srv.NoMatchCache.key(1, 1), video)
+
+
+def _handler_with(headers, peer):
+    handler = srv._HookHandler.__new__(srv._HookHandler)
+    if headers is not None:
+        handler.headers = headers
+    handler.client_address = peer
+    return handler
+
+
+def test_the_request_origin_is_logged_not_the_proxy(monkeypatch):
+    """Through Traefik the socket peer is always the proxy's container IP, so
+    logging it identifies nothing. A /retry that nothing accounted for could
+    not be attributed at all (2026-09-22)."""
+    # Behind the proxy: the forwarded client wins over the socket peer.
+    handler = _handler_with({"X-Forwarded-For": "192.168.1.50, 172.18.0.4"}, ("172.18.0.4", 51000))
+    assert handler._caller() == "192.168.1.50"
+
+    # From inside the container (a cron helper on localhost): no header.
+    handler = _handler_with({}, ("127.0.0.1", 40000))
+    assert handler._caller() == "127.0.0.1"
+
+    # Called before the request line is parsed — must not raise.
+    handler = _handler_with(None, None)
+    assert handler._caller() == "-"
+
+
+def test_log_message_includes_the_origin(monkeypatch):
+    lines = []
+    monkeypatch.setattr(srv.logger, "info", lambda fmt, *a: lines.append(fmt % a))
+    handler = _handler_with({}, ("127.0.0.1", 40000))
+    handler.log_message('"%s" %s %s', "GET /retry?dir=/tv/Show HTTP/1.1", "202", "-")
+    assert lines == ['127.0.0.1 "GET /retry?dir=/tv/Show HTTP/1.1" 202 -']
