@@ -123,6 +123,14 @@ def _year_suffix(title: str) -> str:
 logger = logging.getLogger(__name__)
 
 
+# Returned as the *reason* alongside described=True when the file already
+# carried an AD track and nothing was done to it. Callers notify and log this
+# distinctly: reporting it as "described" claims a publish that never happened,
+# which is exactly how a rescan of a finished show produced a Pushover per
+# episode saying work had been done (2026-09-22).
+ALREADY_DESCRIBED = "already-described"
+
+
 def process_episode(
     client: AudioVaultClient,
     config: Config,
@@ -158,7 +166,7 @@ def process_episode(
     # or we stack a second one (duplicate webhook / mid-drain restart).
     if source_has_ad_track(video_path):
         logger.info("%s already has an audio-description track — skipping.", video_path.name)
-        return True, None
+        return True, ALREADY_DESCRIBED
     if len(all_episodes) == 1:
         logger.info("Looking up: %s S%02dE%02d", series_title, season, episode)
     else:
@@ -264,7 +272,7 @@ def process_movie(
     label = f"{movie_title} ({movie_year})" if movie_year else movie_title
     if source_has_ad_track(video_path):
         logger.info("%s already has an audio-description track — skipping.", video_path.name)
-        return True, None
+        return True, ALREADY_DESCRIBED
     logger.info("Looking up movie: %s (%s)", movie_title, movie_year)
 
     search_title = _strip_year_suffix(movie_title)

@@ -82,6 +82,12 @@ class Config:
     # log is a screen-reader-friendly audit trail replacing container-log
     # grepping; it is capped so it can't grow without bound.
     history_size: int = 50
+    # How long a "no source has audio description for this" result stays
+    # believed. Without a memory of misses, every /retry?dir= re-runs the full
+    # search for every episode no catalogue carries — 60 lookups a pass on a
+    # show that will never match. Catalogues do gain titles, so the memory
+    # expires rather than being permanent. 0 disables it (always re-search).
+    nomatch_ttl_days: int = 30
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -131,6 +137,16 @@ class Config:
         if history_size < 0:
             raise ValueError("DESCRIBARR_HISTORY_SIZE must be ≥ 0.")
 
+        raw_nomatch_ttl = os.environ.get("DESCRIBARR_NOMATCH_TTL_DAYS", "30").strip()
+        try:
+            nomatch_ttl_days = int(raw_nomatch_ttl)
+        except ValueError:
+            raise ValueError(
+                f"DESCRIBARR_NOMATCH_TTL_DAYS must be an integer; got {raw_nomatch_ttl!r}"
+            )
+        if nomatch_ttl_days < 0:
+            raise ValueError("DESCRIBARR_NOMATCH_TTL_DAYS must be ≥ 0.")
+
         return cls(
             email=email,
             password=password,
@@ -143,4 +159,5 @@ class Config:
             backup_retention_days=backup_retention_days,
             api_key=api_key,
             history_size=history_size,
+            nomatch_ttl_days=nomatch_ttl_days,
         )

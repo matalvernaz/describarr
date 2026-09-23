@@ -50,3 +50,23 @@ if "dotenv" not in sys.modules:
     dotenv = types.ModuleType("dotenv")
     dotenv.load_dotenv = lambda *a, **k: None
     sys.modules["dotenv"] = dotenv
+
+
+def fake_config(tmp_path=None, **overrides):
+    """A Config stand-in carrying every field the server/worker paths read.
+
+    Each call site used to build its own bare ``SimpleNamespace``, so adding a
+    Config field broke a dozen unrelated tests — and, worse, a fake missing a
+    field silently modelled a configuration that cannot exist. One factory
+    keeps the fakes in step with the real dataclass.
+    """
+    import types as _types
+    from pathlib import Path as _Path
+
+    base = {
+        "cache_dir": (tmp_path / "cache") if tmp_path is not None else _Path("/nonexistent"),
+        "nomatch_ttl_days": 30,
+        "history_size": 50,
+    }
+    base.update(overrides)
+    return _types.SimpleNamespace(**base)

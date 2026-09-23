@@ -11,6 +11,7 @@ Without it ``find_season`` cannot tell a show from a same-titled reboot: on
 import types
 
 import describarr.server as srv
+from conftest import fake_config
 from describarr.retry_queue import RetryQueue
 
 
@@ -142,7 +143,7 @@ def test_retry_dir_stamps_the_inferred_year_on_every_episode(tmp_path, monkeypat
     pending = _FakePending()
     srv._worker_handle_retry_dir(
         {"title": "Avatar: The Last Airbender", "dir": str(show)},
-        types.SimpleNamespace(cache_dir=tmp_path / "cache"), pending,
+        fake_config(tmp_path), pending,
     )
     assert [i["series_year"] for i in pending.pushed] == ["2005", "2005"]
 
@@ -153,7 +154,7 @@ def test_retry_dir_prefers_the_year_the_request_carried(tmp_path, monkeypatch):
     pending = _FakePending()
     srv._worker_handle_retry_dir(
         {"title": "Show", "dir": str(show), "year": "2009"},
-        types.SimpleNamespace(cache_dir=tmp_path / "cache"), pending,
+        fake_config(tmp_path), pending,
     )
     assert pending.pushed[0]["series_year"] == "2009"
 
@@ -164,12 +165,12 @@ def test_retry_dir_omits_the_key_when_no_year_is_known(tmp_path, monkeypatch):
     pending = _FakePending()
     srv._worker_handle_retry_dir(
         {"title": "Show", "dir": str(show)},
-        types.SimpleNamespace(cache_dir=tmp_path / "cache"), pending,
+        fake_config(tmp_path), pending,
     )
     assert "series_year" not in pending.pushed[0]
 
 
-def _run_retry_episode(monkeypatch, item):
+def _run_retry_episode(monkeypatch, item, tmp_path):
     seen = {}
 
     def fake_process_episode(client, config, video_path, title, season, episode, **kwargs):
@@ -179,7 +180,7 @@ def _run_retry_episode(monkeypatch, item):
     monkeypatch.setattr(srv, "process_episode", fake_process_episode)
     monkeypatch.setattr(srv, "_get_client", lambda config: object())
     monkeypatch.setattr(srv, "_notify_outcome", lambda *a, **k: None)
-    srv._worker_handle_retry_episode(item, types.SimpleNamespace(), _FakePending())
+    srv._worker_handle_retry_episode(item, fake_config(tmp_path), _FakePending())
     return seen
 
 
@@ -188,6 +189,7 @@ def test_retry_episode_passes_the_carried_year_to_process_episode(tmp_path, monk
     seen = _run_retry_episode(
         monkeypatch,
         {"title": "Show", "path": str(video), "season": 1, "episode": 1, "series_year": "2005"},
+        tmp_path,
     )
     assert seen["series_year"] == "2005"
 
@@ -196,7 +198,7 @@ def test_retry_episode_infers_the_year_for_an_item_queued_without_one(tmp_path, 
     # Items queued before the year travelled with them; the layout still knows it.
     _, video = _layout(tmp_path, filename="Show (2005) - S01E01.mkv")
     seen = _run_retry_episode(
-        monkeypatch, {"title": "Show", "path": str(video), "season": 1, "episode": 1},
+        monkeypatch, {"title": "Show", "path": str(video), "season": 1, "episode": 1}, tmp_path,
     )
     assert seen["series_year"] == "2005"
 
@@ -204,7 +206,7 @@ def test_retry_episode_infers_the_year_for_an_item_queued_without_one(tmp_path, 
 def test_retry_episode_without_any_year_passes_an_empty_string(tmp_path, monkeypatch):
     _, video = _layout(tmp_path)
     seen = _run_retry_episode(
-        monkeypatch, {"title": "Show", "path": str(video), "season": 1, "episode": 1},
+        monkeypatch, {"title": "Show", "path": str(video), "season": 1, "episode": 1}, tmp_path,
     )
     assert seen["series_year"] == ""
 
@@ -222,15 +224,15 @@ def test_daily_limit_requeue_keeps_the_year(tmp_path, monkeypatch):
     monkeypatch.setattr(srv, "_get_retry_queue", lambda config: queue)
     srv._worker_handle_retry_episode(
         {"title": "Show", "path": str(video), "season": 1, "episode": 1},
-        types.SimpleNamespace(), _FakePending(),
+        fake_config(tmp_path), _FakePending(),
     )
     assert queue.load()[0]["series_year"] == "2005"
 
 
-def _handler(monkeypatch, pending):
+def _handler(monkeypatch, pending, tmp_path):
     monkeypatch.setattr(srv, "_get_pending_queue", lambda config: pending)
     monkeypatch.setattr(
-        srv, "Config", types.SimpleNamespace(from_env=lambda: types.SimpleNamespace()),
+        srv, "Config", types.SimpleNamespace(from_env=lambda: fake_config(tmp_path)),
     )
     handler = srv._HookHandler.__new__(srv._HookHandler)
     handler.responses = []
@@ -244,7 +246,7 @@ def test_handle_retry_carries_the_filename_year_on_a_single_episode(tmp_path, mo
         filename="Avatar The Last Airbender (2005) - S01E01.mkv",
     )
     pending = _FakePending()
-    handler = _handler(monkeypatch, pending)
+    handler = _handler(monkeypatch, pending, tmp_path)
     handler._handle_retry({"path": str(video)})
     assert handler.responses[0][0] == 202
     assert pending.pushed[0]["type"] == "retry_episode"
@@ -254,7 +256,7 @@ def test_handle_retry_carries_the_filename_year_on_a_single_episode(tmp_path, mo
 def test_handle_retry_carries_an_explicit_year_on_a_directory(tmp_path, monkeypatch):
     show, _ = _layout(tmp_path)
     pending = _FakePending()
-    handler = _handler(monkeypatch, pending)
+    handler = _handler(monkeypatch, pending, tmp_path)
     handler._handle_retry({"dir": str(show), "title": "Show", "year": "2005"})
     assert handler.responses[0][0] == 202
     assert pending.pushed[0]["type"] == "retry_dir"
@@ -264,6 +266,6 @@ def test_handle_retry_carries_an_explicit_year_on_a_directory(tmp_path, monkeypa
 def test_handle_retry_leaves_the_year_off_when_nothing_knows_it(tmp_path, monkeypatch):
     show, _ = _layout(tmp_path)
     pending = _FakePending()
-    handler = _handler(monkeypatch, pending)
+    handler = _handler(monkeypatch, pending, tmp_path)
     handler._handle_retry({"dir": str(show), "title": "Show"})
     assert "year" not in pending.pushed[0]
