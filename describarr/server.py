@@ -1056,8 +1056,12 @@ def _outcome_for(config: Config, path_str: str) -> dict:
     job = _current_job
     if job and outcome_key(job.get("path", "")) == wanted:
         return {"state": "working", "detail": "", "at": job.get("started_at", "")}
-    if any(outcome_key(_queued_path(item)) == wanted
-           for item in _get_pending_queue(config).load()):
+    pending = _get_pending_queue(config)
+    # Claimed but not yet the current job: logging in, or searching, before
+    # the work that sets it has begun.
+    if any(outcome_key(_queued_path(item)) == wanted for item in pending.inflight()):
+        return {"state": "working", "detail": "", "at": ""}
+    if any(outcome_key(_queued_path(item)) == wanted for item in pending.load()):
         return {"state": "queued", "detail": "", "at": ""}
     if any(outcome_key(item.get("video_path", "")) == wanted
            for item in _get_retry_queue(config).load()):

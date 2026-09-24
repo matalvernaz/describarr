@@ -126,6 +126,16 @@ class PendingQueue:
         with self._lock:
             return len(self._load())
 
+    def inflight(self) -> list[dict]:
+        """Items the worker has claimed and not yet acknowledged.
+
+        Between a claim and the job it starts there is a login and a search,
+        and an item in that gap is neither waiting nor the current job; /outcome
+        reads it here so it does not answer "unknown" about work under way.
+        """
+        with self._lock:
+            return self._load_inflight()
+
     # ── enqueue ────────────────────────────────────────────────────────
 
     def push(self, item: dict) -> int:
