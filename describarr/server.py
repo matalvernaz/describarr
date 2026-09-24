@@ -28,6 +28,7 @@ from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, Lo
 from .config import Config
 from .decision_log import DecisionLog
 from .nomatch_cache import NoMatchCache
+from .outcome_log import OutcomeLog, key as outcome_key
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
 from .workflow import ALREADY_DESCRIBED, drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _atomic_write_json, _MAX_DRAIN_PASSES
@@ -493,6 +494,8 @@ class _HookHandler(BaseHTTPRequestHandler):
             self._handle_status()
         elif path == "/queue":
             self._handle_queue_get()
+        elif path == "/outcome":
+            self._handle_outcome(params)
         elif path == "/retry":
             if not self._authorized():
                 return
@@ -592,6 +595,19 @@ class _HookHandler(BaseHTTPRequestHandler):
             self._respond_json(200, data)
         else:
             self._respond_html(200, _render_status_html(data))
+
+    def _handle_outcome(self, params: dict) -> None:
+        """What became of one file. Read-only, like /status and /queue."""
+        path_str = params.get("path", "").strip()
+        if not outcome_key(path_str):
+            self._respond(400, "path is required.")
+            return
+        try:
+            config = Config.from_env()
+        except ValueError as exc:
+            self._respond(500, str(exc))
+            return
+        self._respond_json(200, _outcome_for(config, path_str))
 
     def _handle_queue_get(self) -> None:
         try:
@@ -952,7 +968,7 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
 
     client = _get_client(config)
     try:
-        with _set_current_job({"type": "episode", "title": series_title, "season": season, "episode": primary_episode}):
+        with _set_current_job({"type": "episode", "title": series_title, "season": season, "episode": primary_episode, "path": str(video_path)}):
             described, reason = process_episode(
                 client, config, video_path,
                 series_title, season, primary_episode,
@@ -968,11 +984,12 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
         _get_retry_queue(config).add_episodes(
             series_title, season, episodes, str(video_path), series_year=series_year,
         )
-        return {"label": label, "outcome": "queued"}
+        return {"label": label, "outcome": "queued", "path": str(video_path)}
     return {
         "label": label,
         "outcome": _episode_outcome(described, reason),
         "reason": reason,
+        "path": str(video_path),
     }
 
 
@@ -993,15 +1010,16 @@ def _radarr(config: Config, env: dict[str, str]) -> dict | None:
     label = f"{movie_title} ({movie_year})" if movie_year else movie_title
     client = _get_client(config)
     try:
-        with _set_current_job({"type": "movie", "title": movie_title, "year": movie_year}):
+        with _set_current_job({"type": "movie", "title": movie_title, "year": movie_year, "path": str(video_path)}):
             described, reason = process_movie(client, config, video_path, movie_title, movie_year)
     except DailyLimitReached:
         _get_retry_queue(config).add_movie(movie_title, movie_year, str(video_path))
-        return {"label": label, "outcome": "queued"}
+        return {"label": label, "outcome": "queued", "path": str(video_path)}
     return {
         "label": label,
         "outcome": _episode_outcome(described, reason),
         "reason": reason,
+        "path": str(video_path),
     }
 
 
@@ -1016,6 +1034,42 @@ def _episode_outcome(described: bool, reason: Optional[str]) -> str:
     if not described:
         return "no_match"
     return "already_described" if reason == ALREADY_DESCRIBED else "described"
+
+
+def _queued_path(item: dict) -> str:
+    """The file a pending item is for, whichever way it was queued."""
+    if item.get("type") in ("retry_movie", "retry_episode"):
+        return item.get("path", "")
+    env = item.get("env") or {}
+    return env.get("radarr_moviefile_path") or env.get("sonarr_episodefile_path") or ""
+
+
+def _outcome_for(config: Config, path_str: str) -> dict:
+    """The state of one file, as a client reads it.
+
+    Being worked on, then waiting its turn, then how it last ended, in that
+    order: a file asked for again after a miss is waiting, not missed. A
+    ``no_match`` with a reason is a candidate that was found and refused, which
+    a client says differently from finding nothing at all. See `outcome_log`.
+    """
+    wanted = outcome_key(path_str)
+    job = _current_job
+    if job and outcome_key(job.get("path", "")) == wanted:
+        return {"state": "working", "detail": "", "at": job.get("started_at", "")}
+    if any(outcome_key(_queued_path(item)) == wanted
+           for item in _get_pending_queue(config).load()):
+        return {"state": "queued", "detail": "", "at": ""}
+    if any(outcome_key(item.get("video_path", "")) == wanted
+           for item in _get_retry_queue(config).load()):
+        return {"state": "queued",
+                "detail": "Waiting for the next day's download allowance.", "at": ""}
+    entry = OutcomeLog.in_cache(config.cache_dir).get(path_str)
+    if entry is None:
+        return {"state": "unknown", "detail": "", "at": ""}
+    outcome = entry.get("outcome", "")
+    detail = entry.get("detail", "")
+    state = "rejected" if outcome == "no_match" and detail else outcome
+    return {"state": state, "detail": detail, "at": entry.get("at", "")}
 
 
 # Per-show record of episodes no source could cover, beside that show's
@@ -1056,9 +1110,13 @@ def _log_terminal_decision(config: Config, label: str, outcome: str, reason: Opt
         logger.debug("Terminal decision-log write failed.", exc_info=True)
 
 
-def _notify_outcome(config: Config, label: str, outcome: str, reason: Optional[str] = None) -> None:
+def _notify_outcome(
+    config: Config, label: str, outcome: str, reason: Optional[str] = None,
+    path: str | Path | None = None,
+) -> None:
     """Send the Pushover for an outcome (with the specific cause appended when
-    known) and record the terminal decision for the /status audit trail."""
+    known), record the terminal decision for the /status audit trail, and,
+    where the file is known, keep it as that file's latest for /outcome."""
     if reason == ALREADY_DESCRIBED:
         # The sentinel is a signal to this function, not prose for the operator.
         reason = None
@@ -1066,6 +1124,9 @@ def _notify_outcome(config: Config, label: str, outcome: str, reason: Optional[s
     message = f"{base} ({reason})" if reason else base
     notify.send(f"describarr: {label}", message)
     _log_terminal_decision(config, label, outcome, reason)
+    if path:
+        OutcomeLog.in_cache(config.cache_dir).record(
+            path, outcome, detail=reason or "", label=label)
 
 
 def _worker_handle_hook(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -1089,7 +1150,9 @@ def _worker_handle_hook(item: dict, config: Config, pending: PendingQueue) -> No
     if not result:
         return
 
-    _notify_outcome(config, result["label"], result["outcome"], result.get("reason"))
+    _notify_outcome(
+        config, result["label"], result["outcome"], result.get("reason"),
+        path=result.get("path"))
 
 
 def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -1116,7 +1179,7 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
     client = _get_client(config)
     label = f"{title} S{season:02d}" + "".join(f"E{e:02d}" for e in [episode, *extra_episodes])
     try:
-        with _set_current_job({"type": "episode", "title": title, "season": season, "episode": episode}):
+        with _set_current_job({"type": "episode", "title": title, "season": season, "episode": episode, "path": str(video_path)}):
             described, reason = process_episode(
                 client, config, video_path, title, season, episode,
                 extra_episodes=extra_episodes, series_year=series_year,
@@ -1125,7 +1188,7 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
         _get_retry_queue(config).add_episodes(
             title, season, [episode, *extra_episodes], str(video_path), series_year=series_year,
         )
-        _notify_outcome(config, label, "queued")
+        _notify_outcome(config, label, "queued", path=video_path)
         return
     nomatch = NoMatchCache(
         config.cache_dir / "shows" / _safe_dirname(title) / _NOMATCH_FILENAME,
@@ -1144,7 +1207,7 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
         for key in keys:
             nomatch.record_miss(key, video_path)
 
-    _notify_outcome(config, label, _episode_outcome(described, reason), reason)
+    _notify_outcome(config, label, _episode_outcome(described, reason), reason, path=video_path)
 
 
 def _worker_handle_retry_movie(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -1160,13 +1223,13 @@ def _worker_handle_retry_movie(item: dict, config: Config, pending: PendingQueue
     client = _get_client(config)
     label = f"{title} ({year_str})" if year_str else title
     try:
-        with _set_current_job({"type": "movie", "title": title, "year": year_str}):
+        with _set_current_job({"type": "movie", "title": title, "year": year_str, "path": str(video_path)}):
             described, reason = process_movie(client, config, video_path, title, year_str)
     except DailyLimitReached:
         _get_retry_queue(config).add_movie(title, year_str, str(video_path))
-        _notify_outcome(config, label, "queued")
+        _notify_outcome(config, label, "queued", path=video_path)
         return
-    _notify_outcome(config, label, _episode_outcome(described, reason), reason)
+    _notify_outcome(config, label, _episode_outcome(described, reason), reason, path=video_path)
 
 
 def _merge_done_entries(show_cache_dir: Path, season: int, episodes: set) -> int:

@@ -52,7 +52,7 @@ def test_a_skipped_episode_is_notified_as_skipped_not_described(tmp_path, monkey
     monkeypatch.setattr(srv, "_get_client", lambda config: object())
     monkeypatch.setattr(
         srv, "_notify_outcome",
-        lambda config, label, outcome, reason=None: outcomes.append(outcome),
+        lambda config, label, outcome, reason=None, path=None: outcomes.append(outcome),
     )
 
     srv._worker_handle_retry_episode(

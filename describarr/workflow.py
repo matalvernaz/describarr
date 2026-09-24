@@ -41,6 +41,7 @@ from .aligner import (
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
 from .decision_log import DecisionLog
+from .outcome_log import OutcomeLog
 from .matcher import extract_episode, find_movie, find_season
 from .retry_queue import RetryQueue
 from .sources import load_extra_sources
@@ -1225,6 +1226,24 @@ def _atomic_write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
+def _record_drained(config, video_path: Path, described: bool,
+                    reason: Optional[str], label: str) -> None:
+    """Keep a drained item's outcome as its file's latest. See `outcome_log`.
+
+    Quietly skipped without a cache directory, which only a test's stand-in
+    config lacks; the record must never be why a drain fails.
+    """
+    cache_dir = getattr(config, "cache_dir", None)
+    if cache_dir is None:
+        return
+    if described:
+        outcome = "already_described" if reason == ALREADY_DESCRIBED else "described"
+    else:
+        outcome = "no_match"
+    OutcomeLog.in_cache(cache_dir).record(
+        video_path, outcome, detail="" if described else (reason or ""), label=label)
+
+
 def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Config) -> None:
     """
     Process items that were previously skipped due to the daily download limit.
@@ -1318,6 +1337,9 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                 described_labels.append(_queue_item_label(item))
             else:
                 no_match += 1
+            # And keep it as the file's latest, so whoever asked can be told:
+            # the drain is where a request that hit the daily cap ends.
+            _record_drained(config, video_path, described, _reason, _queue_item_label(item))
         except DailyLimitReached:
             if cap_key is not None:
                 capped_keys.add(cap_key)
