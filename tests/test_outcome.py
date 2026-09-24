@@ -11,15 +11,19 @@ from describarr.outcome_log import OutcomeLog
 
 
 class _Queue:
-    def __init__(self, items=None):
+    def __init__(self, items=None, claimed=None):
         self.items = list(items or [])
+        self.claimed = list(claimed or [])
 
     def load(self):
         return list(self.items)
 
+    def inflight(self):
+        return list(self.claimed)
 
-def _quiet(monkeypatch, pending=None, retry=None):
-    monkeypatch.setattr(srv, "_get_pending_queue", lambda config: _Queue(pending))
+
+def _quiet(monkeypatch, pending=None, retry=None, claimed=None):
+    monkeypatch.setattr(srv, "_get_pending_queue", lambda config: _Queue(pending, claimed))
     monkeypatch.setattr(srv, "_get_retry_queue", lambda config: _Queue(retry))
     monkeypatch.setattr(srv, "_current_job", None)
     monkeypatch.setattr(srv.notify, "send", lambda *args, **kwargs: None)
@@ -152,3 +156,26 @@ def test_a_drained_request_is_kept_as_its_files_outcome(tmp_path, monkeypatch):
 
     entry = OutcomeLog.in_cache(tmp_path).get("/media/movies/Heat.mkv")
     assert entry["outcome"] == "no_match"
+
+
+def test_a_claimed_item_is_under_way_not_unknown(tmp_path, monkeypatch):
+    """Between the worker's claim and the job it starts there is a login and a
+    search. Measured on the first live request: "unknown" in that gap."""
+    _quiet(monkeypatch, claimed=[{"type": "retry_movie", "title": "Heat",
+                                  "path": "/media/movies/Heat.mkv"}])
+    config = fake_config(cache_dir=tmp_path)
+
+    assert srv._outcome_for(config, "/media/movies/Heat.mkv")["state"] == "working"
+
+
+def test_the_real_queue_reports_what_it_has_claimed(tmp_path):
+    from describarr.pending_queue import PendingQueue
+
+    queue = PendingQueue(tmp_path / "pending.json")
+    queue.push({"type": "retry_movie", "path": "/movies/Heat.mkv"})
+    claimed = queue.claim_first()
+
+    assert queue.inflight() == [claimed]
+    assert queue.load() == []
+    queue.ack(claimed)
+    assert queue.inflight() == []
