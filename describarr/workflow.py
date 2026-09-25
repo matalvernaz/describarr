@@ -100,26 +100,30 @@ def _should_abandon_stale(item: dict) -> bool:
     item["drain_passes"] = passes
     return passes > _MAX_DRAIN_PASSES
 
-# Trailing "(YYYY)" tokens in the title break AudioVault's search index. The
-# year stripping is applied defensively here even though callers usually pass
-# the title and year separately, because the /retry endpoint and some Sonarr/
-# Radarr setups can pass a year-suffixed title through verbatim.
-_TITLE_YEAR_SUFFIX_RE = re.compile(r"\s*\((\d{4})\)\s*$")
+# Sonarr disambiguates a series with trailing "(YYYY)" and "(CC)" country
+# qualifiers, alone or together ("Archer (2009)", "Heartland (2007) (CA)").
+# AudioVault's search matches none of them, so they are stripped from the
+# query; the matcher still sees the full title. Callers usually pass the title
+# and year separately, but the /retry endpoint and some Sonarr/Radarr setups
+# pass a qualified title through verbatim.
+_TITLE_QUALIFIERS_RE = re.compile(r"(?:\s*\((?:\d{4}|[A-Z]{2})\))+\s*$")
+_QUALIFIER_YEAR_RE = re.compile(r"\((\d{4})\)")
 
 
-def _strip_year_suffix(title: str) -> str:
-  """Return *title* with a trailing ``(YYYY)`` token removed."""
-  return _TITLE_YEAR_SUFFIX_RE.sub("", title).strip()
+def _strip_title_qualifiers(title: str) -> str:
+  """Return *title* without its trailing ``(YYYY)`` / ``(CC)`` qualifiers."""
+  return _TITLE_QUALIFIERS_RE.sub("", title).strip() or title
 
 
 def _year_suffix(title: str) -> str:
-  """The trailing ``(YYYY)`` year in *title*, or "" if it has none.
+  """The ``(YYYY)`` year among *title*'s trailing qualifiers, or "" if none.
 
   Sonarr names some series with the disambiguating year already attached, so
   this recovers a series year even where the webhook carries no explicit one.
   """
-  match = _TITLE_YEAR_SUFFIX_RE.search(title)
-  return match.group(1) if match and match.groups() else ""
+  match = _TITLE_QUALIFIERS_RE.search(title)
+  year = _QUALIFIER_YEAR_RE.search(match.group(0)) if match else None
+  return year.group(1) if year else ""
 
 logger = logging.getLogger(__name__)
 
@@ -174,8 +178,8 @@ def process_episode(
         ep_label = "".join(f"E{e:02d}" for e in all_episodes)
         logger.info("Looking up: %s S%02d%s (multi-episode)", series_title, season, ep_label)
 
-    search_title = _strip_year_suffix(series_title)
-    stripped_note = " (year stripped)" if search_title != series_title else ""
+    search_title = _strip_title_qualifiers(series_title)
+    stripped_note = f" (searched as {search_title!r})" if search_title != series_title else ""
     # An empty AudioVault result is not the end of the search: extra sources
     # are tried below and a show AudioVault has never heard of is exactly the
     # case a private provider exists to cover. Returning here skipped them.
@@ -276,8 +280,8 @@ def process_movie(
         return True, ALREADY_DESCRIBED
     logger.info("Looking up movie: %s (%s)", movie_title, movie_year)
 
-    search_title = _strip_year_suffix(movie_title)
-    stripped_note = " (year stripped)" if search_title != movie_title else ""
+    search_title = _strip_title_qualifiers(movie_title)
+    stripped_note = f" (searched as {search_title!r})" if search_title != movie_title else ""
     # As in process_episode: no AudioVault match means fall through to the
     # extra sources, not give up.
     results = client.search_movies(search_title)
