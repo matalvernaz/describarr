@@ -62,6 +62,7 @@ def test_resource_kill_aborts_candidate_walk(monkeypatch, tmp_path):
     described, reason = process_movie(client, config, video, "Movie", "2020")
     assert not described
     assert "killed by signal" in reason
+    assert isinstance(reason, workflow.EngineFailure)
     assert len(downloads) == 1  # no further download slots burned
 
 

@@ -123,6 +123,18 @@ def _read_metrics(report: Optional[Path]) -> Optional[dict]:
     return metrics
 
 
+class EngineFailure(str):
+    """A failure reason meaning the engine failed, not that a candidate was refused.
+
+    The run crashed, timed out, was killed or produced no usable output, so
+    nothing was judged. Callers report it as an error: a crash told as "found,
+    but it did not match" sends a listener to look again for a source that was
+    never in doubt (Heartland S10E14, 2026-09-24). The engine's own
+    ``*.fail.json`` diagnosis is a judgment of the inputs and stays a plain
+    reason. In every other respect it is just the message.
+    """
+
+
 class AlignResult:
     """Outputs of a describealaign run.
 
@@ -213,7 +225,7 @@ def run(
             "describealaign not found. Install it with: pip install describealaign"
         )
         _cleanup_run_dir(run_output_dir)
-        return AlignResult(None, None, "describealign is not installed")
+        return AlignResult(None, None, EngineFailure("describealign is not installed"))
     except subprocess.TimeoutExpired:
         logger.error(
             "describealaign timed out after %d seconds — process group killed.",
@@ -222,7 +234,7 @@ def run(
         _cleanup_run_dir(run_output_dir)
         return AlignResult(
             None, None,
-            f"alignment timed out after {_SUBPROCESS_TIMEOUT_SEC // 60} minutes",
+            EngineFailure(f"alignment timed out after {_SUBPROCESS_TIMEOUT_SEC // 60} minutes"),
         )
 
     if stdout:
@@ -241,7 +253,7 @@ def run(
         if reason:
             logger.error("describealaign could not align %s: %s", video_path.name, reason)
         else:
-            reason = f"alignment failed (describealaign exit {returncode})"
+            reason = EngineFailure(f"alignment failed (describealaign exit {returncode})")
             # No diagnosis sidecar means the engine crashed rather than rejected
             # the inputs. Its traceback is in stderr; at DEBUG nobody sees it in
             # production (Snow White, 2026-09-15: two "exit 1" runs with no cause
@@ -259,12 +271,12 @@ def run(
     output = _find_output(video_path, run_output_dir, run_start)
     if output is None:
         _cleanup_run_dir(run_output_dir)
-        return AlignResult(None, None, "describealign produced no output file")
+        return AlignResult(None, None, EngineFailure("describealign produced no output file"))
 
     if not _validate_media_output(video_path, output):
         # The output is structurally broken — refuse to publish it.
         _cleanup_run_dir(run_output_dir)
-        return AlignResult(None, None, "alignment output failed validation")
+        return AlignResult(None, None, EngineFailure("alignment output failed validation"))
 
     report = _find_report(video_path, alignment_dir, min_mtime=run_start)
     # NOTE: caller is responsible for cleaning up `output` (and its parent

@@ -179,3 +179,53 @@ def test_the_real_queue_reports_what_it_has_claimed(tmp_path):
     assert queue.load() == []
     queue.ack(claimed)
     assert queue.inflight() == []
+
+
+def test_an_engine_failure_is_an_error_not_a_rejection(tmp_path, monkeypatch):
+    """Heartland S10E14 (2026-09-24): the engine crashed after a sound match
+    and the file was filed as refused, so a listener was told the source did
+    not match and to look again."""
+    _quiet(monkeypatch)
+    sent = []
+    monkeypatch.setattr(srv.notify, "send", lambda title, message: sent.append(message))
+    config = fake_config(cache_dir=tmp_path)
+    crash = srv.EngineFailure("alignment failed (describealaign exit 1)")
+
+    outcome = srv._episode_outcome(False, crash)
+    srv._notify_outcome(config, "Heartland S10E14", outcome, crash, path="/tv/S10E14.mkv")
+
+    state = srv._outcome_for(config, "/media/TV shows/S10E14.mkv")
+    assert outcome == "error"
+    assert state["state"] == "error"
+    assert state["detail"] == "alignment failed (describealaign exit 1)"
+    assert "no audio description available" not in sent[0]
+    assert srv._episode_outcome(False, "similarity 12.0% — no trusted sync signal") == "no_match"
+
+
+def test_a_drained_engine_failure_is_kept_as_an_error(tmp_path, monkeypatch):
+    import describarr.workflow as wf
+
+    class _Retry:
+        def __init__(self, items):
+            self.items = items
+
+        def load(self):
+            return list(self.items)
+
+        def save(self, items):
+            self.items = items
+
+        def clear(self):
+            self.items = []
+
+    film = tmp_path / "Heat.mkv"
+    film.write_bytes(b"x")
+    crash = wf.EngineFailure("alignment failed (describealaign exit 1)")
+    monkeypatch.setattr(wf, "process_movie", lambda *args, **kwargs: (False, crash))
+    queue = _Retry([{"type": "movie", "movie_title": "Heat", "movie_year": "1995",
+                     "video_path": str(film)}])
+
+    wf.drain_retry_queue(queue, client=None, config=fake_config(cache_dir=tmp_path))
+
+    entry = OutcomeLog.in_cache(tmp_path).get("/media/movies/Heat.mkv")
+    assert entry["outcome"] == "error"

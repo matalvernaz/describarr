@@ -29,6 +29,7 @@ from typing import Optional
 import requests
 
 from .aligner import (
+    EngineFailure,
     run as align,
     parse_score,
     content_score,
@@ -257,6 +258,8 @@ def process_episode(
                 source.close()
     except (AlignmentResourceKill, SourceVanished) as exc:
         logger.error("Aborting candidate walk for %s: %s", video_path.name, exc)
+        if isinstance(exc, AlignmentResourceKill):
+            return False, EngineFailure(str(exc))
         return False, str(exc)
 
     return False, last_reason
@@ -331,6 +334,8 @@ def process_movie(
                 source.close()
     except (AlignmentResourceKill, SourceVanished) as exc:
         logger.error("Aborting candidate walk for %s: %s", video_path.name, exc)
+        if isinstance(exc, AlignmentResourceKill):
+            return False, EngineFailure(str(exc))
         return False, str(exc)
 
     return False, last_reason
@@ -887,7 +892,7 @@ def _align_and_keep(
     result = align(video_path, audio_path, tmp_output_dir, alignment_dir, config.stretch_audio)
     if result is None or result.output is None:
         reason = (result.failure_reason if result is not None else None) \
-            or "alignment produced no validated output"
+            or EngineFailure("alignment produced no validated output")
         logger.error("Alignment produced no validated output file: %s", reason)
         _log_decision(config, entry_title, "failed", reason)
         if result is not None and result.returncode is not None and result.returncode < 0:
@@ -1243,7 +1248,7 @@ def _record_drained(config, video_path: Path, described: bool,
     if described:
         outcome = "already_described" if reason == ALREADY_DESCRIBED else "described"
     else:
-        outcome = "no_match"
+        outcome = "error" if isinstance(reason, EngineFailure) else "no_match"
     OutcomeLog.in_cache(cache_dir).record(
         video_path, outcome, detail="" if described else (reason or ""), label=label)
 
