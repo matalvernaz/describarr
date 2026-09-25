@@ -6,3 +6,4 @@ dist/
 
 # Private source — credentials and implementation kept off the public repo
 describarr/living_audio.py
+tests/test_living_audio_private.py
