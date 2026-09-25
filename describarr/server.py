@@ -32,7 +32,7 @@ from .outcome_log import OutcomeLog, key as outcome_key
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
 from .workflow import ALREADY_DESCRIBED, drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _atomic_write_json, _MAX_DRAIN_PASSES
-from .aligner import source_has_ad_track
+from .aligner import EngineFailure, source_has_ad_track
 
 logger = logging.getLogger(__name__)
 
@@ -1029,10 +1029,10 @@ def _episode_outcome(described: bool, reason: Optional[str]) -> str:
     ``described=True`` with the ALREADY_DESCRIBED sentinel means the guard in
     process_episode/process_movie found an existing AD track and returned
     without doing anything. Reporting that as "described" claims a publish that
-    never happened.
+    never happened. An EngineFailure reason is an error, not a rejection.
     """
     if not described:
-        return "no_match"
+        return "error" if isinstance(reason, EngineFailure) else "no_match"
     return "already_described" if reason == ALREADY_DESCRIBED else "described"
 
 
@@ -1106,6 +1106,8 @@ def _log_terminal_decision(config: Config, label: str, outcome: str, reason: Opt
         return
     if outcome == "no_match" and reason:
         return
+    if isinstance(reason, EngineFailure):
+        return  # the failed attempt is already logged
     try:
         DecisionLog(config.cache_dir / "decisions.json", config.history_size).append({
             "title": label, "outcome": outcome, "detail": reason or "",

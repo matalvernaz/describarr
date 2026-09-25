@@ -19,6 +19,7 @@ def test_engine_crash_traceback_is_logged_at_error(tmp_path, monkeypatch, caplog
         res = aligner.run(video, audio, tmp_path / "out", tmp_path / "align", stretch_audio=True)
 
     assert res.output is None and res.returncode == 1
+    assert isinstance(res.failure_reason, aligner.EngineFailure)
     errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
     assert any("ValueError: boom" in m for m in errors), errors
 
@@ -36,4 +37,6 @@ def test_engine_rejection_with_sidecar_does_not_dump_stderr(tmp_path, monkeypatc
         res = aligner.run(video, audio, tmp_path / "out", tmp_path / "align", stretch_audio=True)
 
     assert res.failure_reason == "AD audio is 95% silence"
+    # The engine judged the inputs; that is a rejection, not a failure.
+    assert not isinstance(res.failure_reason, aligner.EngineFailure)
     assert not any("some engine noise" in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
