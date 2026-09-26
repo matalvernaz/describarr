@@ -38,6 +38,8 @@ from .aligner import (
     undescribed_seconds,
     undescribed_spans,
     source_has_ad_track,
+    piecewise_rate_fraction,
+    primary_audio_is_english,
 )
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
@@ -46,6 +48,7 @@ from .outcome_log import OutcomeLog
 from .matcher import extract_episode, find_movie, find_season
 from .retry_queue import RetryQueue
 from .sources import load_extra_sources
+from .titles import donor_episode_title, episode_title_from_filename, titles_agree
 
 # Errors we treat as transient (re-queue and retry on next drain).
 # AudioVault occasional 5xx, a flaky Cloudflare edge, or a stalled CDN
@@ -146,9 +149,16 @@ def process_episode(
     episode: int,
     extra_episodes: Optional[list[int]] = None,
     series_year: str = "",
+    episode_title: str = "",
 ) -> tuple[bool, Optional[str]]:
     """
     Find and align the audio description for a single TV episode.
+
+    *episode_title* is Sonarr's title for the episode when the hook sent one;
+    otherwise it is read from the release filename, and it may stay empty. It
+    is evidence only: it lets a low-scoring donor that names this episode be
+    accepted, and stops the positional fallback handing over a file that names
+    a different one.
 
     *series_year* is the year the series began (Sonarr's ``sonarr_series_year``).
     It disambiguates a reboot that shares its parent's title and season
@@ -178,6 +188,9 @@ def process_episode(
     else:
         ep_label = "".join(f"E{e:02d}" for e in all_episodes)
         logger.info("Looking up: %s S%02d%s (multi-episode)", series_title, season, ep_label)
+
+    title = episode_title or episode_title_from_filename(video_path.name)
+    tried: set[str] = set()
 
     search_title = _strip_title_qualifiers(series_title)
     stripped_note = f" (searched as {search_title!r})" if search_title != series_title else ""
@@ -212,13 +225,19 @@ def process_episode(
             except DailyLimitReached:
                 raise
             extract_dir = zip_cache_dir / f"season_{season:02d}" / _safe_dirname(candidate["name"])
-            audio_path = _episode_donor(zip_path, extract_dir, all_episodes, label)
+            audio_path = _episode_donor(
+                zip_path, extract_dir, all_episodes, label, episode_title=title,
+            )
             if not audio_path:
                 logger.warning(
                     "%r cannot cover %s — trying next candidate.", candidate["name"], label
                 )
                 continue
-            published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+            if _already_tried(audio_path, tried, label):
+                continue
+            published, reason = _align_and_keep(
+                config, video_path, audio_path, label=label, episode_title=title,
+            )
             if published:
                 for ep in all_episodes:
                     _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
@@ -244,7 +263,11 @@ def process_episode(
                         config.cache_dir, series_title, season, episode
                     )
                 for audio_path in source_candidates:
-                    published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+                    if _already_tried(audio_path, tried, label):
+                        continue
+                    published, reason = _align_and_keep(
+                        config, video_path, audio_path, label=label, episode_title=title,
+                    )
                     if published:
                         # An extra source may deliver a bare per-episode file with
                         # no season zip; still record every covered episode in the
@@ -308,12 +331,15 @@ def process_movie(
         )
 
     last_reason: Optional[str] = None
+    tried: set[str] = set()
     try:
         for candidate in candidates[:_MAX_MOVIE_CANDIDATES]:
             try:
                 audio_path = _get_cached(client, candidate["url"], movie_cache_dir, limiter)
             except DailyLimitReached:
                 raise
+            if _already_tried(audio_path, tried, label):
+                continue
             published, reason = _align_and_keep(config, video_path, audio_path, label=label)
             if published:
                 return True, reason
@@ -326,6 +352,8 @@ def process_movie(
                 for audio_path in source.movie_candidates(
                     config.cache_dir, movie_title, movie_year
                 ):
+                    if _already_tried(audio_path, tried, label):
+                        continue
                     published, reason = _align_and_keep(config, video_path, audio_path, label=label)
                     if published:
                         return True, reason
@@ -357,6 +385,23 @@ _NATIVE_RATE_TOLERANCE = 0.5      # |median_rate| ≤ this ⇒ native-rate (comm
 _DRIFT_RATE_MIN = 2.0             # PAL/NTSC rate conversion is ~4.27%
 _DRIFT_RATE_MAX = 6.0             # anything past this is not a standard rate shift → reject
 
+# Mixed-rate rescue: per-act broadcast time compression (see
+# aligner.piecewise_rate_fraction). Same score and runtime floors as the drift
+# rescue; the uniform-trunk requirement is replaced by "nearly all of the
+# runtime is long straight segments within the compression band".
+_MIXED_RATE_MIN_FRACTION = 90.0
+# No seam-sized holes beyond the ordinary: every mixed-rate episode on the
+# 2026-09-26 replay (20 of them) had >= 99.6 % coverage.
+_MIXED_RATE_MIN_COVERAGE = 99.0
+
+# Corroborated rescue: similarity below the rescue floor over one native-rate
+# line, accepted only with two checks the score cannot give — the donor's own
+# filename names this episode, and the aligned (first) audio track is English.
+# 20 % is describealaign's own "mismatched" line; nothing below it is rescued.
+_CORROBORATED_MIN_SCORE = 20.0
+_CORROBORATED_MIN_STABLE_FRACTION = 99.0
+_CORROBORATED_MIN_COVERAGE = 99.0
+
 
 def _acceptance_decision(
     *,
@@ -367,6 +412,9 @@ def _acceptance_decision(
     total_runtime: float,
     sync_ok: bool,
     min_score: float,
+    piecewise_fraction: float = 0.0,
+    title_corroborated: bool = False,
+    primary_audio_english: bool = False,
 ) -> tuple[bool, str, str]:
     """Decide whether an alignment is good enough to overwrite the original.
 
@@ -384,6 +432,19 @@ def _acceptance_decision(
     native (commercial-break-seam case) or a *bounded* known drift
     (PAL/NTSC). content_coverage is informational only — "few seam
     artifacts" says nothing about whether the narration lands on time.
+
+    Two narrower paths follow, each for one measured cause:
+
+    * ``mixed-rate-rescue`` — per-act broadcast time compression: the same
+      score and runtime floors, with nearly all of the runtime in long
+      straight segments within 2 % of native (*piecewise_fraction*), where a
+      uniform trunk is not possible because the acts run at two speeds.
+    * ``corroborated-rescue`` — similarity between describealaign's own 20 %
+      mismatch line and the rescue floor over an almost perfect native-rate
+      line, only when the donor names this episode (*title_corroborated*) and
+      the aligned first audio track is English (*primary_audio_english*). A
+      straight line proves the timing is uniform, not that the content is
+      right; those two independent checks are what make it right.
     """
     if score >= min_score:
         return True, "similarity", f"similarity {score:.1f}% ≥ {min_score:.0f}% (sync confident)"
@@ -404,6 +465,32 @@ def _acceptance_decision(
             f"similarity {score:.1f}% below {min_score:.0f}% but stable trunk "
             f"{stable_fraction:.1f}% at median rate {median_rate:.2f}% with a passing "
             f"sync-quality check — accepting consistent-drift alignment"
+        )
+    if (
+        score >= _RESCUE_MIN_SCORE
+        and total_runtime >= _RESCUE_MIN_RUNTIME_SEC
+        and piecewise_fraction >= _MIXED_RATE_MIN_FRACTION
+        and content_coverage >= _MIXED_RATE_MIN_COVERAGE
+    ):
+        return True, "mixed-rate-rescue", (
+            f"similarity {score:.1f}% below {min_score:.0f}% and the rate differs between "
+            f"acts, but {piecewise_fraction:.1f}% of the runtime is long straight segments "
+            f"within 2% of native — accepting per-act broadcast time compression"
+        )
+    if (
+        score >= _CORROBORATED_MIN_SCORE
+        and sync_ok
+        and stable_fraction >= _CORROBORATED_MIN_STABLE_FRACTION
+        and abs(median_rate) <= _NATIVE_RATE_TOLERANCE
+        and content_coverage >= _CORROBORATED_MIN_COVERAGE
+        and total_runtime >= _RESCUE_MIN_RUNTIME_SEC
+        and title_corroborated
+        and primary_audio_english
+    ):
+        return True, "corroborated-rescue", (
+            f"similarity {score:.1f}% below {_RESCUE_MIN_SCORE:.0f}% but "
+            f"{stable_fraction:.1f}% of the runtime is one native-rate line, the donor "
+            f"names this episode and the aligned track is English — accepting"
         )
     return False, "reject", (
         f"similarity {score:.1f}% (coverage {content_coverage:.1f}%, stable trunk "
@@ -573,8 +660,41 @@ def _extra_source_multi_donor(
     return _concat_audio(parts, joined)
 
 
+def _donor_digest(path: Path) -> str:
+    """SHA-256 of a donor file's bytes."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _already_tried(audio_path: Path, tried: set[str], label: str) -> bool:
+    """True when *audio_path* is byte-identical to a donor already aligned for this video.
+
+    The providers mirror one master: LivingAudio's This Is Us and Heartland
+    files are the same bytes as AudioVault's, so after AudioVault's donor was
+    refused the walk aligned the identical file again — the same verdict, and
+    five to ten more minutes per refused episode (2026-09-26). An unreadable
+    file is never skipped; the alignment reports that problem itself.
+    """
+    try:
+        digest = _donor_digest(audio_path)
+    except OSError:
+        return False
+    if digest in tried:
+        logger.info(
+            "%s: %s is identical to a donor already tried for this file — skipping.",
+            label, audio_path.name,
+        )
+        return True
+    tried.add(digest)
+    return False
+
+
 def _episode_donor(
     zip_path: Path, extract_dir: Path, episodes: list[int], label: str,
+    episode_title: str = "",
 ) -> Optional[Path]:
     """The AD audio for *episodes* from one catalogue entry, or None.
 
@@ -587,10 +707,15 @@ def _episode_donor(
     The joined file lives beside the extract dir, not inside it: the ledger
     snaps a season's episode count from the extract dir's audio files, and
     an extra file there would keep the season from ever completing.
+
+    *episode_title* guards a single episode's positional fallback (see
+    :func:`extract_episode`); a multi-episode file's parts have their own
+    titles, so it is not passed for those.
     """
     parts: list[Path] = []
+    single_title = episode_title if len(episodes) == 1 else ""
     for ep in episodes:
-        part = extract_episode(zip_path, extract_dir, ep)
+        part = extract_episode(zip_path, extract_dir, ep, episode_title=single_title)
         if not part:
             logger.warning(
                 "E%02d not found in %s — cannot describe %s from this entry.",
@@ -842,13 +967,38 @@ def _log_decision(
         logger.debug("Decision-log write failed.", exc_info=True)
 
 
+def _corroboration(
+    video_path: Path, audio_path: Path, episode_title: str, score: float,
+) -> tuple[bool, bool]:
+    """Title and language evidence for the corroborated rescue.
+
+    Returns ``(title_corroborated, primary_audio_english)``. Probed only when
+    the score falls in the band that rescue covers, so ordinary alignments pay
+    for no extra ffprobe; logged so the decision can be audited.
+    """
+    if not (_CORROBORATED_MIN_SCORE <= score < _RESCUE_MIN_SCORE):
+        return False, False
+    donor_title = donor_episode_title(audio_path.name)
+    agree = titles_agree(episode_title, donor_title)
+    english = primary_audio_is_english(video_path) if agree else False
+    logger.info(
+        "Corroboration for %s: episode title %r vs donor %r → %s; first audio track English: %s",
+        video_path.name, episode_title, donor_title, agree, english,
+    )
+    return agree is True, english
+
+
 def _align_and_keep(
     config: Config,
     video_path: Path,
     audio_path: Path,
     label: Optional[str] = None,
+    episode_title: str = "",
 ) -> tuple[bool, Optional[str]]:
     """Run alignment and either keep or discard the combined output.
+
+    *episode_title* (episodes only) is compared with the title in the donor's
+    filename for the corroborated rescue; empty means no title evidence.
 
     Returns ``(published, reason)``. On success *reason* is None or an
     informational note (see :func:`_undescribed_note`); on failure it is a
@@ -916,12 +1066,16 @@ def _align_and_keep(
     score = parse_score(report)
     cscore = content_score(report)
     median_rate, stable_fraction, total_runtime = slope_stability(report)
+    piecewise = piecewise_rate_fraction(report)
 
     # Always log every metric so acceptance decisions are auditable.
     logger.info(
         "Metrics for %s: similarity=%.1f%% coverage=%.1f%% "
-        "slope_stability=%.1f%% median_rate=%.2f%% runtime=%.0fs",
-        video_path.name, score, cscore, stable_fraction, median_rate, total_runtime,
+        "slope_stability=%.1f%% median_rate=%.2f%% runtime=%.0fs piecewise=%.1f%%",
+        video_path.name, score, cscore, stable_fraction, median_rate, total_runtime, piecewise,
+    )
+    title_corroborated, primary_english = _corroboration(
+        video_path, audio_path, episode_title, score,
     )
 
     # Coverage is a separate question from sync. similarity says the narration
@@ -953,6 +1107,9 @@ def _align_and_keep(
         total_runtime=total_runtime,
         sync_ok=sync_ok,
         min_score=config.min_score,
+        piecewise_fraction=piecewise,
+        title_corroborated=title_corroborated,
+        primary_audio_english=primary_english,
     )
     if accepted and note and total_runtime > 0 \
             and undescribed >= _UNDESCRIBED_MAJOR_FRACTION * total_runtime:
@@ -1325,6 +1482,7 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
                     item["series_title"], item["season"], item["episode"],
                     series_year=item.get("series_year", ""),
                     extra_episodes=extra_episodes,
+                    episode_title=item.get("episode_title", ""),
                 )
             elif item["type"] == "movie":
                 described, _reason = process_movie(

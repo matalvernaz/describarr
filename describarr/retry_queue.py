@@ -53,6 +53,7 @@ class RetryQueue:
         episodes: list[int],
         video_path: str,
         series_year: str = "",
+        episode_title: str = "",
     ) -> None:
         """Queue a (possibly multi-) episode retry as ONE item.
 
@@ -84,6 +85,10 @@ class RetryQueue:
             # Carried so a drained item disambiguates a reboot the same way the
             # live webhook does; older queue entries simply lack the key.
             item["series_year"] = series_year
+        if episode_title:
+            # Sonarr's title, the corroborated rescue's evidence; without it a
+            # drained item falls back to whatever the filename says.
+            item["episode_title"] = episode_title
         self._append(item)
 
     def add_movie(self, movie_title: str, movie_year: str, video_path: str) -> None:

@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
+from .titles import donor_episode_title, titles_agree
+
 logger = logging.getLogger(__name__)
 
 # Audio file extensions that describealaign accepts.
@@ -280,7 +282,9 @@ def find_movie(results: list[dict], title: str, year: str) -> list[dict]:
 # Episode extraction
 # ------------------------------------------------------------------
 
-def extract_episode(zip_path: Path, extract_dir: Path, episode: int) -> Optional[Path]:
+def extract_episode(
+    zip_path: Path, extract_dir: Path, episode: int, episode_title: str = "",
+) -> Optional[Path]:
     """
     Extract *zip_path* into *extract_dir* (if not already done) and return
     the audio file for *episode*.
@@ -289,6 +293,12 @@ def extract_episode(zip_path: Path, extract_dir: Path, episode: int) -> Optional
       1. Explicit SxxEnn or Exx pattern in the filename.
       2. epNN or episodeNN pattern.
       3. Positional fallback (nth audio file sorted lexicographically).
+
+    The positional fallback is refused when *episode_title* and the chosen
+    file's own title are both known and disagree: a zip that lacks the episode
+    shifts every later file up one place. This Is Us S02E06 "The 20's"
+    (2026-09-25) had no file, so the fallback handed over "2.07 The Most
+    Disappointed Man" and spent an alignment on the wrong episode.
     """
     # If the "file" is actually already an MP3/audio, return it directly.
     if zip_path.suffix.lower() in _AUDIO_EXTS:
@@ -342,6 +352,14 @@ def extract_episode(zip_path: Path, extract_dir: Path, episode: int) -> Optional
 
     if 1 <= episode <= len(audio_files):
         chosen = audio_files[episode - 1]
+        chosen_title = donor_episode_title(chosen.name)
+        if titles_agree(episode_title, chosen_title, fuzzy=True) is False:
+            logger.warning(
+                "No filename match for E%02d; the positional fallback %s is titled %r, "
+                "not %r — not using it.",
+                episode, chosen.name, chosen_title, episode_title,
+            )
+            return None
         logger.warning(
             "No filename match for E%02d; using positional fallback → %s",
             episode,
