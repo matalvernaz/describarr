@@ -101,10 +101,10 @@ def test_notification_carries_the_note(monkeypatch, tmp_path):
     server._notify_outcome(config, "Scary Movie 3 (2003)", "described",
                            "AD source is a different cut: 75 s of the picture has no description")
     assert sent == [("describarr: Scary Movie 3 (2003)",
-                     "Added and described. (AD source is a different cut: 75 s of the picture has no description)")]
+                     "Described. (AD source is a different cut: 75 s of the picture has no description)")]
     sent.clear()
     server._notify_outcome(config, "Scary Movie 3 (2003)", "described", None)
-    assert sent == [("describarr: Scary Movie 3 (2003)", "Added and described.")]
+    assert sent == [("describarr: Scary Movie 3 (2003)", "Described.")]
 
 
 # ── the note says where, and changes its words when most of the picture is bare ──

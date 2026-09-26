@@ -582,6 +582,67 @@ def sync_quality(report: Optional[Path]) -> tuple[bool, str]:
     return True, ""
 
 
+# Broadcast time compression: a network speeds some acts of an episode up to
+# fit more advertising, and an off-air description recording carries that
+# while a streaming video does not. Measured 2026-09-26 on NBC shows (This Is
+# Us S04-S06, Brooklyn Nine-Nine S06-S08): individual acts 0.3-1.9 % fast, the
+# rest native, each act one straight segment.
+_MIXED_RATE_LONG_SEGMENT_SEC = 60.0   # an act-length piece, not a seam or a jitter fragment
+_MIXED_RATE_MAX_ABS_PCT = 2.0         # time compression; PAL (4.27 %) has its own rescue
+
+
+def piecewise_rate_fraction(report: Optional[Path]) -> float:
+    """
+    Percentage of the aligned runtime that sits in long straight segments at a
+    small rate — the shape per-act time compression leaves.
+
+    The single-rate stable trunk counts only segments near the median rate, so
+    an episode whose acts line up perfectly at two speeds scores 51-84 % there.
+    This counts every segment of at least ``_MIXED_RATE_LONG_SEGMENT_SEC`` whose
+    rate is within ``_MIXED_RATE_MAX_ABS_PCT`` of native, whatever the median.
+    A wrong donor leaves short pieces at erratic rates, which count for nothing.
+    """
+    metrics = _read_metrics(report)
+    if metrics is None:
+        return 0.0
+    total = 0.0
+    straight = 0.0
+    for seg in metrics.get("segments", []):
+        dur = _segment_duration(seg)
+        if dur <= 0:
+            continue
+        total += dur
+        if dur >= _MIXED_RATE_LONG_SEGMENT_SEC and abs(seg["rate_pct"]) <= _MIXED_RATE_MAX_ABS_PCT:
+            straight += dur
+    return (straight / total) * 100.0 if total > 0.0 else 0.0
+
+
+_ENGLISH_LANGUAGE_TAGS = frozenset({"eng", "en", "english"})
+
+
+def primary_audio_is_english(path: Path) -> bool:
+    """
+    True when the audio describealaign aligns against is English.
+
+    The engine decodes the file's FIRST audio stream (``-map 0:a:0``), and that
+    stream also fills every gap in the described track. A MULTi release with
+    French first scores like a hard-to-match English one (This Is Us S01E12:
+    20.4 % over a straight native map), so a low-score acceptance must know
+    which one it has. An untagged track counts only when it is the only one.
+    False on a probe failure.
+    """
+    probe = _ffprobe_json(path)
+    if probe is None:
+        return False
+    audio = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
+    if not audio:
+        return False
+    language = ((audio[0].get("tags") or {}).get("language") or "").strip().casefold()
+    if language in _ENGLISH_LANGUAGE_TAGS:
+        return True
+    return len(audio) == 1 and language in ("", "und")
+
+
 def _parse_tc(tc: str) -> float:
     """Convert a H:MM:SS.fff or MM:SS.fff timecode string to seconds."""
     parts = tc.split(":")

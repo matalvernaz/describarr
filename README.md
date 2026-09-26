@@ -7,7 +7,7 @@ When Sonarr or Radarr imports a new file, describarr:
 1. Searches AudioVault for a matching audio description track.
 2. Downloads the file (caching season ZIPs so they are only fetched once per season).
 3. Runs [describealaign](https://github.com/matalvernaz/describealaign) to align and combine the audio description with the video.
-4. If the alignment is confident enough that the description lands at the right time, replaces the original file in-place with the combined version. The primary gate is the **similarity score (default ≥ 65 %)**, which measures how well the description track's embedded program audio locked onto the video — i.e. how confidently the narration was placed in time. A secondary *drift rescue* accepts a lower similarity only when the time-mapping is uniform and the cause is known (commercial-break seams, or a PAL/NTSC rate conversion). Otherwise the description is discarded and the original is untouched. As a safety net, the original is hardlinked into a backup before any overwrite (see `DESCRIBARR_BACKUP_*`), so a bad alignment is always recoverable.
+4. If the alignment is confident enough that the description lands at the right time, replaces the original file in-place with the combined version. The primary gate is the **similarity score (default ≥ 65 %)**, which measures how well the description track's embedded program audio locked onto the video — i.e. how confidently the narration was placed in time. A secondary *drift rescue* accepts a lower similarity only when the time-mapping is uniform and the cause is known (commercial-break seams, or a PAL/NTSC rate conversion). Two narrower rescues each cover one more measured cause: a *mixed-rate rescue* for off-air recordings whose acts the broadcaster sped up by different amounts (nearly all of the runtime in long straight segments within 2 % of native, e.g. NBC's This Is Us and Brooklyn Nine-Nine), and a *corroborated rescue* for a similarity between describealaign's own 20 % mismatch line and the 30 % rescue floor over an almost perfect native-rate line — accepted only when the donor's filename names the same episode and the aligned audio track is English, because a straight line proves the timing, not the content. Otherwise the description is discarded and the original is untouched. As a safety net, the original is hardlinked into a backup before any overwrite (see `DESCRIBARR_BACKUP_*`), so a bad alignment is always recoverable.
 
 ---
 
@@ -65,19 +65,25 @@ Create `/path/to/sonarr/config/describarr-hook.sh`:
 
 ```sh
 #!/bin/sh
-curl -sf -X POST http://describarr:8686/hook \
+curl -sf --retry 5 --retry-all-errors --retry-delay 3 --max-time 30 \
+  -X POST http://describarr:8686/hook \
   --data-urlencode "sonarr_eventtype=$sonarr_eventtype" \
   --data-urlencode "sonarr_series_title=$sonarr_series_title" \
+  --data-urlencode "sonarr_series_year=$sonarr_series_year" \
   --data-urlencode "sonarr_episodefile_seasonnumber=$sonarr_episodefile_seasonnumber" \
   --data-urlencode "sonarr_episodefile_episodenumbers=$sonarr_episodefile_episodenumbers" \
+  --data-urlencode "sonarr_episodefile_episodetitles=$sonarr_episodefile_episodetitles" \
   --data-urlencode "sonarr_episodefile_path=$sonarr_episodefile_path"
 ```
+
+Sonarr and Radarr never re-run a failed Custom Script, so without the retry flags any import that lands while describarr restarts is lost. A stopped container makes the hostname fail to resolve, which plain `--retry` does not retry; `--retry-all-errors` does (curl ≥ 7.71). The episode title is optional: it lets describarr check that a donor names the episode it is describing.
 
 Create `/path/to/radarr/config/describarr-hook.sh`:
 
 ```sh
 #!/bin/sh
-curl -sf -X POST http://describarr:8686/hook \
+curl -sf --retry 5 --retry-all-errors --retry-delay 3 --max-time 30 \
+  -X POST http://describarr:8686/hook \
   --data-urlencode "radarr_eventtype=$radarr_eventtype" \
   --data-urlencode "radarr_movie_title=$radarr_movie_title" \
   --data-urlencode "radarr_movie_year=$radarr_movie_year" \
@@ -250,9 +256,9 @@ If the folder name doesn't include the year (or the AudioVault title differs), p
 
 `GET /status` is a status page showing the current job, the download-cap and queue counts, and a **recent-decisions** table: the last N accept / reject / skip / no-match decisions with their scores and reasons (`DESCRIBARR_HISTORY_SIZE`, default 50). It's a plain semantic page — headings and real tables — so it reads cleanly with a screen reader, and there's a `?format=json` view for programmatic polling. It replaces grepping container logs to see what happened overnight.
 
-When an alignment can't be made, the Pushover notification carries the specific cause instead of a generic "errored" — e.g. *"AD is 22 min vs 45 min video — likely wrong/truncated episode"* or *"AD audio is 95% silence"* — so you know whether to swap the AD source or re-grab the video. (This relies on the failure diagnosis emitted by describealaign ≥ v2.1.9.)
+When a description was found but refused, the notification says so — *"Found an audio description, but it did not line up with this copy, so the file was left alone. (match score 21%)"* — rather than claiming none exists; *"No audio description found."* is kept for when no source had one. When an alignment can't be made, the Pushover notification carries the specific cause instead of a generic "errored" — e.g. *"AD is 22 min vs 45 min video — likely wrong/truncated episode"* or *"AD audio is 95% silence"* — so you know whether to swap the AD source or re-grab the video. (This relies on the failure diagnosis emitted by describealaign ≥ v2.1.9.)
 
-When an alignment *is* published but the AD source turns out to be a different cut of the film (an unrated video against a theatrical description, say), the success notification says so and says where — *"Added and described. (AD source is a different cut: 75 s of the picture has no description at 1:19–1:45, 5:02–5:31)"* — because the inserted footage keeps its original soundtrack and you should expect stretches without narration. A stretch right after the title card is usually a recap the AD source omits. When most of the runtime is undescribed the wording changes to *"description covers only part of the picture: 23 min of 47 min has no description at 24:12–46:38"*, which is what a double episode aligned against a single episode's AD looks like. The same figures land in the `/status` decision log as `undescribed` and `dropped` seconds. Anything under 20 s is treated as ordinary seams and not mentioned.
+When an alignment *is* published but the AD source turns out to be a different cut of the film (an unrated video against a theatrical description, say), the success notification says so and says where — *"Described. (AD source is a different cut: 75 s of the picture has no description at 1:19–1:45, 5:02–5:31)"* — because the inserted footage keeps its original soundtrack and you should expect stretches without narration. A stretch right after the title card is usually a recap the AD source omits. When most of the runtime is undescribed the wording changes to *"description covers only part of the picture: 23 min of 47 min has no description at 24:12–46:38"*, which is what a double episode aligned against a single episode's AD looks like. The same figures land in the `/status` decision log as `undescribed` and `dropped` seconds. Anything under 20 s is treated as ordinary seams and not mentioned.
 
 A published file inherits the owner, group and permission bits of the file it replaces, and the sibling `.describarr_backup` folder and `.admerge.lock` file take the library folder's owner with group-writable modes. describarr runs as root in its container; without this every publish left root-owned entries behind, and a root-owned folder later blocks Sonarr/Radarr (uid 1000) from replacing the file on an upgrade.
 

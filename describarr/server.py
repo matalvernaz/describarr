@@ -930,6 +930,9 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
     season_str = env.get("sonarr_episodefile_seasonnumber", "0").strip()
     episode_str = env.get("sonarr_episodefile_episodenumbers", "1").strip()
     file_path_str = env.get("sonarr_episodefile_path", "").strip()
+    # Sonarr joins a multi-episode file's titles with "|"; the first belongs
+    # to the primary episode, the one whose donor is aligned.
+    episode_title = env.get("sonarr_episodefile_episodetitles", "").split("|")[0].strip()
 
     if not series_title or not file_path_str:
         logger.error("Missing required Sonarr fields.")
@@ -974,6 +977,7 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
                 series_title, season, primary_episode,
                 extra_episodes=extra_episodes,
                 series_year=series_year,
+                episode_title=episode_title,
             )
     except DailyLimitReached:
         # ONE retry item carries the full episode list so the drain runs ONE
@@ -983,6 +987,7 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
         # — destructively re-align the merged file once per episode.
         _get_retry_queue(config).add_episodes(
             series_title, season, episodes, str(video_path), series_year=series_year,
+            episode_title=episode_title,
         )
         return {"label": label, "outcome": "queued", "path": str(video_path)}
     return {
@@ -1087,12 +1092,39 @@ _NOMATCH_FILENAME = ".nomatch.json"
 # ------------------------------------------------------------------
 
 _OUTCOME_MESSAGES = {
-    "described": "Added and described.",
+    "described": "Described.",
     "already_described": "Already had an audio description — left alone.",
-    "no_match": "Added — no audio description available.",
-    "queued": "Added — description queued (AudioVault daily limit reached).",
-    "error": "Added — describarr errored, check logs.",
+    "no_match": "No audio description found.",
+    "queued": "Description queued (AudioVault daily limit reached).",
+    "error": "describarr hit an error — check its logs.",
 }
+
+# A no_match that carries a reason is a donor that was found and refused. It
+# used to read "Added — no audio description available", which is false (one
+# was found) and sent a listener looking for a description that exists; and
+# "Added" was wrong for every retry (2026-09-26).
+_REFUSED_MESSAGE = (
+    "Found an audio description, but it did not line up with this copy, "
+    "so the file was left alone."
+)
+
+
+def _plain_reason(reason: str) -> str:
+    """A refusal's detail in words: the gate's metric dump becomes its match score."""
+    m = re.match(r"similarity (\d+(?:\.\d+)?)%", reason)
+    if m:
+        return f"match score {float(m.group(1)):.0f}%"
+    if reason.startswith("No obvious cause from energy analysis"):
+        return "the sound did not match"
+    return reason
+
+
+def _notify_message(outcome: str, reason: Optional[str]) -> str:
+    """The Pushover body for an outcome."""
+    if outcome == "no_match" and reason:
+        return f"{_REFUSED_MESSAGE} ({_plain_reason(reason)})"
+    base = _OUTCOME_MESSAGES.get(outcome, outcome)
+    return f"{base} ({reason})" if reason else base
 
 
 def _log_terminal_decision(config: Config, label: str, outcome: str, reason: Optional[str]) -> None:
@@ -1126,9 +1158,7 @@ def _notify_outcome(
     if reason == ALREADY_DESCRIBED:
         # The sentinel is a signal to this function, not prose for the operator.
         reason = None
-    base = _OUTCOME_MESSAGES.get(outcome, outcome)
-    message = f"{base} ({reason})" if reason else base
-    notify.send(f"describarr: {label}", message)
+    notify.send(f"describarr: {label}", _notify_message(outcome, reason))
     _log_terminal_decision(config, label, outcome, reason)
     if path:
         OutcomeLog.in_cache(config.cache_dir).record(

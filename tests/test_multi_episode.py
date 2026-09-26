@@ -141,7 +141,7 @@ def _fake_zip_with(monkeypatch, tmp_path, present):
         f.write_bytes(b"x")
         files[ep] = f
 
-    def fake_extract(zip_path, extract_dir, episode):
+    def fake_extract(zip_path, extract_dir, episode, episode_title=""):
         return files.get(episode)
 
     monkeypatch.setattr(workflow, "extract_episode", fake_extract)
@@ -192,7 +192,7 @@ def test_process_episode_aligns_the_joined_donor_and_marks_both_done(monkeypatch
     monkeypatch.setattr(workflow, "_get_cached", lambda client, url, cache_dir, limiter: tmp_path / "s2.zip")
     monkeypatch.setattr(workflow, "_concat_audio", lambda parts, out: out)
     monkeypatch.setattr(workflow, "_align_and_keep",
-                        lambda config, video_path, audio_path, label=None: (aligned.append(audio_path), (True, None))[1])
+                        lambda config, video_path, audio_path, label=None, **kwargs: (aligned.append(audio_path), (True, None))[1])
     monkeypatch.setattr(workflow, "_mark_episode_done", lambda cache, season, ep, *a, **k: marked.append((season, ep)))
     monkeypatch.setattr(workflow, "load_extra_sources", lambda: [])
 
@@ -304,7 +304,7 @@ def test_multi_episode_falls_through_to_an_extra_source(monkeypatch, tmp_path):
     monkeypatch.setattr(workflow, "_concat_audio", lambda parts, out: out)
     monkeypatch.setattr(workflow, "load_extra_sources", lambda: [source])
     monkeypatch.setattr(workflow, "_align_and_keep",
-                        lambda config, video_path, audio_path, label=None:
+                        lambda config, video_path, audio_path, label=None, **kwargs:
                             (aligned.append(audio_path), (True, None))[1])
     monkeypatch.setattr(workflow, "_mark_episode_done",
                         lambda cache, season, ep, *a, **k: marked.append((season, ep)))
@@ -333,7 +333,7 @@ def test_a_show_audiovault_never_heard_of_still_reaches_the_extra_source(monkeyp
     monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
     monkeypatch.setattr(workflow, "load_extra_sources", lambda: [source])
     monkeypatch.setattr(workflow, "_align_and_keep",
-                        lambda config, video_path, audio_path, label=None:
+                        lambda config, video_path, audio_path, label=None, **kwargs:
                             (aligned.append(audio_path), (True, None))[1])
     monkeypatch.setattr(workflow, "_mark_episode_done", lambda *a, **k: None)
 
@@ -355,7 +355,7 @@ def test_a_season_with_no_audiovault_entry_still_reaches_the_extra_source(monkey
     monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
     monkeypatch.setattr(workflow, "load_extra_sources", lambda: [source])
     monkeypatch.setattr(workflow, "_align_and_keep",
-                        lambda config, video_path, audio_path, label=None:
+                        lambda config, video_path, audio_path, label=None, **kwargs:
                             (aligned.append(audio_path), (True, None))[1])
     monkeypatch.setattr(workflow, "_mark_episode_done", lambda *a, **k: None)
 
@@ -383,7 +383,7 @@ def test_a_movie_audiovault_lacks_still_reaches_the_extra_source(monkeypatch, tm
     monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
     monkeypatch.setattr(workflow, "load_extra_sources", lambda: [source])
     monkeypatch.setattr(workflow, "_align_and_keep",
-                        lambda config, video_path, audio_path, label=None:
+                        lambda config, video_path, audio_path, label=None, **kwargs:
                             (aligned.append(audio_path), (True, None))[1])
 
     described, _ = workflow.process_movie(NoResults(), config, video, "Film", "2020")
