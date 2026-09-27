@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -104,9 +107,14 @@ class PendingQueue:
             return
         with self._lock:
             items = self._load()
+            queued_ids = {item.get("queue_id") for item in items if item.get("queue_id")}
             # Preserve original order (oldest claim first) by prepending in
             # reverse so the first leftover ends up at index 0.
             for item in reversed(leftover):
+                # A crash after persisting a deferred replacement but before
+                # clearing its claim must preserve the newer retry schedule.
+                if item.get("queue_id") in queued_ids:
+                    continue
                 items.insert(0, item)
             self._save(items)
             self._save_inflight([])
@@ -141,7 +149,7 @@ class PendingQueue:
     def push(self, item: dict) -> int:
         with self._cv:
             items = self._load()
-            items.append(item)
+            items.append({"queue_id": uuid.uuid4().hex, **item})
             self._save(items)
             self._cv.notify_all()
             return len(items)
@@ -149,27 +157,31 @@ class PendingQueue:
     def push_front(self, item: dict) -> None:
         with self._cv:
             items = self._load()
-            items.insert(0, item)
+            items.insert(0, {"queue_id": uuid.uuid4().hex, **item})
             self._save(items)
             self._cv.notify_all()
 
     # ── claim/ack lifecycle ────────────────────────────────────────────
 
     def claim_first(self) -> Optional[dict]:
-        """Atomically move the head item to the in-flight file and return it.
+        """Claim the first due item; delayed work does not block ready jobs.
 
-        If the worker dies before calling :meth:`ack` or :meth:`requeue`,
+        If the worker dies before calling :meth:`ack`, :meth:`defer` or :meth:`requeue`,
         the next process start will pull the item back into pending. Use
         this instead of :meth:`pop_first` whenever the consumer wants
         crash-resilience guarantees.
         """
         with self._lock:
             items = self._load()
-            if not items:
+            now = time.time()
+            index = next((i for i, row in enumerate(items)
+                          if self.ready_at(row) <= now), None)
+            if index is None:
                 return None
-            item = items.pop(0)
+            item = items.pop(index)
+            item.setdefault("queue_id", uuid.uuid4().hex)
             # Write inflight FIRST so that a crash between the two writes
-            # results in "item is in both files" → recovery prepends it back
+            # results in "item is in both files" → recovery keeps one copy
             # → at-least-once delivery preserved. If we wrote pending first,
             # a crash would lose the item.
             inflight = self._load_inflight()
@@ -177,6 +189,29 @@ class PendingQueue:
             self._save_inflight(inflight)
             self._save(items)
             return item
+
+    @staticmethod
+    def ready_at(item: dict) -> float:
+        """Persisted UTC epoch time; old jobs without a schedule are due now."""
+        try:
+            value = float(item.get("retry_at", 0))
+            return value if math.isfinite(value) else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def defer(self, item: dict, replacement: dict) -> None:
+        """Persist a delayed retry before releasing the old claim."""
+        with self._cv:
+            items = self._load()
+            items.append(replacement)
+            self._save(items)
+            inflight = self._load_inflight()
+            try:
+                inflight.remove(item)
+            except ValueError:
+                pass
+            self._save_inflight(inflight)
+            self._cv.notify_all()
 
     def ack(self, item: dict) -> None:
         """Remove *item* from in-flight after the consumer finished it.
@@ -233,7 +268,11 @@ class PendingQueue:
     # ── consumer notification ──────────────────────────────────────────
 
     def wait_for_item(self, timeout: float = 10.0) -> None:
-        """Block up to *timeout* seconds for an item to appear."""
+        """Wait for new work or the next retry, without spinning on delayed jobs."""
         with self._cv:
-            if not self._load():
-                self._cv.wait(timeout=timeout)
+            items = self._load()
+            wait = timeout
+            if items:
+                wait = min(wait, max(0, min(self.ready_at(item) for item in items) - time.time()))
+            if wait > 0:
+                self._cv.wait(timeout=wait)
