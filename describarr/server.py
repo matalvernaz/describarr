@@ -107,6 +107,10 @@ def _get_pending_queue(config: Config) -> PendingQueue:
 # Cap on per-item retries before the worker drops a stuck pending item, to
 # stop a truly broken Sonarr/Radarr payload from looping forever.
 _MAX_WORKER_ATTEMPTS = 5
+# The first retry waits out a source's five-minute cooldown. Further outages
+# back off exponentially; the schedule lives in the persisted pending item.
+_WORKER_RETRY_BASE_SECONDS = 300
+_WORKER_RETRY_MAX_SECONDS = 3600
 
 _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
@@ -401,6 +405,7 @@ def _process_item(item: dict, config: Config, pending: PendingQueue) -> None:
                 "Dropping pending item after %d attempts (%s): %r",
                 attempts, exc, item,
             )
+            _record_worker_failure(config, item, str(exc))
             pending.ack(item)
             return
         # Build the requeued payload BEFORE acking: PendingQueue.ack matches
@@ -410,16 +415,28 @@ def _process_item(item: dict, config: Config, pending: PendingQueue) -> None:
         # quietly stacking duplicate alignments on the same source.
         requeued = dict(item)
         requeued["attempts"] = attempts
+        delay = min(_WORKER_RETRY_MAX_SECONDS,
+                    _WORKER_RETRY_BASE_SECONDS * 2 ** (attempts - 1))
+        requeued["retry_at"] = time.time() + delay
         # Push to the BACK so other items get a fair chance to make progress
         # while this one waits out whatever transient condition tripped it.
-        pending.ack(item)
-        pending.push(requeued)
+        pending.defer(item, requeued)
         logger.warning(
-            "Transient error processing %s (attempt %d/%d), re-queued: %s",
-            item_type, attempts, _MAX_WORKER_ATTEMPTS, exc,
+            "Transient error processing %s (attempt %d/%d), retry in %ds: %s",
+            item_type, attempts, _MAX_WORKER_ATTEMPTS, delay, exc,
         )
     else:
         pending.ack(item)
+
+
+def _record_worker_failure(config: Config, item: dict, reason: str) -> None:
+    """Give an exhausted request an explicit terminal outcome for the client."""
+    path = _queued_path(item)
+    label = item.get("title") or _label_from_env(item.get("env") or {}) or "Description request"
+    detail = f"Description failed after {_MAX_WORKER_ATTEMPTS} attempts: {reason}"
+    if path:
+        OutcomeLog.in_cache(config.cache_dir).record(path, "error", detail, label)
+    _log_terminal_decision(config, label, "error", detail)
 
 
 # Errors that should re-queue the pending item rather than drop it. Anything
@@ -1066,8 +1083,11 @@ def _outcome_for(config: Config, path_str: str) -> dict:
     # the work that sets it has begun.
     if any(outcome_key(_queued_path(item)) == wanted for item in pending.inflight()):
         return {"state": "working", "detail": "", "at": ""}
-    if any(outcome_key(_queued_path(item)) == wanted for item in pending.load()):
-        return {"state": "queued", "detail": "", "at": ""}
+    for item in pending.load():
+        if outcome_key(_queued_path(item)) == wanted:
+            retry_at = PendingQueue.ready_at(item)
+            detail = "The description source is unavailable; waiting to retry." if retry_at else ""
+            return {"state": "queued", "detail": detail, "at": "", "retryAt": retry_at or None}
     if any(outcome_key(item.get("video_path", "")) == wanted
            for item in _get_retry_queue(config).load()):
         return {"state": "queued",
