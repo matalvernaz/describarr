@@ -538,6 +538,37 @@ def undescribed_spans(report: Optional[Path]) -> list[tuple[float, float]]:
     return spans
 
 
+# Head or tail time this short outside the aligned stretch is ordinary: a cold
+# open before the recording starts, end credits after it stops.
+_END_ALLOWANCE_SEC = 60.0
+
+
+def uncovered_ends(report: Optional[Path], video_duration: float) -> list[tuple[float, float]]:
+    """The video before the first aligned segment and after the last, when longer than ordinary.
+
+    :func:`undescribed_spans` sees only the segments the engine wrote, so a
+    recording that runs out before the video does leaves the rest of the
+    picture out of every count. Family Guy S09E01 (2026-10-01) is 49 minutes;
+    its recording was the first half alone, the segments stopped at 26:42, and
+    the note said 4 minutes were undescribed. Returns ``(start_sec, end_sec)``
+    pairs, empty when *video_duration* is unknown.
+    """
+    metrics = _read_metrics(report)
+    if metrics is None or video_duration <= 0:
+        return []
+    segments = metrics.get("segments", [])
+    if not segments:
+        return []
+    first = min(float(seg["video_start_sec"]) for seg in segments)
+    last = max(float(seg["video_end_sec"]) for seg in segments)
+    ends = []
+    if first > _END_ALLOWANCE_SEC:
+        ends.append((0.0, first))
+    if video_duration - last > _END_ALLOWANCE_SEC:
+        ends.append((last, video_duration))
+    return ends
+
+
 def sync_quality(report: Optional[Path]) -> tuple[bool, str]:
     """
     Return (ok, reason) where ok=False means the alignment is likely unreliable.

@@ -520,3 +520,91 @@ def test_a_pack_that_says_it_is_not_described_is_never_aligned(monkeypatch, tmp_
                                accept={"09 - 18  Family Guy - It's a Trap.mp3"})
     assert not described
     assert aligned == []
+
+
+# ── a recording that runs out before the video does ──────────────────────────
+
+def test_a_recording_that_stops_halfway_is_refused(monkeypatch, tmp_path):
+    """Family Guy S09E01 (2026-10-01): a 49-minute video aligned against the
+    first half's recording alone. The segments stop at 26:42 and nothing after
+    them was counted, so it published with "4 min" undescribed."""
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    config.min_score = 60.0
+    video = tmp_path / "Family.Guy.S09E01.And.Then.There.Were.Fewer.1080p.WEB-DL.DD5.1.H.264-CtrlHD.mkv"
+    video.write_bytes(b"v")
+    audio = tmp_path / "[S09.E01] And Then There Were Fewer Pt 1.mp3"
+    audio.write_bytes(b"a")
+    report = tmp_path / "alignments" / "ep.txt"
+    report.parent.mkdir()
+    report.write_text("Input file similarity: 75.2%\n")
+    report.with_suffix(".json").write_text(json.dumps({
+        "similarity_pct": 75.2, "median_rate_pct": 0.0,
+        "segments": [{"rate_pct": 0.0, "video_start_sec": 0.0, "video_end_sec": 1601.6,
+                      "audio_start_sec": 22.6, "audio_end_sec": 1357.5}],
+    }))
+    combined = tmp_path / "out" / "ad_ep.mkv"
+    combined.parent.mkdir()
+    combined.write_bytes(b"z")
+    published = []
+    monkeypatch.setattr(workflow, "align", lambda *a, **k: AlignResult(combined, report, None, returncode=0))
+    monkeypatch.setattr(workflow, "_publish_in_place", lambda *a, **k: published.append(a))
+    monkeypatch.setattr(workflow, "_cleanup_combined", lambda c: None)
+    monkeypatch.setattr(workflow, "_audio_duration", lambda p: 2955.4 if p == video else 1357.5)
+    ok, reason = workflow._align_and_keep(config, video, audio, label="Family Guy S09E01")
+    assert not ok and published == []
+    assert reason.startswith("description covers only part of the picture: 23 min of 49 min")
+    assert "26:42–49:15" in reason
+
+
+# AudioVault "Family Guy - Season 9 (2010) [AudioVault Original]": the two
+# halves of each double episode are filed under consecutive numbers.
+SEASON_9_ORIGINAL = (
+    "Family Guy - Season 9 (2010) [AudioVault Original]",
+    ["[S09.E01] And Then There Were Fewer Pt 1.mp3", "[S09.E02] And Then There Were Fewer Pt 2.mp3",
+     "[S09.E03] Excellence in Broadcasting.mp3", "[S09.E06] Baby You Knock Me Out.mp3",
+     "[S09.E07] Brian Writes a Bestseller.mp3", "[S09.E08] Road to the North Pole Pt 1.mp3",
+     "[S09.E09] Road to the North Pole Pt 2.mp3", "[S09.E10] New Kidney in Town.mp3",
+     "[S09.E20] It's a Trap! - Part 1.mp3", "[S09.E21] It's a Trap! - Part 2.mp3"],
+)
+
+
+@pytest.mark.parametrize("episode, title, video_seconds, halves", [
+    (7, "Road to the North Pole", 2624.6,
+     ["[S09.E08] Road to the North Pole Pt 1.mp3", "[S09.E09] Road to the North Pole Pt 2.mp3"]),
+    (18, "It's a Trap!", 3395.0,
+     ["[S09.E20] It's a Trap! - Part 1.mp3", "[S09.E21] It's a Trap! - Part 2.mp3"]),
+    (1, "And Then There Were Fewer", 2955.4,
+     ["[S09.E01] And Then There Were Fewer Pt 1.mp3", "[S09.E02] And Then There Were Fewer Pt 2.mp3"]),
+])
+def test_halves_filed_under_different_numbers_are_joined(monkeypatch, tmp_path, episode, title,
+                                                         video_seconds, halves):
+    joined = []
+
+    def concat(parts, out):
+        joined.append([p.name for p in parts])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"+".join(p.read_bytes() for p in parts))
+        return out
+
+    monkeypatch.setattr(workflow, "_audio_duration",
+                        lambda p: video_seconds if p.suffix == ".mkv" else 1360.0)
+    monkeypatch.setattr(workflow, "_concat_audio", concat)
+    video = _video(tmp_path, 9, f"Family.Guy.S09E{episode:02d}.1080p.WEB-DL.DD5.1.H.264-CtrlHD.mkv",
+                   nfo=(title, 9, episode))
+    whole = halves[0].rsplit(" P", 1)[0].rstrip(" -") + ".mp3"
+    described, aligned = _walk(monkeypatch, tmp_path, SEASON_9_ORIGINAL, video, 9, episode, accept={whole})
+    assert described
+    assert joined[0] == halves
+    assert aligned[0][0] == whole
+
+
+def test_ordinary_end_credits_are_not_reported(tmp_path):
+    from describarr.aligner import uncovered_ends
+    report = tmp_path / "r.json"
+    report.write_text(json.dumps({"segments": [
+        {"rate_pct": 0.0, "video_start_sec": 3.0, "video_end_sec": 1263.3,
+         "audio_start_sec": 0.0, "audio_end_sec": 1260.3}]}))
+    # Family Guy S21E05's ~34 s DSNP credits tail: ordinary, nothing to say.
+    assert uncovered_ends(report, 1297.5) == []
+    assert uncovered_ends(report, 2955.4) == [(1263.3, 2955.4)]
+    assert uncovered_ends(report, 0.0) == []            # length unknown: no claim

@@ -268,3 +268,17 @@ def test_a_season_entry_that_says_it_is_not_described_is_skipped():
 def test_a_film_entry_that_says_it_is_not_described_is_skipped():
     results = _movies(["Gladiator (2000) [Not Described]", "Gladiator (2000) [Old Description]"])
     assert _names(find_movie(results, "gladiator", "2000")) == ["Gladiator (2000) [Old Description]"]
+
+
+def test_two_part_ones_make_the_title_ambiguous(tmp_path):
+    from describarr.matcher import _title_parts
+    files = [tmp_path / n for n in ("[S09.E01] Fewer Pt 1.mp3", "[S09.E02] Fewer Pt 1.mp3",
+                                    "[S09.E03] Fewer Pt 2.mp3")]
+    assert _title_parts(files, "Fewer", "Family Guy") == ()
+
+
+def test_parts_of_another_title_are_not_taken(tmp_path):
+    from describarr.matcher import _title_parts
+    files = [tmp_path / n for n in ("[S09.E08] Road to the North Pole Pt 1.mp3",
+                                    "[S09.E09] Road to the North Pole Pt 2.mp3")]
+    assert _title_parts(files, "New Kidney in Town", "Family Guy") == ()

@@ -36,6 +36,7 @@ from .aligner import (
     content_score,
     slope_stability,
     sync_quality,
+    uncovered_ends,
     undescribed_seconds,
     undescribed_spans,
     source_has_ad_track,
@@ -1395,7 +1396,16 @@ def _align_and_keep(
     # cause of that shape (a donor covering one episode of two, half a film,
     # a truncated recording) is caught here, after the sync gate.
     undescribed, dropped = undescribed_seconds(report)
-    note = _undescribed_note(undescribed, dropped, undescribed_spans(report), total_runtime)
+    spans = undescribed_spans(report)
+    # Measured against the video itself, not the stretch the segments span: a
+    # recording that runs out early leaves the rest of the picture outside
+    # every segment, where nothing above counts it (Family Guy S09E01, Gossip
+    # Girl S06E10: half the episode undescribed, published, 2026-10-01).
+    video_runtime = _audio_duration(video_path) or total_runtime
+    ends = uncovered_ends(report, video_runtime)
+    undescribed += sum(end - start for start, end in ends)
+    spans = sorted(spans + ends)
+    note = _undescribed_note(undescribed, dropped, spans, video_runtime)
 
     # similarity is describealaign's match-confidence metric: the fraction of
     # the AD release's embedded program audio that aligned against the video.
@@ -1420,8 +1430,8 @@ def _align_and_keep(
         title_corroborated=title_corroborated,
         primary_audio_english=primary_english,
     )
-    if accepted and note and total_runtime > 0 \
-            and undescribed >= _UNDESCRIBED_MAJOR_FRACTION * total_runtime:
+    if accepted and note and video_runtime > 0 \
+            and undescribed >= _UNDESCRIBED_MAJOR_FRACTION * video_runtime:
         accepted, decision_detail = False, note
     if not accepted:
         logger.warning("Discarding %s — %s", video_path.name, decision_detail)
