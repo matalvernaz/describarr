@@ -538,6 +538,58 @@ def undescribed_spans(report: Optional[Path]) -> list[tuple[float, float]]:
     return spans
 
 
+# Head or tail time this short outside the aligned stretch is ordinary: a cold
+# open before the recording starts, end credits after it stops. A film's credits
+# run minutes, so the tail may also be this share of the runtime.
+_END_ALLOWANCE_SEC = 60.0
+_CREDITS_ALLOWANCE_FRACTION = 0.10
+
+
+def described_seconds(report: Optional[Path]) -> float:
+    """Video time the engine replaced with the recording: the segments within ±10 %.
+
+    Everything else in the picture, unreplaced segments, holes between
+    segments, and whatever lies before the first or after the last, plays
+    with no description.
+    """
+    metrics = _read_metrics(report)
+    if metrics is None:
+        return 0.0
+    return sum(
+        max(0.0, _segment_duration(seg)) for seg in metrics.get("segments", [])
+        if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT
+    )
+
+
+def uncovered_ends(report: Optional[Path], video_duration: float) -> list[tuple[float, float]]:
+    """The video before the first aligned segment and after the last, when longer than ordinary.
+
+    For the success note: where the picture is undescribed. (The refusal
+    weighs :func:`described_seconds` against the whole video instead, so
+    nothing an allowance leaves out can tip it.) :func:`undescribed_spans`
+    sees only the segments the engine wrote, so a
+    recording that runs out before the video does leaves the rest of the
+    picture out of every count. Family Guy S09E01 (2026-10-01) is 49 minutes;
+    its recording was the first half alone, the segments stopped at 26:42, and
+    the note said 4 minutes were undescribed. Returns ``(start_sec, end_sec)``
+    pairs, empty when *video_duration* is unknown.
+    """
+    metrics = _read_metrics(report)
+    if metrics is None or video_duration <= 0:
+        return []
+    segments = metrics.get("segments", [])
+    if not segments:
+        return []
+    first = min(float(seg["video_start_sec"]) for seg in segments)
+    last = max(float(seg["video_end_sec"]) for seg in segments)
+    ends = []
+    if first > _END_ALLOWANCE_SEC:
+        ends.append((0.0, first))
+    if video_duration - last > max(_END_ALLOWANCE_SEC, video_duration * _CREDITS_ALLOWANCE_FRACTION):
+        ends.append((last, video_duration))
+    return ends
+
+
 def sync_quality(report: Optional[Path]) -> tuple[bool, str]:
     """
     Return (ok, reason) where ok=False means the alignment is likely unreliable.

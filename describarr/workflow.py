@@ -31,11 +31,13 @@ import requests
 from .aligner import (
     OUTPUT_VALIDATION_FAILED,
     EngineFailure,
+    described_seconds,
     run as align,
     parse_score,
     content_score,
     slope_stability,
     sync_quality,
+    uncovered_ends,
     undescribed_seconds,
     undescribed_spans,
     source_has_ad_track,
@@ -1395,7 +1397,24 @@ def _align_and_keep(
     # cause of that shape (a donor covering one episode of two, half a film,
     # a truncated recording) is caught here, after the sync gate.
     undescribed, dropped = undescribed_seconds(report)
-    note = _undescribed_note(undescribed, dropped, undescribed_spans(report), total_runtime)
+    spans = undescribed_spans(report)
+    # The segments alone hide a recording that runs out early: the rest of the
+    # picture lies outside every one of them, where nothing above counts it
+    # (Family Guy S09E01 and S09E07, Gossip Girl S06E10: half the episode
+    # undescribed and published, 2026-10-01). With the video's real length the
+    # refusal below weighs everything no placed recording covers; it can only
+    # ever be stricter than the segment count. Without it, as before.
+    picture = _audio_duration(video_path)
+    if picture > 0:
+        picture = max(picture, total_runtime)
+        ends = uncovered_ends(report, picture)
+        undescribed += sum(end - start for start, end in ends)
+        spans = sorted(spans + ends)
+        unreached = max(undescribed, picture - described_seconds(report))
+        runtime = picture
+    else:
+        unreached, runtime = undescribed, total_runtime
+    note = _undescribed_note(undescribed, dropped, spans, runtime)
 
     # similarity is describealaign's match-confidence metric: the fraction of
     # the AD release's embedded program audio that aligned against the video.
@@ -1420,9 +1439,12 @@ def _align_and_keep(
         title_corroborated=title_corroborated,
         primary_audio_english=primary_english,
     )
-    if accepted and note and total_runtime > 0 \
-            and undescribed >= _UNDESCRIBED_MAJOR_FRACTION * total_runtime:
-        accepted, decision_detail = False, note
+    if accepted and runtime > 0 and (picture > 0 or note) \
+            and unreached >= _UNDESCRIBED_MAJOR_FRACTION * runtime:
+        accepted, decision_detail = False, (
+            _undescribed_note(unreached, dropped, spans, runtime)
+            or f"{_fmt_duration(unreached)} of {_fmt_duration(runtime)} has no description"
+        )
     if not accepted:
         logger.warning("Discarding %s — %s", video_path.name, decision_detail)
         _cleanup_combined(combined)

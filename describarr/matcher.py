@@ -423,7 +423,43 @@ def episode_donor_options(
             logger.info("No number match for E%02d; %s is titled as %r.",
                         episode, titled.name, episode_title)
         options.insert(0, (titled,))
+    # The parts of one recording can be filed under consecutive numbers too: the
+    # "AudioVault Original" season 9 has "[S09.E01] And Then There Were Fewer Pt
+    # 1" and "[S09.E02] ... Pt 2" for the library's one 49-minute S09E01.
+    titled_parts = _title_parts(audio_files, episode_title, series_title)
+    if titled_parts and titled_parts not in options:
+        logger.info("%d parts are titled as %r: %s.", len(titled_parts), episode_title,
+                    ", ".join(p.name for p in titled_parts))
+        options.insert(0, titled_parts)
     return options
+
+
+def _title_parts(
+    audio_files: list[Path], episode_title: str, series_title: str,
+) -> tuple[Path, ...]:
+    """The parts 1..N of one recording titled as *episode_title*, whatever their numbers; else ``()``.
+
+    A file counts when its name, less its part number, agrees with the title
+    (a near spelling will do: this only chooses what is aligned). Two files
+    claiming the same part number make it ambiguous, and nothing is returned.
+    """
+    parts: dict[int, Path] = {}
+    for audio in audio_files:
+        m = _PART_SUFFIX_RE.search(audio.stem)
+        if not m:
+            continue
+        whole = _PART_SUFFIX_RE.sub("", audio.stem).rstrip(" -_.(")
+        if donor_names_episode(
+            episode_title, whole + audio.suffix, series_title=series_title, fuzzy=True,
+        ) is not True:
+            continue
+        number = int(m.group(1) or m.group(2))
+        if number in parts:
+            return ()
+        parts[number] = audio
+    if len(parts) < 2 or sorted(parts) != list(range(1, len(parts) + 1)):
+        return ()
+    return tuple(parts[n] for n in sorted(parts))
 
 
 def neighbour_donors(
