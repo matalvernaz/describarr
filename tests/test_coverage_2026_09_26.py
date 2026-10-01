@@ -149,7 +149,7 @@ def _walk(monkeypatch, tmp_path, audiovault_bytes, mirror_bytes):
     monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
     monkeypatch.setattr(workflow, "find_season", lambda results, *a, **k: results)
     monkeypatch.setattr(workflow, "_get_cached", lambda *a, **k: tmp_path / "s5.zip")
-    monkeypatch.setattr(workflow, "_episode_donor", lambda *a, **k: av)
+    monkeypatch.setattr(workflow, "_episode_donors", lambda *a, **k: [av])
     monkeypatch.setattr(workflow, "load_extra_sources", lambda: [_Source([la])])
     monkeypatch.setattr(workflow, "_align_and_keep",
                         lambda config, video_path, audio_path, **k:

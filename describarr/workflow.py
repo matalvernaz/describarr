@@ -45,10 +45,21 @@ from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
 from .decision_log import DecisionLog
 from .outcome_log import OutcomeLog
-from .matcher import extract_episode, find_movie, find_season
+from .matcher import (
+    episode_donor_options,
+    extract_episode,
+    find_movie,
+    find_season,
+    whole_recording_stem,
+)
 from .retry_queue import RetryQueue
 from .sources import episode_candidates_from, load_extra_sources
-from .titles import donor_episode_title, episode_title_from_filename, titles_agree
+from .titles import (
+    donor_episode_title,
+    donor_names_episode,
+    episode_title_from_filename,
+    episode_title_from_nfo,
+)
 
 # Errors we treat as transient (re-queue and retry on next drain).
 # AudioVault occasional 5xx, a flaky Cloudflare edge, or a stalled CDN
@@ -189,7 +200,17 @@ def process_episode(
         ep_label = "".join(f"E{e:02d}" for e in all_episodes)
         logger.info("Looking up: %s S%02d%s (multi-episode)", series_title, season, ep_label)
 
-    title = episode_title or episode_title_from_filename(video_path.name)
+    # Sonarr's title first, then the media server's .nfo (a release named
+    # "Family Guy S12E14 1080p WEB-DL AAC2.0 AVC-TrollHD" carries none, and a
+    # manual retry has no Sonarr title), then the release name's. A
+    # multi-episode file's .nfo holds several titles, so it is not read.
+    title, title_from = episode_title, "Sonarr"
+    if not title and len(all_episodes) == 1:
+        title, title_from = episode_title_from_nfo(video_path, season, episode), "its .nfo"
+    if not title:
+        title, title_from = episode_title_from_filename(video_path.name), "its file name"
+    if title:
+        logger.info("Episode title for %s: %r (from %s).", label, title, title_from)
     tried: set[str] = set()
 
     search_title = _strip_title_qualifiers(series_title)
@@ -225,24 +246,27 @@ def process_episode(
             except DailyLimitReached:
                 raise
             extract_dir = zip_cache_dir / f"season_{season:02d}" / _safe_dirname(candidate["name"])
-            audio_path = _episode_donor(
+            donors = _episode_donors(
                 zip_path, extract_dir, all_episodes, label, episode_title=title,
+                series_title=series_title, video_path=video_path,
             )
-            if not audio_path:
+            if not donors:
                 logger.warning(
                     "%r cannot cover %s — trying next candidate.", candidate["name"], label
                 )
                 continue
-            if _already_tried(audio_path, tried, label):
-                continue
-            published, reason = _align_and_keep(
-                config, video_path, audio_path, label=label, episode_title=title,
-            )
-            if published:
-                for ep in all_episodes:
-                    _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
-                return True, reason
-            last_reason = reason
+            for audio_path in donors:
+                if _already_tried(audio_path, tried, label):
+                    continue
+                published, reason = _align_and_keep(
+                    config, video_path, audio_path, label=label, episode_title=title,
+                    series_title=series_title,
+                )
+                if published:
+                    for ep in all_episodes:
+                        _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
+                    return True, reason
+                last_reason = reason
             logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
         # Extra (privately-supplied) sources, tried after AudioVault. Each yields
@@ -271,6 +295,7 @@ def process_episode(
                         continue
                     published, reason = _align_and_keep(
                         config, video_path, audio_path, label=label, episode_title=title,
+                        series_title=series_title,
                     )
                     if published:
                         # An extra source may deliver a bare per-episode file with
@@ -696,43 +721,96 @@ def _already_tried(audio_path: Path, tried: set[str], label: str) -> bool:
     return False
 
 
-def _episode_donor(
+def _episode_donors(
     zip_path: Path, extract_dir: Path, episodes: list[int], label: str,
-    episode_title: str = "",
-) -> Optional[Path]:
-    """The AD audio for *episodes* from one catalogue entry, or None.
+    episode_title: str = "", series_title: str = "", video_path: Optional[Path] = None,
+) -> list[Path]:
+    """The AD audio files one catalogue entry offers for *episodes*, best first.
 
-    One episode: its own file. A multi-episode video (Sonarr's ``S02E12-E13``):
-    every covered episode's file joined in order, so the whole picture is
-    described. None when any part is missing — publishing half a double
-    episode is the failure this exists to prevent (Avatar S02E12-E13,
-    2026-09-16: E12's description alone left 23 minutes silent).
+    One episode: every option :func:`episode_donor_options` finds — a file
+    titled as this episode ahead of the one its number picks, and a recording
+    split into parts joined (see :func:`_whole_recording`). The caller aligns
+    them in turn and the acceptance gate judges each.
 
-    The joined file lives beside the extract dir, not inside it: the ledger
+    A multi-episode video (Sonarr's ``S02E12-E13``): every covered episode's
+    file joined in order, so the whole picture is described. Nothing when any
+    part is missing — publishing half a double episode is the failure this
+    exists to prevent (Avatar S02E12-E13, 2026-09-16: E12's description alone
+    left 23 minutes silent). A multi-episode file's parts have their own
+    titles, so *episode_title* plays no part there.
+
+    Joined files live beside the extract dir, not inside it: the ledger
     snaps a season's episode count from the extract dir's audio files, and
     an extra file there would keep the season from ever completing.
-
-    *episode_title* guards a single episode's positional fallback (see
-    :func:`extract_episode`); a multi-episode file's parts have their own
-    titles, so it is not passed for those.
     """
+    if len(episodes) == 1:
+        donors: list[Path] = []
+        for option in episode_donor_options(
+            zip_path, extract_dir, episodes[0],
+            episode_title=episode_title, series_title=series_title,
+        ):
+            donor = option[0] if len(option) == 1 else _whole_recording(
+                option, extract_dir, video_path, label,
+            )
+            if donor is not None:
+                donors.append(donor)
+        if not donors:
+            logger.warning(
+                "E%02d not found in %s — cannot describe %s from this entry.",
+                episodes[0], zip_path.name, label,
+            )
+        return donors
     parts: list[Path] = []
-    single_title = episode_title if len(episodes) == 1 else ""
     for ep in episodes:
-        part = extract_episode(zip_path, extract_dir, ep, episode_title=single_title)
+        part = extract_episode(zip_path, extract_dir, ep)
         if not part:
             logger.warning(
                 "E%02d not found in %s — cannot describe %s from this entry.",
                 ep, zip_path.name, label,
             )
-            return None
+            return []
         parts.append(part)
-    if len(parts) == 1:
-        return parts[0]
     joined = extract_dir.with_name(extract_dir.name + "_multi") / (
         "".join(f"E{e:02d}" for e in episodes) + ".mp3"
     )
-    return _concat_audio(parts, joined)
+    joined = _concat_audio(parts, joined)
+    return [joined] if joined else []
+
+
+def _whole_recording(
+    parts: tuple[Path, ...], extract_dir: Path, video_path: Optional[Path], label: str,
+) -> Optional[Path]:
+    """One recording's numbered parts joined, when the video is the whole of it.
+
+    A double-length episode can be catalogued as its halves under one number:
+    Family Guy S13E01 "The Simpsons Guy" (2026-10-01) is "… part 1" and "…
+    part 2", and either half alone left 22 of its 44 minutes undescribed and
+    was refused. A library that splits such an episode in two holds one half
+    per file instead, so the join is used only when its length is nearer the
+    video's than any single part's is; otherwise, or when a length cannot be
+    read, the first part is offered alone.
+
+    The joined file keeps the parts' shared name without the part number, so
+    the title checks downstream still read the episode it describes.
+    """
+    # ffprobe's container duration reads a video as readily as an audio file.
+    video = _audio_duration(video_path) if video_path is not None else 0.0
+    durations = [_audio_duration(p) for p in parts]
+    if video <= 0 or not all(d > 0 for d in durations):
+        logger.info("%s: could not measure %s against its parts; trying the first part alone.",
+                    label, video_path.name if video_path else "the video")
+        return parts[0]
+    whole = sum(durations)
+    if abs(whole - video) >= min(abs(d - video) for d in durations):
+        logger.info(
+            "%s: the video (%.0f s) is the length of one part, not of all %d (%.0f s); "
+            "trying %s alone.", label, video, len(parts), whole, parts[0].name,
+        )
+        return parts[0]
+    joined = extract_dir.with_name(extract_dir.name + "_parts") / (
+        whole_recording_stem(parts) + ".mp3"
+    )
+    return _concat_audio(list(parts), joined)
 
 
 _BACKUP_SUBDIR = ".describarr_backup"
@@ -973,17 +1051,20 @@ def _log_decision(
 
 def _corroboration(
     video_path: Path, audio_path: Path, episode_title: str, score: float,
+    series_title: str = "",
 ) -> tuple[bool, bool]:
     """Title and language evidence for the corroborated rescue.
 
     Returns ``(title_corroborated, primary_audio_english)``. Probed only when
     the score falls in the band that rescue covers, so ordinary alignments pay
-    for no extra ffprobe; logged so the decision can be audited.
+    for no extra ffprobe; logged so the decision can be audited. The donor's
+    name must give the episode's title EXACTLY; *series_title* only lets a name
+    that repeats the show's own ("Family Guy - Baking Bad") be read by the rest.
     """
     if not (_CORROBORATED_MIN_SCORE <= score < _RESCUE_MIN_SCORE):
         return False, False
     donor_title = donor_episode_title(audio_path.name)
-    agree = titles_agree(episode_title, donor_title)
+    agree = donor_names_episode(episode_title, audio_path.name, series_title=series_title)
     english = primary_audio_is_english(video_path) if agree else False
     logger.info(
         "Corroboration for %s: episode title %r vs donor %r → %s; first audio track English: %s",
@@ -998,11 +1079,14 @@ def _align_and_keep(
     audio_path: Path,
     label: Optional[str] = None,
     episode_title: str = "",
+    series_title: str = "",
 ) -> tuple[bool, Optional[str]]:
     """Run alignment and either keep or discard the combined output.
 
     *episode_title* (episodes only) is compared with the title in the donor's
     filename for the corroborated rescue; empty means no title evidence.
+    *series_title* lets that comparison read past the show's own name in front
+    of the donor's title.
 
     Returns ``(published, reason)``. On success *reason* is None or an
     informational note (see :func:`_undescribed_note`); on failure it is a
@@ -1079,7 +1163,7 @@ def _align_and_keep(
         video_path.name, score, cscore, stable_fraction, median_rate, total_runtime, piecewise,
     )
     title_corroborated, primary_english = _corroboration(
-        video_path, audio_path, episode_title, score,
+        video_path, audio_path, episode_title, score, series_title,
     )
 
     # Coverage is a separate question from sync. similarity says the narration

@@ -20,7 +20,7 @@ import describarr.server as srv
 from conftest import fake_config
 import describarr.workflow as workflow
 from describarr.config import Config
-from describarr.workflow import _concat_audio, _episode_donor, process_episode
+from describarr.workflow import _concat_audio, _episode_donors, process_episode
 
 
 # ── parsing every style Sonarr writes ─────────────────────────────────────────
@@ -144,13 +144,17 @@ def _fake_zip_with(monkeypatch, tmp_path, present):
     def fake_extract(zip_path, extract_dir, episode, episode_title=""):
         return files.get(episode)
 
+    def fake_options(zip_path, extract_dir, episode, episode_title="", series_title=""):
+        return [(files[episode],)] if episode in files else []
+
     monkeypatch.setattr(workflow, "extract_episode", fake_extract)
+    monkeypatch.setattr(workflow, "episode_donor_options", fake_options)
     return files
 
 
 def test_single_episode_donor_is_its_own_file(monkeypatch, tmp_path):
     files = _fake_zip_with(monkeypatch, tmp_path, [12])
-    assert _episode_donor(tmp_path / "s.zip", tmp_path / "extract", [12], "x") == files[12]
+    assert _episode_donors(tmp_path / "s.zip", tmp_path / "extract", [12], "x") == [files[12]]
 
 
 def test_double_episode_donor_joins_both_files_beside_the_extract_dir(monkeypatch, tmp_path):
@@ -164,8 +168,8 @@ def test_double_episode_donor_joins_both_files_beside_the_extract_dir(monkeypatc
 
     monkeypatch.setattr(workflow, "_concat_audio", fake_concat)
     extract_dir = tmp_path / "season_02" / "entry"
-    result = _episode_donor(tmp_path / "s.zip", extract_dir, [12, 13], "x")
-    assert result == joined["out"]
+    result = _episode_donors(tmp_path / "s.zip", extract_dir, [12, 13], "x")
+    assert result == [joined["out"]]
     assert joined["parts"] == [files[12], files[13]]
     assert joined["out"] == tmp_path / "season_02" / "entry_multi" / "E12E13.mp3"
     assert extract_dir not in joined["out"].parents             # never inside the extract dir
@@ -174,7 +178,7 @@ def test_double_episode_donor_joins_both_files_beside_the_extract_dir(monkeypatc
 def test_double_episode_with_a_missing_part_is_refused(monkeypatch, tmp_path):
     _fake_zip_with(monkeypatch, tmp_path, [12])                 # no E13 in this entry
     monkeypatch.setattr(workflow, "_concat_audio", lambda parts, out: pytest.fail("must not join"))
-    assert _episode_donor(tmp_path / "s.zip", tmp_path / "extract", [12, 13], "x") is None
+    assert _episode_donors(tmp_path / "s.zip", tmp_path / "extract", [12, 13], "x") == []
 
 
 def test_process_episode_aligns_the_joined_donor_and_marks_both_done(monkeypatch, tmp_path):

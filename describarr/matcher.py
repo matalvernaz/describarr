@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from .titles import donor_episode_title, titles_agree
+from .titles import _TRACK_NUMBER_MAX_DIGITS, donor_episode_title, donor_names_episode
 
 logger = logging.getLogger(__name__)
 
@@ -282,8 +282,27 @@ def find_movie(results: list[dict], title: str, year: str) -> list[dict]:
 # Episode extraction
 # ------------------------------------------------------------------
 
+# A pack numbered like a CD: every file opens with a bare track number and the
+# title ("01 Married With Cancer.mp3" … "20 Adam West High.mp3", Family Guy
+# season 17). The number is the episode's only when the WHOLE pack is laid out
+# so, each number once: a lone leading number in a pack named any other way is
+# as likely to begin a title ("3 Acts of God").
+_TRACK_PREFIX_RE = re.compile(rf"^(\d{{1,{_TRACK_NUMBER_MAX_DIGITS}}})\s+(?=[^\W\d_])")
+
+# "part 1", "pt. 2", "(part 1)" or "(2)" closing a file's name: one episode
+# recorded in pieces. Family Guy's double-length "The Simpsons Guy" is filed as
+# "13 - 01 … the Simpsons Guy part 1" and "13 - 01 … The simpson guy part 2".
+_PART_SUFFIX_RE = re.compile(r"(?i)(?:\b(?:part|pt)\.?\s*(\d+)|\((\d+)\))\s*\)?\s*$")
+
+# How well a donor's name agrees with the episode's title, for ranking files.
+_TITLE_EXACT = 2
+_TITLE_NEAR = 1
+_TITLE_NONE = 0
+
+
 def extract_episode(
     zip_path: Path, extract_dir: Path, episode: int, episode_title: str = "",
+    series_title: str = "",
 ) -> Optional[Path]:
     """
     Extract *zip_path* into *extract_dir* (if not already done) and return
@@ -292,20 +311,97 @@ def extract_episode(
     Episode matching tries several patterns in order:
       1. Explicit SxxEnn or Exx pattern in the filename.
       2. epNN or episodeNN pattern.
-      3. Positional fallback (nth audio file sorted lexicographically).
+      3. A bare track number, in a pack that numbers every file that way.
+      4. Positional fallback (nth audio file sorted lexicographically).
 
     The positional fallback is refused when *episode_title* and the chosen
     file's own title are both known and disagree: a zip that lacks the episode
     shifts every later file up one place. This Is Us S02E06 "The 20's"
     (2026-09-25) had no file, so the fallback handed over "2.07 The Most
     Disappointed Man" and spent an alignment on the wrong episode.
+    *series_title* lets a file that repeats the show's name ("Family Guy -
+    Baking Bad") be read as titled by the rest.
+
+    This is the number's pick alone; :func:`episode_donor_options` adds the
+    alternatives a title or a split recording offers.
     """
-    # If the "file" is actually already an MP3/audio, return it directly.
     if zip_path.suffix.lower() in _AUDIO_EXTS:
         return zip_path
+    audio_files = _extracted_audio(zip_path, extract_dir)
+    if not audio_files:
+        return None
+    numbered = _numbered(audio_files, episode)
+    if numbered:
+        logger.info("Matched episode %02d → %s", episode, numbered[0].name)
+        return numbered[0]
+    return _positional(audio_files, episode, episode_title, series_title)
 
+
+def episode_donor_options(
+    zip_path: Path, extract_dir: Path, episode: int, episode_title: str = "",
+    series_title: str = "",
+) -> list[tuple[Path, ...]]:
+    """Every way one season pack can describe *episode*, best first.
+
+    Each option is a tuple of files: one file, or the parts of one recording
+    to be joined in order. The caller aligns them in turn and the acceptance
+    gate judges each, so an option only decides what is TRIED:
+
+    * the number's pick (:func:`extract_episode`), or, when every file the
+      number picks is a numbered part, all the parts — "The Simpsons Guy" is
+      one 44-minute episode recorded as two halves under one number;
+    * ahead of it, a file elsewhere in the pack whose title agrees better with
+      *episode_title* than the number's pick does. A catalogue can number a
+      season differently from the library: AudioVault's Family Guy season 12
+      files "Fresh Heir" as E13, which is the library's E14, and its "Season
+      13 UK" swaps E02 and E04 (2026-10-01). The number's pick stays as the
+      fallback, because a catalogue's own title can be misspelt beyond
+      recognition ("Stewie Chris and Steve's excellent adventure" is S13E07).
+    """
+    if zip_path.suffix.lower() in _AUDIO_EXTS:
+        return [(zip_path,)]
+    audio_files = _extracted_audio(zip_path, extract_dir)
+    if not audio_files:
+        return []
+    numbered = _numbered(audio_files, episode)
+    if numbered:
+        parts = _split_recording(numbered)
+        primary = parts or (numbered[0],)
+        if parts:
+            logger.info(
+                "Matched episode %02d → %d parts: %s",
+                episode, len(parts), ", ".join(p.name for p in parts),
+            )
+        else:
+            logger.info("Matched episode %02d → %s", episode, numbered[0].name)
+    else:
+        positional = _positional(audio_files, episode, episode_title, series_title)
+        primary = (positional,) if positional else ()
+    options = [primary] if primary else []
+    if not episode_title:
+        return options
+    primary_level = (
+        _title_agreement(episode_title, primary[0].name, series_title) if primary else _TITLE_NONE
+    )
+    titled, titled_level = _best_title_match(
+        audio_files, episode_title, series_title, exclude=set(primary),
+    )
+    if titled is not None and titled_level > primary_level:
+        if primary:
+            logger.info(
+                "%s is titled as %r and %s is not — trying it before the number's pick.",
+                titled.name, episode_title, primary[0].name,
+            )
+        else:
+            logger.info("No number match for E%02d; %s is titled as %r.",
+                        episode, titled.name, episode_title)
+        options.insert(0, (titled,))
+    return options
+
+
+def _extracted_audio(zip_path: Path, extract_dir: Path) -> list[Path]:
+    """The pack's audio files, extracted on first use, in natural order."""
     _ensure_extracted(zip_path, extract_dir)
-
     # Natural sort so the positional fallback orders files numerically
     # (Track 1, Track 2, …, Track 10) rather than lexicographically
     # (Track 1, Track 10, Track 11, …, Track 2). Previously episode 2's
@@ -314,11 +410,17 @@ def extract_episode(
     audio_files = _natsort_paths(
         f for f in extract_dir.rglob("*") if f.is_file() and f.suffix.lower() in _AUDIO_EXTS
     )
-
     if not audio_files:
         logger.error("No audio files found after extracting %s.", zip_path.name)
-        return None
+    return audio_files
 
+
+def _numbered(audio_files: list[Path], episode: int) -> list[Path]:
+    """Every file whose name carries *episode*'s number, in pack order.
+
+    The first is the number's pick; more than one only matters when they are
+    the parts of one recording (see :func:`_split_recording`).
+    """
     # Pattern list, tried in order.
     patterns = [
         re.compile(rf"[Ee]{episode:02d}(?!\d)"),
@@ -334,13 +436,29 @@ def extract_episode(
         # only thing matching these and could pick the wrong file.
         re.compile(rf"^\d+\.0*{episode}(?!\d)"),
     ]
+    found = [a for a in audio_files if any(p.search(a.stem) for p in patterns)]
+    if found:
+        return found
+    track = _track_numbers(audio_files).get(episode)
+    return [track] if track else []
 
+
+def _track_numbers(audio_files: list[Path]) -> dict[int, Path]:
+    """Episode number → file for a pack whose every file opens with a bare
+    track number, each number once; empty for a pack named any other way."""
+    numbered: dict[int, Path] = {}
     for audio in audio_files:
-        for pattern in patterns:
-            if pattern.search(audio.stem):
-                logger.info("Matched episode %02d → %s", episode, audio.name)
-                return audio
+        m = _TRACK_PREFIX_RE.match(audio.stem)
+        if not m or int(m.group(1)) in numbered:
+            return {}
+        numbered[int(m.group(1))] = audio
+    return numbered
 
+
+def _positional(
+    audio_files: list[Path], episode: int, episode_title: str, series_title: str,
+) -> Optional[Path]:
+    """The file at *episode*'s place in the pack, unless its title names another episode."""
     # Positional fallback (1-based). Episode 0 is excluded: it means "special
     # episode", and positional index -1 would be meaningless; the filename
     # patterns above must match explicitly for specials.
@@ -352,12 +470,13 @@ def extract_episode(
 
     if 1 <= episode <= len(audio_files):
         chosen = audio_files[episode - 1]
-        chosen_title = donor_episode_title(chosen.name)
-        if titles_agree(episode_title, chosen_title, fuzzy=True) is False:
+        if donor_names_episode(
+            episode_title, chosen.name, series_title=series_title, fuzzy=True,
+        ) is False:
             logger.warning(
                 "No filename match for E%02d; the positional fallback %s is titled %r, "
                 "not %r — not using it.",
-                episode, chosen.name, chosen_title, episode_title,
+                episode, chosen.name, donor_episode_title(chosen.name), episode_title,
             )
             return None
         logger.warning(
@@ -369,6 +488,63 @@ def extract_episode(
 
     logger.error("Episode %02d not found among %d audio files.", episode, len(audio_files))
     return None
+
+
+def _split_recording(numbered: list[Path]) -> tuple[Path, ...]:
+    """*numbered* in part order when it is one recording's parts 1..N, else ``()``."""
+    if len(numbered) < 2:
+        return ()
+    parts: dict[int, Path] = {}
+    for audio in numbered:
+        m = _PART_SUFFIX_RE.search(audio.stem)
+        if not m:
+            return ()
+        number = int(m.group(1) or m.group(2))
+        if number in parts:
+            return ()
+        parts[number] = audio
+    if sorted(parts) != list(range(1, len(parts) + 1)):
+        return ()
+    return tuple(parts[n] for n in sorted(parts))
+
+
+def whole_recording_stem(parts: tuple[Path, ...]) -> str:
+    """The name a recording's joined parts go by: the first part's, less its part number.
+
+    ``13 - 01  Family Guy - the Simpsons Guy part 1`` gives ``13 - 01  Family
+    Guy - the Simpsons Guy``, which still reads as naming the episode.
+    """
+    stem = _PART_SUFFIX_RE.sub("", parts[0].stem).rstrip(" -_.(")
+    return stem or parts[0].stem
+
+
+def _title_agreement(episode_title: str, donor_name: str, series_title: str) -> int:
+    """``_TITLE_EXACT``, ``_TITLE_NEAR`` or ``_TITLE_NONE`` for how *donor_name* names the episode."""
+    if donor_names_episode(episode_title, donor_name, series_title=series_title) is True:
+        return _TITLE_EXACT
+    if donor_names_episode(
+        episode_title, donor_name, series_title=series_title, fuzzy=True,
+    ) is True:
+        return _TITLE_NEAR
+    return _TITLE_NONE
+
+
+def _best_title_match(
+    audio_files: list[Path], episode_title: str, series_title: str, exclude: set[Path],
+) -> tuple[Optional[Path], int]:
+    """The pack's file whose title agrees best with *episode_title*, and how well.
+
+    Exact agreement beats a near spelling; between equals the pack's first
+    wins. ``(None, _TITLE_NONE)`` when no file agrees at all.
+    """
+    best, best_level = None, _TITLE_NONE
+    for audio in audio_files:
+        if audio in exclude:
+            continue
+        level = _title_agreement(episode_title, audio.name, series_title)
+        if level > best_level:
+            best, best_level = audio, level
+    return best, best_level
 
 
 # ------------------------------------------------------------------
