@@ -48,7 +48,7 @@ def test_country_qualified_show_reaches_audiovault(monkeypatch, tmp_path):
 
     monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
     monkeypatch.setattr(workflow, "_get_cached", fake_get_cached)
-    monkeypatch.setattr(workflow, "_episode_donor", lambda *a, **k: tmp_path / "12.07.mp3")
+    monkeypatch.setattr(workflow, "_episode_donors", lambda *a, **k: [tmp_path / "12.07.mp3"])
     monkeypatch.setattr(workflow, "_align_and_keep", lambda *a, **k: (True, None))
     monkeypatch.setattr(workflow, "_mark_episode_done", lambda *a, **k: None)
     monkeypatch.setattr(workflow, "load_extra_sources",

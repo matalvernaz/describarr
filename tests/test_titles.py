@@ -101,3 +101,123 @@ def test_acceptance_needs_the_exact_title():
 def test_fuzzy_agreement_still_needs_the_same_numbers():
     assert titles_agree("A Hell of a Week (1)", "A Hell of a Week (2)", fuzzy=True) is False
     assert titles_agree("Brother", "Brothers", fuzzy=True) is True
+
+
+# ── a donor's name read past catalogue clutter (2026-10-01, Family Guy) ──────
+
+from describarr.matcher import _split_recording, whole_recording_stem  # noqa: E402
+from describarr.titles import (  # noqa: E402
+    donor_names_episode,
+    donor_title_readings,
+    episode_title_from_nfo,
+)
+
+
+@pytest.mark.parametrize("donor, title", [
+    ("16 You Can't Handle the Booth.mp3", "You Can't Handle the Booth"),   # track number
+    ("13 - 02  Family Guy - Baking Bad.mp3", "Baking Bad"),                # the show's name
+    ("[S12.E01] Family Guy - Finders Keepers.mp3", "Finders Keepers"),
+    ("13 - 12  Family guy - Stewie is Enciente.mp3", "Stewie is Enciente"),
+    ("01 Family Guy - Pilot.mp3", "Pilot"),                                # both
+    ("[S12.E21] 3 Acts of God.mp3", "3 Acts of God"),                      # a number IN the title
+])
+def test_a_donor_names_its_episode_past_the_clutter(donor, title):
+    assert donor_names_episode(title, donor, series_title="Family Guy") is True
+
+
+def test_a_series_year_does_not_hide_the_show_name():
+    assert donor_names_episode("Baking Bad", "13 - 02  Family Guy - Baking Bad.mp3",
+                               series_title="Family Guy (1999)") is True
+
+
+def test_reading_past_the_clutter_still_tells_episodes_apart():
+    assert donor_names_episode("The Book of Joe", "13 - 02  Family Guy - Baking Bad.mp3",
+                               series_title="Family Guy") is False
+    # Exact stays exact once the clutter is gone: no near spelling vouches.
+    assert donor_names_episode("Pilot", "01 Family Guy - Pilots.mp3", series_title="Family Guy") is False
+
+
+def test_the_literal_reading_comes_first():
+    assert donor_title_readings("16 You Can't Handle the Booth.mp3")[0] == "16 You Can't Handle the Booth"
+
+
+@pytest.mark.parametrize("donor", ["Track 07.mp3", "07.mp3", "Family Guy - 07.mp3"])
+def test_a_counter_left_after_the_clutter_names_nothing(donor):
+    # "Family Guy - 07" is the show's name and a counter: no title at all.
+    assert donor_names_episode("Pilot", donor, series_title="Family Guy") in (None, False)
+    assert all(not r.isdigit() for r in donor_title_readings(donor, "Family Guy")[1:])
+
+
+def test_a_release_may_drop_the_leading_article():
+    assert titles_agree("Book of Joe", "The Book of Joe", fuzzy=True) is True
+    assert titles_agree("Book of Joe", "The Book of Joe") is False        # never for acceptance
+
+
+# ── the title in Jellyfin's .nfo ─────────────────────────────────────────────
+
+def _nfo(tmp_path, body, name="Family Guy S12E14 1080p WEB-DL AAC2.0 AVC-TrollHD"):
+    video = tmp_path / f"{name}.mp4"
+    video.write_bytes(b"v")
+    (tmp_path / f"{name}.nfo").write_bytes(body.encode("utf-8"))
+    return video
+
+
+def _episode(title, season=12, episode=14):
+    return (f"﻿<?xml version=\"1.0\"?>\n<episodedetails>\n  <title>{title}</title>\n"
+            f"  <episode>{episode}</episode>\n  <season>{season}</season>\n</episodedetails>\n")
+
+
+def test_the_nfo_title_is_read(tmp_path):
+    assert episode_title_from_nfo(_nfo(tmp_path, _episode("Fresh Heir")), 12, 14) == "Fresh Heir"
+
+
+def test_the_nfo_title_is_unescaped(tmp_path):
+    video = _nfo(tmp_path, _episode("Stewie, Chris &amp; Brian&apos;s Excellent Adventure"))
+    assert episode_title_from_nfo(video, 12, 14) == "Stewie, Chris & Brian's Excellent Adventure"
+
+
+def test_a_cdata_title_is_read(tmp_path):
+    video = _nfo(tmp_path, _episode("<![CDATA[He's Bla-ack!]]>"))
+    assert episode_title_from_nfo(video, 12, 14) == "He's Bla-ack!"
+
+
+def test_an_nfo_for_another_number_is_not_trusted(tmp_path):
+    assert episode_title_from_nfo(_nfo(tmp_path, _episode("Fresh Heir", episode=13)), 12, 14) == ""
+    assert episode_title_from_nfo(_nfo(tmp_path, _episode("Fresh Heir", season=11)), 12, 14) == ""
+
+
+def test_a_multi_episode_nfo_is_not_trusted(tmp_path):
+    # Little House S03E21-E22's sidecar holds both episodes' titles.
+    body = _episode("Gold Country (1)", 3, 21) + _episode("Gold Country (2)", 3, 22).replace("﻿", "")
+    assert episode_title_from_nfo(_nfo(tmp_path, body), 3, 21) == ""
+
+
+def test_no_nfo_means_no_title(tmp_path):
+    video = tmp_path / "Family Guy S12E14 1080p WEB-DL AAC2.0 AVC-TrollHD.mp4"
+    video.write_bytes(b"v")
+    assert episode_title_from_nfo(video, 12, 14) == ""
+
+
+# ── one recording in numbered parts ──────────────────────────────────────────
+
+def test_parts_are_put_in_part_order(tmp_path):
+    p2 = tmp_path / "13 - 01  Family Guy - The simpson guy part 2.mp3"
+    p1 = tmp_path / "13 - 01  Family Guy - the Simpsons Guy part 1.mp3"
+    assert _split_recording([p2, p1]) == (p1, p2)
+    assert whole_recording_stem((p1, p2)) == "13 - 01  Family Guy - the Simpsons Guy"
+
+
+@pytest.mark.parametrize("names", [
+    ["Title part 1.mp3", "Title part 3.mp3"],               # a part missing
+    ["Title part 1.mp3", "Title.mp3"],                      # one is not a part
+    ["Title part 1.mp3", "Other part 1.mp3"],               # two first parts
+    ["Title part 1.mp3"],                                   # one file is just a file
+])
+def test_files_that_are_not_one_recording_are_not_joined(tmp_path, names):
+    assert _split_recording([tmp_path / n for n in names]) == ()
+
+
+def test_bracketed_part_numbers_count(tmp_path):
+    p1, p2 = tmp_path / "13.01 the Simpsons Guy (part 1).mp3", tmp_path / "13.01 the Simpsons Guy (part 2).mp3"
+    assert _split_recording([p1, p2]) == (p1, p2)
+    assert whole_recording_stem((p1, p2)) == "13.01 the Simpsons Guy"
