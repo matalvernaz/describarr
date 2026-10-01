@@ -47,7 +47,7 @@ from .decision_log import DecisionLog
 from .outcome_log import OutcomeLog
 from .matcher import extract_episode, find_movie, find_season
 from .retry_queue import RetryQueue
-from .sources import load_extra_sources
+from .sources import episode_candidates_from, load_extra_sources
 from .titles import donor_episode_title, episode_title_from_filename, titles_agree
 
 # Errors we treat as transient (re-queue and retry on next drain).
@@ -259,8 +259,12 @@ def process_episode(
                     )
                     source_candidates = [joined] if joined else []
                 else:
-                    source_candidates = source.episode_candidates(
-                        config.cache_dir, series_title, season, episode
+                    # Sonarr's title lets a source vouch for a file it would
+                    # otherwise pass over (a folder named for how the title
+                    # begins); an older source is asked without it.
+                    source_candidates = episode_candidates_from(
+                        source, config.cache_dir, series_title, season, episode,
+                        episode_title=title,
                     )
                 for audio_path in source_candidates:
                     if _already_tried(audio_path, tried, label):
