@@ -163,14 +163,24 @@ def titles_agree(a: str, b: str, *, fuzzy: bool = False) -> bool | None:
 # packs fill gaps with the plain soundtrack, "06 - 09  Family Guy - Back to the
 # Woods not described.mp3" (2026-10-01). It aligns almost perfectly, 98 %,
 # precisely because nothing is narrated, and was published as a description.
+# A whole catalogue entry can say it too: Family Guy's season 9 is "Season 9 not
+# described.zip", every file inside named as an ordinary episode. Letters, not
+# word boundaries, end the phrase, so a folder made from the name
+# ("family_guy_-_season_09_2010_not_described_parts") still reads as it.
 _UNDESCRIBED_DONOR_RE = re.compile(
-    r"(?i)\b(?:not|non|un)[\s_-]*described\b|\b(?:no|without)\s+(?:audio\s+)?description\b"
+    r"(?i)(?<![a-z])(?:not|non|un)[\s_-]*described(?![a-z])"
+    r"|(?<![a-z])(?:no|without)[\s_-]+(?:audio[\s_-]+)?description(?![a-z])"
 )
+
+
+def says_undescribed(text: str) -> bool:
+    """True when a file, folder or catalogue entry's name says it has no description."""
+    return bool(_UNDESCRIBED_DONOR_RE.search(text or ""))
 
 
 def donor_says_undescribed(name: str) -> bool:
     """True when a donor's file name says the recording has no description."""
-    return bool(_UNDESCRIBED_DONOR_RE.search(Path(name).stem))
+    return says_undescribed(Path(name).stem)
 
 
 def donor_title_readings(name: str, series_title: str = "") -> list[str]:

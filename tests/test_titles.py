@@ -244,3 +244,20 @@ def test_a_donor_that_says_it_has_no_description(name):
 def test_an_ordinary_donor_says_nothing_of_the_sort(name):
     from describarr.titles import donor_says_undescribed
     assert not donor_says_undescribed(name)
+
+
+@pytest.mark.parametrize("text", [
+    "Season 9 not described",
+    "family_guy_-_season_09_2010_not_described",
+    "family_guy_-_season_09_2010_not_described_parts",
+    "Family Guy - Season 09 (2010) [Not Described]",
+])
+def test_a_pack_or_folder_that_says_it_is_not_described(text):
+    from describarr.titles import says_undescribed
+    assert says_undescribed(text)
+
+
+@pytest.mark.parametrize("text", ["Mr. Robot - Season 1", "Described and Captioned", "The Undescribable Thing"])
+def test_an_ordinary_pack_name(text):
+    from describarr.titles import says_undescribed
+    assert not says_undescribed(text)
