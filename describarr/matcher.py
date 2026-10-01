@@ -288,6 +288,8 @@ def find_movie(results: list[dict], title: str, year: str) -> list[dict]:
 # so, each number once: a lone leading number in a pack named any other way is
 # as likely to begin a title ("3 Acts of God").
 _TRACK_PREFIX_RE = re.compile(rf"^(\d{{1,{_TRACK_NUMBER_MAX_DIGITS}}})\s+(?=[^\W\d_])")
+# The highest number such a pack may start at: "00 Recap" or "01 Pilot".
+_TRACK_NUMBERING_FIRST_MAX = 1
 
 # "part 1", "pt. 2", "(part 1)" or "(2)" closing a file's name: one episode
 # recorded in pieces. Family Guy's double-length "The Simpsons Guy" is filed as
@@ -389,7 +391,8 @@ def episode_donor_options(
     if titled is not None and titled_level > primary_level:
         if primary:
             logger.info(
-                "%s is titled as %r and %s is not — trying it before the number's pick.",
+                "%s agrees better with the title %r than %s does — trying it before "
+                "the number's pick.",
                 titled.name, episode_title, primary[0].name,
             )
         else:
@@ -445,13 +448,21 @@ def _numbered(audio_files: list[Path], episode: int) -> list[Path]:
 
 def _track_numbers(audio_files: list[Path]) -> dict[int, Path]:
     """Episode number → file for a pack whose every file opens with a bare
-    track number, each number once; empty for a pack named any other way."""
+    track number, each number once; empty for a pack named any other way.
+
+    The numbering must also start this season's count (at 0 or 1). A pack
+    numbered across the whole show (season 2 opening at "27 …") counts
+    episodes another way, and its "27" is this season's first episode, not
+    its 27th.
+    """
     numbered: dict[int, Path] = {}
     for audio in audio_files:
         m = _TRACK_PREFIX_RE.match(audio.stem)
         if not m or int(m.group(1)) in numbered:
             return {}
         numbered[int(m.group(1))] = audio
+    if numbered and min(numbered) > _TRACK_NUMBERING_FIRST_MAX:
+        return {}
     return numbered
 
 

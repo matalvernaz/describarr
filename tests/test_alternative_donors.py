@@ -328,3 +328,11 @@ def test_a_low_score_is_corroborated_by_a_donor_that_repeats_the_show_name(monke
     assert aligned == ["13 - 04  Family Guy - The book of Joe.mp3"]
     decision = json.loads((config.cache_dir / "decisions.json").read_text())[-1]
     assert decision["path"] == "corroborated-rescue"
+
+
+def test_a_pack_numbered_across_the_show_is_not_read_as_track_numbers(tmp_path):
+    # Season 2 of an absolutely numbered show opens at "27": its 27 is this
+    # season's first episode, so E27 must not be handed "27 Pilot".
+    pack = ("Show - Season 2", [f"{n} Title {n}.mp3" for n in range(27, 57)])
+    got = extract_episode(_pack(tmp_path, pack), tmp_path / "x", 27)
+    assert got.name == "53 Title 53.mp3"                    # the 27th file, as before

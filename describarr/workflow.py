@@ -55,8 +55,8 @@ from .matcher import (
 from .retry_queue import RetryQueue
 from .sources import episode_candidates_from, load_extra_sources
 from .titles import (
-    donor_episode_title,
     donor_names_episode,
+    donor_title_readings,
     episode_title_from_filename,
     episode_title_from_nfo,
 )
@@ -1063,12 +1063,14 @@ def _corroboration(
     """
     if not (_CORROBORATED_MIN_SCORE <= score < _RESCUE_MIN_SCORE):
         return False, False
-    donor_title = donor_episode_title(audio_path.name)
+    readings = donor_title_readings(audio_path.name, series_title)
     agree = donor_names_episode(episode_title, audio_path.name, series_title=series_title)
     english = primary_audio_is_english(video_path) if agree else False
     logger.info(
-        "Corroboration for %s: episode title %r vs donor %r → %s; first audio track English: %s",
-        video_path.name, episode_title, donor_title, agree, english,
+        "Corroboration for %s: episode title %r vs donor read as %s → %s; "
+        "first audio track English: %s",
+        video_path.name, episode_title, " / ".join(repr(r) for r in readings) or "''",
+        agree, english,
     )
     return agree is True, english
 

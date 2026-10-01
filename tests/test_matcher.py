@@ -211,3 +211,45 @@ def test_a_one_off_special_is_not_a_season():
     # still adds two real title words, and it is not season 1 of anything.
     results = [{"name": "The Office UK - Christmas Special (2003)", "url": "u-xmas"}]
     assert find_season(results, "The Office", 1, "2001") == []
+
+
+# ------------------------------------------------------------------
+# episode_donor_options: what one season pack offers for an episode
+# ------------------------------------------------------------------
+
+import zipfile  # noqa: E402
+
+from describarr.matcher import episode_donor_options  # noqa: E402
+
+
+def _zip(tmp_path, names):
+    zip_path = tmp_path / "pack.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for n in names:
+            zf.writestr(f"Show - Season 1/{n}", n.encode())
+    return zip_path
+
+
+def test_one_leading_number_does_not_make_a_track_numbered_pack(tmp_path):
+    # "1 Night Only" begins with a number, but the pack is named by title, so
+    # it is not "track 1": the title finds the pilot, and nothing else is offered.
+    options = episode_donor_options(
+        _zip(tmp_path, ["Pilot.mp3", "Second.mp3", "1 Night Only.mp3"]), tmp_path / "x", 1,
+        episode_title="Pilot",
+    )
+    assert [[p.name for p in o] for o in options] == [["Pilot.mp3"]]
+
+
+def test_without_a_title_the_options_are_the_number_pick_alone(tmp_path):
+    options = episode_donor_options(
+        _zip(tmp_path, ["[S01.E01] Pilot.mp3", "[S01.E02] Second.mp3"]), tmp_path / "x", 2,
+    )
+    assert [[p.name for p in o] for o in options] == [["[S01.E02] Second.mp3"]]
+
+
+def test_an_agreeing_number_pick_is_offered_alone(tmp_path):
+    options = episode_donor_options(
+        _zip(tmp_path, ["[S01.E01] Pilot.mp3", "[S01.E02] Second.mp3", "[S01.E03] Second.mp3"]),
+        tmp_path / "x", 2, episode_title="Second",
+    )
+    assert [[p.name for p in o] for o in options] == [["[S01.E02] Second.mp3"]]
