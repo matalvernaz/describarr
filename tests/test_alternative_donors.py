@@ -608,3 +608,57 @@ def test_ordinary_end_credits_are_not_reported(tmp_path):
     assert uncovered_ends(report, 1297.5) == []
     assert uncovered_ends(report, 2955.4) == [(1263.3, 2955.4)]
     assert uncovered_ends(report, 0.0) == []            # length unknown: no claim
+
+
+def _coverage_run(monkeypatch, tmp_path, segments, video_seconds, similarity=75.0):
+    """_align_and_keep through the real gate with *segments*; returns (published, reason)."""
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    config.min_score = 60.0
+    video = tmp_path / "v.mkv"
+    video.write_bytes(b"v")
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"a")
+    report = tmp_path / "alignments" / "ep.txt"
+    report.parent.mkdir(exist_ok=True)
+    report.write_text(f"Input file similarity: {similarity}%\n")
+    report.with_suffix(".json").write_text(json.dumps({
+        "similarity_pct": similarity, "median_rate_pct": 0.0, "segments": segments}))
+    combined = tmp_path / "out" / "ad.mkv"
+    combined.parent.mkdir(exist_ok=True)
+    combined.write_bytes(b"z")
+    monkeypatch.setattr(workflow, "align", lambda *a, **k: AlignResult(combined, report, None, returncode=0))
+    monkeypatch.setattr(workflow, "_publish_in_place", lambda *a, **k: None)
+    monkeypatch.setattr(workflow, "_cleanup_combined", lambda c: None)
+    monkeypatch.setattr(workflow, "_audio_duration", lambda p: video_seconds if p == video else 0.0)
+    return workflow._align_and_keep(config, video, audio, label="x")
+
+
+def _seg(v0, v1, rate=0.0):
+    return {"rate_pct": rate, "video_start_sec": v0, "video_end_sec": v1,
+            "audio_start_sec": v0, "audio_end_sec": v1 if rate == 0.0 else v0}
+
+
+def test_a_short_credits_tail_cannot_tip_a_refusal_into_a_publish(monkeypatch, tmp_path):
+    # Panel 322: 400 s undescribed of 1000 s covered was refused; a 40 s
+    # credits tail must not grow the denominator past it.
+    ok, _ = _coverage_run(monkeypatch, tmp_path, [_seg(0, 600), _seg(600, 1000, rate=5000.0)], 1040.0)
+    assert not ok
+
+
+def test_holes_between_segments_count_against_the_whole_video(monkeypatch, tmp_path):
+    # Panel 322: two 50 s segments at either end of a 1000 s video.
+    ok, _ = _coverage_run(monkeypatch, tmp_path, [_seg(0, 50), _seg(950, 1000, rate=5000.0)], 1000.0)
+    assert not ok
+
+
+def test_an_unreadable_length_behaves_as_before(monkeypatch, tmp_path):
+    # A recording starting 100 s in, the video's length unknown: the old count
+    # (nothing undescribed) and the old denominator, so it publishes.
+    ok, note = _coverage_run(monkeypatch, tmp_path, [_seg(100, 1300)], 0.0)
+    assert ok and note is None
+
+
+def test_a_films_end_credits_get_no_note(monkeypatch, tmp_path):
+    # 8 minutes of credits after a 87-minute film: ordinary, no "different cut".
+    ok, note = _coverage_run(monkeypatch, tmp_path, [_seg(0, 5220)], 5700.0)
+    assert ok and note is None
