@@ -17,6 +17,7 @@ tried after AudioVault has been exhausted.
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -35,12 +36,18 @@ class AudioSource(Protocol):
         """True when the source has everything it needs (creds, host, …)."""
 
     def episode_candidates(
-        self, cache_dir: Path, series_title: str, season: int, episode: int
+        self, cache_dir: Path, series_title: str, season: int, episode: int,
+        episode_title: str = "",
     ) -> Iterable[Path]:
         """Yield local paths to candidate AD audio files for one episode.
 
         Candidates are aligned in order and the first that passes the
         acceptance gate wins, so a source may yield lazily (download-on-demand).
+
+        *episode_title* is Sonarr's title for the episode, or ``""`` when none
+        is known. It is evidence a source may use to accept a file it would
+        otherwise pass over, never a requirement. A source written before the
+        parameter existed keeps working: see :func:`episode_candidates_from`.
         """
 
     def movie_candidates(
@@ -83,3 +90,31 @@ def load_extra_sources() -> list[AudioSource]:
         else:
             logger.info("Extra source %r loaded but not configured — skipping.", entry)
     return sources
+
+
+def episode_candidates_from(
+    source: AudioSource, cache_dir: Path, series_title: str, season: int, episode: int,
+    episode_title: str = "",
+) -> Iterable[Path]:
+    """Ask *source* for one episode's candidates, passing the title if it takes one.
+
+    ``episode_title`` joined :class:`AudioSource` after sources existed that do
+    not accept it, so a source whose method has no such parameter is asked
+    exactly as before rather than failing with a ``TypeError``.
+    """
+    if episode_title and _accepts_keyword(source.episode_candidates, "episode_title"):
+        return source.episode_candidates(
+            cache_dir, series_title, season, episode, episode_title=episode_title
+        )
+    return source.episode_candidates(cache_dir, series_title, season, episode)
+
+
+def _accepts_keyword(func, name: str) -> bool:
+    """True when *func* takes a keyword argument called *name* (or any keyword)."""
+    try:
+        params = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in params
+    )
