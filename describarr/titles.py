@@ -116,7 +116,7 @@ def donor_episode_title(name: str) -> str:
 
     ``[S21.E01] Oscars Guy.mp3`` gives ``Oscars Guy``; ``2.07 The Most
     Disappointed Man.mp3`` gives ``The Most Disappointed Man``. Counters such
-    as ``Track 07.mp3`` or LivingAudio's bare ``4.07.mp3`` give ``""``.
+    as ``Track 07.mp3`` or an extra source's bare ``4.07.mp3`` give ``""``.
     """
     stem = Path(name).stem
     if _GENERIC_DONOR_RE.match(stem.strip()) or re.fullmatch(r"\d+\.\d+", stem.strip()):
@@ -157,6 +157,20 @@ def titles_agree(a: str, b: str, *, fuzzy: bool = False) -> bool | None:
     if _LEADING_ARTICLE_RE.sub("", na) == _LEADING_ARTICLE_RE.sub("", nb):
         return True
     return difflib.SequenceMatcher(None, na, nb).ratio() >= _SIMILARITY_FLOOR
+
+
+# A catalogue file that says it carries no description: AudioVault's Family Guy
+# packs fill gaps with the plain soundtrack, "06 - 09  Family Guy - Back to the
+# Woods not described.mp3" (2026-10-01). It aligns almost perfectly, 98 %,
+# precisely because nothing is narrated, and was published as a description.
+_UNDESCRIBED_DONOR_RE = re.compile(
+    r"(?i)\b(?:not|non|un)[\s_-]*described\b|\b(?:no|without)\s+(?:audio\s+)?description\b"
+)
+
+
+def donor_says_undescribed(name: str) -> bool:
+    """True when a donor's file name says the recording has no description."""
+    return bool(_UNDESCRIBED_DONOR_RE.search(Path(name).stem))
 
 
 def donor_title_readings(name: str, series_title: str = "") -> list[str]:

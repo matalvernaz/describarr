@@ -301,6 +301,11 @@ _TITLE_EXACT = 2
 _TITLE_NEAR = 1
 _TITLE_NONE = 0
 
+# How many numbers either side of an episode's own the last-resort search looks.
+# The catalogue slips seen so far are local: neighbours swapped, a recording
+# filed one or two places off (Family Guy season 7, 2026-10-01).
+_NEIGHBOUR_REACH = 2
+
 
 def extract_episode(
     zip_path: Path, extract_dir: Path, episode: int, episode_title: str = "",
@@ -400,6 +405,36 @@ def episode_donor_options(
                         episode, titled.name, episode_title)
         options.insert(0, (titled,))
     return options
+
+
+def neighbour_donors(
+    zip_path: Path, extract_dir: Path, episode: int, reach: int = _NEIGHBOUR_REACH,
+) -> list[Path]:
+    """The files a season pack numbers near *episode*, nearest number first.
+
+    A last resort, for when the recording catalogued for this episode turned
+    out to hold another one. The "Season 7" UK pack files the library's E06 as
+    "07 - 05 … The man with two Brian's" and its E05 as "07 - 07 … Tales of the
+    third grade nothing" (2026-10-01), so neither the number nor the title
+    leads to the right file; only aligning the neighbours finds it.
+
+    Only a number's own filename match is offered, never a positional guess,
+    and a number whose matches are a split recording's parts is passed over.
+    The episode's own matches are left out: they have been tried already.
+    """
+    if zip_path.suffix.lower() in _AUDIO_EXTS:
+        return []
+    audio_files = _extracted_audio(zip_path, extract_dir)
+    own = set(_numbered(audio_files, episode))
+    found: list[Path] = []
+    for distance in range(1, reach + 1):
+        for number in (episode - distance, episode + distance):
+            if number < 1:
+                continue
+            picks = _numbered(audio_files, number)
+            if len(picks) == 1 and picks[0] not in own and picks[0] not in found:
+                found.append(picks[0])
+    return found
 
 
 def _extracted_audio(zip_path: Path, extract_dir: Path) -> list[Path]:

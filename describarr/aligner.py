@@ -135,6 +135,12 @@ class EngineFailure(str):
     """
 
 
+# The failure reason for a combined file that came out structurally wrong (too
+# short, a stream missing). The workflow checks for it by value to tell a
+# damaged source file from an engine fault.
+OUTPUT_VALIDATION_FAILED = "alignment output failed validation"
+
+
 class AlignResult:
     """Outputs of a describealaign run.
 
@@ -276,7 +282,7 @@ def run(
     if not _validate_media_output(video_path, output):
         # The output is structurally broken — refuse to publish it.
         _cleanup_run_dir(run_output_dir)
-        return AlignResult(None, None, EngineFailure("alignment output failed validation"))
+        return AlignResult(None, None, EngineFailure(OUTPUT_VALIDATION_FAILED))
 
     report = _find_report(video_path, alignment_dir, min_mtime=run_start)
     # NOTE: caller is responsible for cleaning up `output` (and its parent

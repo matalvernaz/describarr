@@ -31,7 +31,7 @@ from .nomatch_cache import NoMatchCache
 from .outcome_log import OutcomeLog, key as outcome_key
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
-from .workflow import ALREADY_DESCRIBED, drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _atomic_write_json, _MAX_DRAIN_PASSES
+from .workflow import ALREADY_DESCRIBED, DamagedSource, Refusal, drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _atomic_write_json, _MAX_DRAIN_PASSES
 from .aligner import EngineFailure, source_has_ad_track
 
 logger = logging.getLogger(__name__)
@@ -1139,8 +1139,45 @@ def _plain_reason(reason: str) -> str:
     return reason
 
 
+def _joined(names) -> str:
+    """"A", "A and B", "A, B and C"."""
+    names = list(names)
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _refusal_message(reason: Refusal) -> str:
+    """A refusal in words, saying how many recordings were tried and from where.
+
+    "Tried 3 audio descriptions (2 from AudioVault, 1 from <a source's label>);
+    none lined up with this copy, so the file was left alone. (match score 2%)": the
+    old one-description wording read as if the second catalogue was never asked.
+    """
+    counts: dict[str, int] = {}
+    for source in reason.sources:
+        counts[source] = counts.get(source, 0) + 1
+    total = len(reason.sources)
+    if total <= 1 and not reason.nearby:
+        where = f" on {reason.sources[0]}" if total == 1 else ""
+        head = (f"Found an audio description{where}, but it did not line up with this "
+                "copy, so the file was left alone.")
+    else:
+        breakdown = ", ".join(f"{n} from {source}" for source, n in counts.items())
+        nearby = (f" and {reason.nearby} more filed near this episode, in case the "
+                  "catalogue mislabelled it") if reason.nearby else ""
+        head = (f"Tried {total} audio description{'s' if total != 1 else ''} ({breakdown})"
+                f"{nearby}; none lined up with this copy, so the file was left alone.")
+    same = [source for source in dict.fromkeys(reason.same)]
+    if same:
+        head += f" {_joined(same)} had the same recording."
+    return f"{head} ({_plain_reason(reason)})"
+
+
 def _notify_message(outcome: str, reason: Optional[str]) -> str:
     """The Pushover body for an outcome."""
+    if isinstance(reason, DamagedSource):
+        return f"The file was left alone: {reason}."
+    if outcome == "no_match" and isinstance(reason, Refusal):
+        return _refusal_message(reason)
     if outcome == "no_match" and reason:
         return f"{_REFUSED_MESSAGE} ({_plain_reason(reason)})"
     base = _OUTCOME_MESSAGES.get(outcome, outcome)

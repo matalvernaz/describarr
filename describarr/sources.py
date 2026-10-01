@@ -30,7 +30,13 @@ _ENV_VAR = "DESCRIBARR_EXTRA_SOURCES"
 
 @runtime_checkable
 class AudioSource(Protocol):
-    """A supplementary audio-description source tried after AudioVault."""
+    """A supplementary audio-description source tried after AudioVault.
+
+    A source may also carry a ``label`` attribute, the short name notifications
+    give it ("Tried 2 audio descriptions (1 from AudioVault, 1 from <label>)").
+    It is optional, and so not a member of this protocol: a source without one
+    is called "another source".
+    """
 
     def is_configured(self) -> bool:
         """True when the source has everything it needs (creds, host, …)."""
