@@ -250,7 +250,7 @@ def test_concat_audio_joins_real_files_and_reuses_the_result(tmp_path):
 # ── extra sources cover a multi-episode file too ─────────────────────────────
 
 class _FakeSource:
-    """An extra source in the shape LivingAudio has: 0 or 1 candidate per episode."""
+    """An extra source in the usual shape: 0 or 1 candidate per episode."""
 
     def __init__(self, have, root):
         self.have = have

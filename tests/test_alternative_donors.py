@@ -6,7 +6,7 @@ already downloaded the right recording, every time inside the same season pack:
 - AudioVault's season 12 numbers by production order from E13 on, so the file
   called E13 is "Fresh Heir", which is the library's E14. The library's
   TrollHD names carry no title, so nothing said which file was which, and
-  E14, E15 and E20 were refused (LivingAudio, tried next, lacks those three).
+  E14, E15 and E20 were refused (the extra source, tried next, lacks those three).
 - "Season 13 UK" swaps E02 and E04, and repeats the show's name in every
   file ("13 - 02  Family Guy - Baking Bad.mp3").
 - S13E01 "The Simpsons Guy" is one 44-minute episode, catalogued as its two
@@ -151,8 +151,8 @@ def test_the_number_pick_is_still_tried_after_the_title_match(monkeypatch, tmp_p
     video = _video(tmp_path, 12, TROLLHD_S12E14, nfo=("Fresh Heir", 12, 14))
     described, aligned = _walk(monkeypatch, tmp_path, SEASON_12, video, 12, 14)
     assert not described
-    assert [name for name, _ in aligned] == ["[S12.E13] Fresh Heir.mp3",
-                                             "[S12.E14] Secondhand Spoke.mp3"]
+    assert [name for name, _ in aligned][:2] == ["[S12.E13] Fresh Heir.mp3",
+                                                 "[S12.E14] Secondhand Spoke.mp3"]
 
 
 def test_a_near_spelling_still_finds_the_renumbered_file(monkeypatch, tmp_path):
@@ -175,7 +175,7 @@ def test_an_nfo_for_another_episode_lends_no_title(monkeypatch, tmp_path):
     # number's pick alone, exactly as before titles were read from it.
     video = _video(tmp_path, 12, TROLLHD_S12E14, nfo=("Fresh Heir", 12, 13))
     _, aligned = _walk(monkeypatch, tmp_path, SEASON_12, video, 12, 14)
-    assert aligned == [("[S12.E14] Secondhand Spoke.mp3", "")]
+    assert aligned[0] == ("[S12.E14] Secondhand Spoke.mp3", "")
 
 
 # ── a scrambled season, with the show's name in every donor ──────────────────
@@ -252,7 +252,7 @@ def test_one_half_of_a_split_episode_is_not_joined(monkeypatch, tmp_path):
     video = _video(tmp_path, 13, SIMPSONS_GUY, nfo=("The Simpsons Guy", 13, 1))
     _, aligned = _walk(monkeypatch, tmp_path, SEASON_13, video, 13, 1)
     assert joins == []
-    assert [name for name, _ in aligned] == [PART_1]
+    assert aligned[0][0] == PART_1
 
 
 # ── a pack numbered like a CD ────────────────────────────────────────────────
@@ -336,3 +336,171 @@ def test_a_pack_numbered_across_the_show_is_not_read_as_track_numbers(tmp_path):
     pack = ("Show - Season 2", [f"{n} Title {n}.mp3" for n in range(27, 57)])
     got = extract_episode(_pack(tmp_path, pack), tmp_path / "x", 27)
     assert got.name == "53 Title 53.mp3"                    # the 27th file, as before
+
+
+# ── a mislabelled catalogue: the right recording is filed near the episode ───
+
+# AudioVault "Season 7" (UK), as cached on 2026-10-01. Its 07-05 holds the
+# library's E06 and its 07-07 the library's E05 (checked by transcript).
+SEASON_7 = (
+    "Season 7",
+    ["07- 01  Family Guy - Love Blactually.mp3", "07 - 02  Family Guy - I dream of Jesus.mp3",
+     "07 - 03  Family Guy - Road to Germany.mp3", "07 - 04  Family Guy - Baby not on board.mp3",
+     "07 - 05  Family Guy - The man with two Brian's.mp3",
+     "07 - 06  Family Guy - Oceans three and a half.mp3",
+     "07 - 07  Family Guy - Tales of the third grade nothing.mp3",
+     "07 - 08  Family Guy - Family Gay.mp3", "07 - 09  Family Guy - The juice is loose.mp3"],
+)
+HOLDS_E05 = "07 - 07  Family Guy - Tales of the third grade nothing.mp3"
+HOLDS_E06 = "07 - 05  Family Guy - The man with two Brian's.mp3"
+
+
+def test_a_recording_filed_under_a_neighbour_is_found(monkeypatch, tmp_path):
+    video = _video(tmp_path, 7,
+                   "Family.Guy.S07E05.The.Man.with.Two.Brians.1080p.DSNP.WEB-DL.AAC2.0.H.264-PHOENiX.mkv",
+                   nfo=("The Man With Two Brians", 7, 5))
+    described, aligned = _walk(monkeypatch, tmp_path, SEASON_7, video, 7, 5, accept={HOLDS_E05})
+    assert described
+    names = [name for name, _ in aligned]
+    assert names[0] == HOLDS_E06                      # its own number and title: refused
+    assert names[-1] == HOLDS_E05                     # found among the neighbours
+    assert names[1:-1] == ["07 - 04  Family Guy - Baby not on board.mp3",
+                           "07 - 06  Family Guy - Oceans three and a half.mp3",
+                           "07 - 03  Family Guy - Road to Germany.mp3"]   # nearest first
+
+
+def test_the_swap_is_found_from_the_other_side_too(monkeypatch, tmp_path):
+    video = _video(tmp_path, 7,
+                   "Family.Guy.S07E06.Tales.of.a.Third.Grade.Nothing.1080p.DSNP.WEB-DL.AAC2.0.H.264-PHOENiX.mkv",
+                   nfo=("Tales of a Third Grade Nothing", 7, 6))
+    described, aligned = _walk(monkeypatch, tmp_path, SEASON_7, video, 7, 6, accept={HOLDS_E06})
+    assert described
+    # the title's pick, the number's pick, then the nearest neighbour; the
+    # title's pick (07-07) is not aligned a second time as a neighbour
+    assert [name for name, _ in aligned] == [HOLDS_E05,
+                                             "07 - 06  Family Guy - Oceans three and a half.mp3",
+                                             HOLDS_E06]
+
+
+def test_a_neighbour_match_says_which_recording_it_was(monkeypatch, tmp_path):
+    video = _video(tmp_path, 7,
+                   "Family.Guy.S07E05.The.Man.with.Two.Brians.1080p.DSNP.WEB-DL.AAC2.0.H.264-PHOENiX.mkv",
+                   nfo=("The Man With Two Brians", 7, 5))
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    zip_path = _pack(tmp_path, SEASON_7)
+
+    class Client:
+        def search_shows(self, title):
+            return [{"name": SEASON_7[0], "url": "https://av/pack"}]
+
+    monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
+    monkeypatch.setattr(workflow, "find_season", lambda results, *a, **k: results)
+    monkeypatch.setattr(workflow, "_get_cached", lambda *a, **k: zip_path)
+    monkeypatch.setattr(workflow, "_mark_episode_done", lambda *a, **k: None)
+    monkeypatch.setattr(workflow, "load_extra_sources", lambda: [])
+    monkeypatch.setattr(workflow, "_align_and_keep",
+                        lambda c, v, audio_path, **k: (audio_path.name == HOLDS_E05,
+                                                       None if audio_path.name == HOLDS_E05
+                                                       else "similarity 2.3% — refused"))
+    described, note = process_episode(Client(), config, video, "Family Guy", 7, 5, series_year="1999")
+    assert described
+    assert "07 - 07  Family Guy - Tales of the third grade nothing" in note
+    assert "names a different episode" in note
+
+
+def test_nothing_nearby_is_tried_when_no_recording_was_filed_for_the_episode(monkeypatch, tmp_path):
+    # This Is Us S02E06 "The 20's" is missing from its pack: nothing filed for
+    # it was ever aligned, so there is no sign of a mislabel to chase.
+    pack = ("This Is Us - Season 2 (2017)",
+            ["2.01 A Father's Advice.mp3", "2.02 A Manny-Splendored Thing.mp3", "2.03 Deja Vu.mp3",
+             "2.04 Still There.mp3", "2.05 Brothers.mp3", "2.07 The Most Disappointed Man.mp3",
+             "2.08 Number One.mp3"])
+    video = _video(tmp_path, 2, "This.Is.Us.S02E06.The.20s.AAC.5.1.1080p.WEBRip.x265-SiQ.mkv")
+    described, aligned = _walk(monkeypatch, tmp_path, pack, video, 2, 6)
+    assert not described
+    assert aligned == []
+
+
+def test_nothing_nearby_is_tried_after_an_engine_failure(monkeypatch, tmp_path):
+    from describarr.aligner import EngineFailure
+    video = _video(tmp_path, 7,
+                   "Family.Guy.S07E05.The.Man.with.Two.Brians.1080p.DSNP.WEB-DL.AAC2.0.H.264-PHOENiX.mkv",
+                   nfo=("The Man With Two Brians", 7, 5))
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    zip_path = _pack(tmp_path, SEASON_7)
+    aligned = []
+
+    class Client:
+        def search_shows(self, title):
+            return [{"name": SEASON_7[0], "url": "https://av/pack"}]
+
+    def crash(c, v, audio_path, **k):
+        aligned.append(audio_path.name)
+        return False, EngineFailure("alignment failed (describealaign exit 1)")
+
+    monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
+    monkeypatch.setattr(workflow, "find_season", lambda results, *a, **k: results)
+    monkeypatch.setattr(workflow, "_get_cached", lambda *a, **k: zip_path)
+    monkeypatch.setattr(workflow, "load_extra_sources", lambda: [])
+    monkeypatch.setattr(workflow, "_align_and_keep", crash)
+    process_episode(Client(), config, video, "Family Guy", 7, 5, series_year="1999")
+    assert aligned == [HOLDS_E06]
+
+
+# ── a recording that says it is not described ────────────────────────────────
+
+# AudioVault "Season 6" (UK): two gaps are filled with the plain soundtrack.
+SEASON_6 = (
+    "Season 6",
+    ["06 - 05  Family Guy - Lois Kills Stewie.mp3", "06 - 06 -family Guy - Padre De Familia.mp3",
+     "06 - 07  Family Guy - Peter's Daughter not described.mp3", "06 - 08  Family Guy - Mcstroke.mp3",
+     "06 - 09  Family Guy - Back to the Woods not described.mp3",
+     "06 - 10  Family Guy - Play it again Brian.mp3", "06 - 11  Family Guy - the former life of Brian.mp3"],
+)
+
+
+def test_a_recording_that_says_it_is_not_described_is_never_aligned(monkeypatch, tmp_path):
+    # Published at 98.2 % on 2026-10-01: nothing narrated, so it matched the
+    # soundtrack almost exactly. Skipping it is not a refusal, so nothing
+    # nearby is searched either.
+    video = _video(tmp_path, 6, "Family.Guy.S06E09.Back.to.the.Woods.1080p.WEB-DL.10bit.x265.HEVC-PHOCiS.mkv",
+                   nfo=("Back to the Woods", 6, 9))
+    described, aligned = _walk(monkeypatch, tmp_path, SEASON_6, video, 6, 9,
+                               accept={"06 - 09  Family Guy - Back to the Woods not described.mp3"})
+    assert not described
+    assert aligned == []
+
+
+def test_a_not_described_neighbour_is_skipped_too(monkeypatch, tmp_path):
+    video = _video(tmp_path, 6, "Family.Guy.S06E08.McStroke.1080p.WEB-DL.10bit.x265.HEVC-PHOCiS.mkv",
+                   nfo=("McStroke", 6, 8))
+    _, aligned = _walk(monkeypatch, tmp_path, SEASON_6, video, 6, 8)
+    names = [name for name, _ in aligned]
+    assert names[0] == "06 - 08  Family Guy - Mcstroke.mp3"
+    assert not any("not described" in n for n in names)
+
+
+def test_a_failed_search_nearby_reports_the_episodes_own_refusal(monkeypatch, tmp_path):
+    video = _video(tmp_path, 7,
+                   "Family.Guy.S07E05.The.Man.with.Two.Brians.1080p.DSNP.WEB-DL.AAC2.0.H.264-PHOENiX.mkv",
+                   nfo=("The Man With Two Brians", 7, 5))
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    zip_path = _pack(tmp_path, SEASON_7)
+
+    class Client:
+        def search_shows(self, title):
+            return [{"name": SEASON_7[0], "url": "https://av/pack"}]
+
+    def gate(c, v, audio_path, **k):
+        if audio_path.name == HOLDS_E06:
+            return False, "similarity 6.4% (coverage 100.0%) — the episode's own"
+        return False, "similarity 2.0% (coverage 100.0%) — a neighbour's"
+
+    monkeypatch.setattr(workflow, "source_has_ad_track", lambda p: False)
+    monkeypatch.setattr(workflow, "find_season", lambda results, *a, **k: results)
+    monkeypatch.setattr(workflow, "_get_cached", lambda *a, **k: zip_path)
+    monkeypatch.setattr(workflow, "load_extra_sources", lambda: [])
+    monkeypatch.setattr(workflow, "_align_and_keep", gate)
+    described, reason = process_episode(Client(), config, video, "Family Guy", 7, 5, series_year="1999")
+    assert not described
+    assert reason.endswith("the episode's own")

@@ -221,3 +221,26 @@ def test_bracketed_part_numbers_count(tmp_path):
     p1, p2 = tmp_path / "13.01 the Simpsons Guy (part 1).mp3", tmp_path / "13.01 the Simpsons Guy (part 2).mp3"
     assert _split_recording([p1, p2]) == (p1, p2)
     assert whole_recording_stem((p1, p2)) == "13.01 the Simpsons Guy"
+
+
+@pytest.mark.parametrize("name", [
+    "06 - 09  Family Guy - Back to the Woods not described.mp3",
+    "07 - 11  Family Guy - Not All Dogs Go to Heaven not described.mp3",
+    "Some Film (2001) (no audio description).mp3",
+    "1.04 Title - undescribed.mp3",
+    "Title non-described.mp3",
+])
+def test_a_donor_that_says_it_has_no_description(name):
+    from describarr.titles import donor_says_undescribed
+    assert donor_says_undescribed(name)
+
+
+@pytest.mark.parametrize("name", [
+    "[S01.E01] Pilot [New Description].mp3",
+    "Gladiator (2000) [Old Description].mp3",
+    "The Undescribable Thing.mp3",
+    "07 - 06  Family Guy - Oceans three and a half.mp3",
+])
+def test_an_ordinary_donor_says_nothing_of_the_sort(name):
+    from describarr.titles import donor_says_undescribed
+    assert not donor_says_undescribed(name)

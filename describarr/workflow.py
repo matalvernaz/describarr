@@ -29,6 +29,7 @@ from typing import Optional
 import requests
 
 from .aligner import (
+    OUTPUT_VALIDATION_FAILED,
     EngineFailure,
     run as align,
     parse_score,
@@ -50,12 +51,14 @@ from .matcher import (
     extract_episode,
     find_movie,
     find_season,
+    neighbour_donors,
     whole_recording_stem,
 )
 from .retry_queue import RetryQueue
 from .sources import episode_candidates_from, load_extra_sources
 from .titles import (
     donor_names_episode,
+    donor_says_undescribed,
     donor_title_readings,
     episode_title_from_filename,
     episode_title_from_nfo,
@@ -106,6 +109,69 @@ class SourceVanished(Exception):
     download slot and another alignment on a file that is no longer there.
     The replacement import fires its own webhook, which is what actually
     describes the new file."""
+
+
+class SourceTruncated(Exception):
+    """The video's sound stops well before the length its container states:
+    an incomplete download. Family Guy S23E06 (2026-10-01) stops at 8:38 of
+    21:38 ("File ended prematurely"), so a perfect alignment still produced a
+    combined file far too short and was refused.
+
+    A property of the file, so the walk aborts: every other recording would
+    fail the same way. The message is the listener's: what is wrong and that
+    a fresh download fixes it."""
+
+
+class DamagedSource(str):
+    """A reason meaning the library file itself is broken, not that a recording
+    was refused or the engine failed. Like :class:`EngineFailure` it is just the
+    message; the type only lets the notification say so instead of "did not
+    line up"."""
+
+
+class Refusal(str):
+    """A refusal's reason, carrying where every refused recording came from.
+
+    The notification used to say "Found an audio description, but it did not
+    line up" when two catalogues' recordings had both been aligned and refused,
+    so it read as if the extra source had never been asked (Family Guy,
+    2026-10-01). *sources* names the source of each recording refused, *same*
+    each source whose copy was skipped as identical to one already refused, and
+    *nearby* counts the recordings filed near the episode that were tried as a
+    last resort. In every other respect it is just the message.
+    """
+
+    sources: tuple[str, ...] = ()
+    same: tuple[str, ...] = ()
+    nearby: int = 0
+
+    def __new__(cls, reason: str, sources=(), same=(), nearby: int = 0) -> "Refusal":
+        refusal = super().__new__(cls, reason)
+        refusal.sources = tuple(sources)
+        refusal.same = tuple(same)
+        refusal.nearby = nearby
+        return refusal
+
+
+# Names a notification gives the sources a recording came from. An extra
+# source may carry its own ``label``; one without is "another source".
+_AUDIOVAULT_LABEL = "AudioVault"
+_UNLABELLED_SOURCE = "another source"
+
+
+def _source_label(source) -> str:
+    """How messages name an extra source: its ``label``, else a neutral phrase."""
+    label = getattr(source, "label", "")
+    return label if isinstance(label, str) and label.strip() else _UNLABELLED_SOURCE
+
+
+def _as_refusal(reason, sources: list[str], same: list[str], nearby: int = 0):
+    """*reason* as a :class:`Refusal` (see its fields); an engine failure, a
+    damaged source or no reason at all is passed through untouched, since the
+    outcome each maps to is decided by its type."""
+    if reason is None or isinstance(reason, (EngineFailure, DamagedSource, Refusal)):
+        return reason
+    return Refusal(reason, sources, same, nearby)
 
 
 def _should_abandon_stale(item: dict) -> bool:
@@ -239,6 +305,13 @@ def process_episode(
     limiter = DownloadLimiter(config.cache_dir / "daily_limit.json")
 
     last_reason: Optional[str] = None
+    # For the notification: the source of every recording refused, and of every
+    # one skipped as identical to a recording already refused.
+    refused_from: list[str] = []
+    same_from: list[str] = []
+    # Packs already on disk, for the last-resort neighbour search below.
+    visited_packs: list[tuple[Path, Path]] = []
+    nearby_refused = 0
     try:
         for candidate in candidates:
             try:
@@ -246,6 +319,7 @@ def process_episode(
             except DailyLimitReached:
                 raise
             extract_dir = zip_cache_dir / f"season_{season:02d}" / _safe_dirname(candidate["name"])
+            visited_packs.append((zip_path, extract_dir))
             donors = _episode_donors(
                 zip_path, extract_dir, all_episodes, label, episode_title=title,
                 series_title=series_title, video_path=video_path,
@@ -256,7 +330,10 @@ def process_episode(
                 )
                 continue
             for audio_path in donors:
+                if _says_undescribed(audio_path, label):
+                    continue
                 if _already_tried(audio_path, tried, label):
+                    same_from.append(_AUDIOVAULT_LABEL)
                     continue
                 published, reason = _align_and_keep(
                     config, video_path, audio_path, label=label, episode_title=title,
@@ -267,6 +344,8 @@ def process_episode(
                         _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
                     return True, reason
                 last_reason = reason
+                if not isinstance(reason, EngineFailure):
+                    refused_from.append(_AUDIOVAULT_LABEL)
             logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
         # Extra (privately-supplied) sources, tried after AudioVault. Each yields
@@ -291,7 +370,10 @@ def process_episode(
                         episode_title=title,
                     )
                 for audio_path in source_candidates:
+                    if _says_undescribed(audio_path, label):
+                        continue
                     if _already_tried(audio_path, tried, label):
+                        same_from.append(_source_label(source))
                         continue
                     published, reason = _align_and_keep(
                         config, video_path, audio_path, label=label, episode_title=title,
@@ -306,15 +388,59 @@ def process_episode(
                             _mark_episode_done(zip_cache_dir, season, ep)
                         return True, reason
                     last_reason = reason
+                    if not isinstance(reason, EngineFailure):
+                        refused_from.append(_source_label(source))
             finally:
                 source.close()
-    except (AlignmentResourceKill, SourceVanished) as exc:
+
+        # Last resort: a recording filed for this episode was aligned and held
+        # something else, so the catalogue may have filed this episode's under
+        # a neighbouring number, with a title that names another episode too.
+        # Only a single-episode file, only packs already on disk, nearest
+        # numbers first, and the same gate for each.
+        if len(all_episodes) == 1 and refused_from:
+            for zip_path, extract_dir in visited_packs:
+                try:
+                    nearby = neighbour_donors(zip_path, extract_dir, episode)
+                except (OSError, zipfile.BadZipFile) as exc:
+                    # A last resort must never end the walk badly.
+                    logger.warning("%s: could not read %s for nearby recordings: %s",
+                                   label, zip_path.name, exc)
+                    continue
+                for audio_path in nearby:
+                    if _says_undescribed(audio_path, label) or _already_tried(audio_path, tried, label):
+                        continue
+                    logger.info(
+                        "%s: the recordings filed for this episode did not match; trying "
+                        "%s, filed near it.", label, audio_path.name,
+                    )
+                    # A neighbour holds another episode, so it should score as
+                    # one: a few per cent. The danger is a clip show (Family Guy
+                    # S06E12's file is the 100th Episode Special), whose clips
+                    # can line up in places; the undescribed-time refusal in
+                    # _align_and_keep is what stops a partial match publishing.
+                    published, reason = _align_and_keep(
+                        config, video_path, audio_path, label=label, episode_title=title,
+                        series_title=series_title,
+                    )
+                    if published:
+                        _mark_episode_done(zip_cache_dir, season, episode, extract_dir, zip_path)
+                        note = (f"matched the recording filed as {audio_path.stem!r}, so the "
+                                "catalogue, or this file, names a different episode")
+                        return True, f"{reason}; {note}" if reason else note
+                    # The episode's own refusal stays the reported one: a
+                    # neighbour's low score says nothing about this episode.
+                    if not isinstance(reason, EngineFailure):
+                        nearby_refused += 1
+    except (AlignmentResourceKill, SourceVanished, SourceTruncated) as exc:
         logger.error("Aborting candidate walk for %s: %s", video_path.name, exc)
         if isinstance(exc, AlignmentResourceKill):
             return False, EngineFailure(str(exc))
+        if isinstance(exc, SourceTruncated):
+            return False, DamagedSource(str(exc))
         return False, str(exc)
 
-    return False, last_reason
+    return False, _as_refusal(last_reason, refused_from, same_from, nearby_refused)
 
 
 def process_movie(
@@ -361,18 +487,25 @@ def process_movie(
 
     last_reason: Optional[str] = None
     tried: set[str] = set()
+    refused_from: list[str] = []
+    same_from: list[str] = []
     try:
         for candidate in candidates[:_MAX_MOVIE_CANDIDATES]:
             try:
                 audio_path = _get_cached(client, candidate["url"], movie_cache_dir, limiter)
             except DailyLimitReached:
                 raise
+            if _says_undescribed(audio_path, label):
+                continue
             if _already_tried(audio_path, tried, label):
+                same_from.append(_AUDIOVAULT_LABEL)
                 continue
             published, reason = _align_and_keep(config, video_path, audio_path, label=label)
             if published:
                 return True, reason
             last_reason = reason
+            if not isinstance(reason, EngineFailure):
+                refused_from.append(_AUDIOVAULT_LABEL)
             logger.info("Candidate %r below threshold — trying next.", candidate["name"])
 
         # Extra (privately-supplied) sources, tried after AudioVault.
@@ -381,21 +514,28 @@ def process_movie(
                 for audio_path in source.movie_candidates(
                     config.cache_dir, movie_title, movie_year
                 ):
+                    if _says_undescribed(audio_path, label):
+                        continue
                     if _already_tried(audio_path, tried, label):
+                        same_from.append(_source_label(source))
                         continue
                     published, reason = _align_and_keep(config, video_path, audio_path, label=label)
                     if published:
                         return True, reason
                     last_reason = reason
+                    if not isinstance(reason, EngineFailure):
+                        refused_from.append(_source_label(source))
             finally:
                 source.close()
-    except (AlignmentResourceKill, SourceVanished) as exc:
+    except (AlignmentResourceKill, SourceVanished, SourceTruncated) as exc:
         logger.error("Aborting candidate walk for %s: %s", video_path.name, exc)
         if isinstance(exc, AlignmentResourceKill):
             return False, EngineFailure(str(exc))
+        if isinstance(exc, SourceTruncated):
+            return False, DamagedSource(str(exc))
         return False, str(exc)
 
-    return False, last_reason
+    return False, _as_refusal(last_reason, refused_from, same_from)
 
 
 # ------------------------------------------------------------------
@@ -615,6 +755,55 @@ def _audio_duration(path: Path) -> float:
         return 0.0
 
 
+# A video counts as cut short when its sound stops this much before the length
+# its container states: whichever is larger, an absolute floor or a share of
+# the runtime. Ordinary files differ from their stated length by a frame or two.
+_TRUNCATION_MIN_SEC = 30.0
+_TRUNCATION_FRACTION = 0.02
+# Decoding a long film's sound to the end over NFS takes a minute or two.
+_TRUNCATION_PROBE_TIMEOUT_SEC = 900
+
+
+def _decoded_audio_seconds(path: Path) -> float:
+    """How far *path*'s first audio stream actually decodes, in seconds; 0.0 when unknown.
+
+    The container's stated duration can promise more than the file holds: an
+    incomplete download keeps its header, so ffprobe reports the full length
+    while the data stops early. Only decoding finds where it really ends.
+    """
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "quiet", "-progress", "pipe:1",
+             "-i", str(path), "-map", "0:a:0", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=_TRUNCATION_PROBE_TIMEOUT_SEC, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    reached = 0.0
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition("=")
+        # ffmpeg's out_time_us and its misnamed out_time_ms both count microseconds.
+        if key in ("out_time_us", "out_time_ms") and value.strip().isdigit():
+            reached = max(reached, int(value) / 1_000_000)
+    return reached
+
+
+def _truncation(video_path: Path) -> Optional[str]:
+    """Where *video_path*'s sound stops, when that is well short of its stated length.
+
+    ``"its sound stops at 8:38 of 21:38"`` for Family Guy S23E06 (2026-10-01),
+    an incomplete download; None for a whole file, or when either length
+    cannot be read.
+    """
+    stated = _audio_duration(video_path)
+    heard = _decoded_audio_seconds(video_path)
+    if stated <= 0 or heard <= 0:
+        return None
+    if stated - heard <= max(_TRUNCATION_MIN_SEC, stated * _TRUNCATION_FRACTION):
+        return None
+    return f"its sound stops at {_fmt_clock(heard)} of {_fmt_clock(stated)}"
+
+
 def _concat_audio(parts: list[Path], out: Path) -> Optional[Path]:
     """Join *parts* end to end into *out* with ffmpeg; None on failure.
 
@@ -698,10 +887,24 @@ def _donor_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _says_undescribed(audio_path: Path, label: str) -> bool:
+    """True, and logged, when a recording's name says it has no description.
+
+    Such a file is the plain soundtrack filling a gap in a pack; with nothing
+    narrated it lines up almost perfectly (98 %, Family Guy S06E09 and S07E11,
+    2026-10-01) and would be published as a description. It is skipped, not
+    refused: it says nothing about whether the catalogue mislabelled the episode.
+    """
+    if not donor_says_undescribed(audio_path.name):
+        return False
+    logger.warning("%s: %s says it is not described — not using it.", label, audio_path.name)
+    return True
+
+
 def _already_tried(audio_path: Path, tried: set[str], label: str) -> bool:
     """True when *audio_path* is byte-identical to a donor already aligned for this video.
 
-    The providers mirror one master: LivingAudio's This Is Us and Heartland
+    The providers mirror one master: an extra source's This Is Us and Heartland
     files are the same bytes as AudioVault's, so after AudioVault's donor was
     refused the walk aligned the identical file again — the same verdict, and
     five to ten more minutes per refused episode (2026-09-26). An unreadable
@@ -1149,6 +1352,17 @@ def _align_and_keep(
                 "(likely a Sonarr/Radarr upgrade); the replacement's own "
                 "import will trigger a fresh run"
             )
+        # A combined file that fails validation can be the video's fault: one
+        # whose sound stops early yields an output that short, whatever the
+        # recording. Measured only after such a failure, so a file that aligns
+        # cleanly pays nothing for the check.
+        if reason == OUTPUT_VALIDATION_FAILED:
+            cut = _truncation(video_path)
+            if cut:
+                raise SourceTruncated(
+                    f"this copy is cut short ({cut}), so no description can line up "
+                    "with it; a fresh download should fix it"
+                )
         return False, reason
 
     combined = result.output
