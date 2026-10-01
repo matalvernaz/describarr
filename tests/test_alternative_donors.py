@@ -504,3 +504,19 @@ def test_a_failed_search_nearby_reports_the_episodes_own_refusal(monkeypatch, tm
     described, reason = process_episode(Client(), config, video, "Family Guy", 7, 5, series_year="1999")
     assert not described
     assert reason.endswith("the episode's own")
+
+
+# AudioVault "Season 9 not described.zip": every file named as an ordinary
+# episode, the whole pack the plain soundtrack (2026-10-01).
+SEASON_9_UNDESCRIBED = (
+    "Season 9 not described",
+    ["09 - 17  Family Guy - Foreign Affairs.mp3", "09 - 18  Family Guy - It's a Trap.mp3"],
+)
+
+
+def test_a_pack_that_says_it_is_not_described_is_never_aligned(monkeypatch, tmp_path):
+    video = _video(tmp_path, 9, "Family Guy - S09E18 - It's a Trap!.mkv", nfo=("It's a Trap!", 9, 18))
+    described, aligned = _walk(monkeypatch, tmp_path, SEASON_9_UNDESCRIBED, video, 9, 18,
+                               accept={"09 - 18  Family Guy - It's a Trap.mp3"})
+    assert not described
+    assert aligned == []

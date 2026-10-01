@@ -253,3 +253,18 @@ def test_an_agreeing_number_pick_is_offered_alone(tmp_path):
         tmp_path / "x", 2, episode_title="Second",
     )
     assert [[p.name for p in o] for o in options] == [["[S01.E02] Second.mp3"]]
+
+
+def test_a_season_entry_that_says_it_is_not_described_is_skipped():
+    # A bracketed tag is stripped before titles are compared, so the spin-off
+    # guard (which catches a bare trailing "not described") never sees it.
+    results = [
+        {"name": "Family Guy - Season 09 (2010) [Not Described]", "url": "u-9"},
+        {"name": "Family Guy - Season 10 (2011)", "url": "u-10"},
+    ]
+    assert find_season(results, "Family Guy", 9, "1999") == []
+
+
+def test_a_film_entry_that_says_it_is_not_described_is_skipped():
+    results = _movies(["Gladiator (2000) [Not Described]", "Gladiator (2000) [Old Description]"])
+    assert _names(find_movie(results, "gladiator", "2000")) == ["Gladiator (2000) [Old Description]"]

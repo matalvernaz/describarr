@@ -59,6 +59,7 @@ from .sources import episode_candidates_from, load_extra_sources
 from .titles import (
     donor_names_episode,
     donor_says_undescribed,
+    says_undescribed,
     donor_title_readings,
     episode_title_from_filename,
     episode_title_from_nfo,
@@ -895,9 +896,13 @@ def _says_undescribed(audio_path: Path, label: str) -> bool:
     2026-10-01) and would be published as a description. It is skipped, not
     refused: it says nothing about whether the catalogue mislabelled the episode.
     """
-    if not donor_says_undescribed(audio_path.name):
+    # The pack can say it instead of the file ("Season 9 not described/09 - 18
+    # ... It's a Trap.mp3"), so the folders it was unpacked into count as well.
+    if not (donor_says_undescribed(audio_path.name)
+            or says_undescribed(audio_path.parent.name)
+            or says_undescribed(audio_path.parent.parent.name)):
         return False
-    logger.warning("%s: %s says it is not described — not using it.", label, audio_path.name)
+    logger.warning("%s: %s says it is not described — not using it.", label, audio_path)
     return True
 
 

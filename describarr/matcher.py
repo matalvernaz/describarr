@@ -13,7 +13,9 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from .titles import _TRACK_NUMBER_MAX_DIGITS, donor_episode_title, donor_names_episode
+from .titles import (
+    _TRACK_NUMBER_MAX_DIGITS, donor_episode_title, donor_names_episode, says_undescribed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,22 @@ def _variant_quality(name: str) -> int:
         return 1
     return 2
 
+def _described_entries(results: list[dict]) -> list[dict]:
+    """*results* without the catalogue entries that say they are not described.
+
+    AudioVault files Family Guy's season 9 as "Season 9 not described": the plain
+    soundtrack, which lines up almost perfectly because nothing is narrated, so
+    the gate would publish it as a description (2026-10-01).
+    """
+    kept = []
+    for r in results:
+        if says_undescribed(r["name"]):
+            logger.info("Skipping %r — it says it is not described.", r["name"])
+        else:
+            kept.append(r)
+    return kept
+
+
 def find_season(
     results: list[dict], title: str, season: int, series_year: str = "",
 ) -> list[dict]:
@@ -119,6 +137,7 @@ def find_season(
     any_season_marker = re.compile(r"\b(?:s|season|series)\s*0?\d+\b", re.IGNORECASE)
 
     results = [r for r in results if not _foreign_narration(r["name"])]
+    results = _described_entries(results)
     title_lower = title.lower()
 
     start_year = int(series_year) if series_year.strip().isdigit() else None
@@ -250,7 +269,7 @@ def find_movie(results: list[dict], title: str, year: str) -> list[dict]:
 
     for result in results:
         name = result["name"]
-        if _foreign_narration(name):
+        if _foreign_narration(name) or says_undescribed(name):
             continue
         name_years = _PAREN_YEAR_RE.findall(name)
         if year and name_years and year not in name_years:
