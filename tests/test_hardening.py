@@ -136,7 +136,8 @@ def test_config_api_key_absent_is_none(monkeypatch):
 def _probe(*, subs: int, add_ad: bool):
     streams = [{"codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080}]
     if add_ad:
-        streams.append({"codec_type": "audio", "disposition": {"default": 1, "visual_impaired": 1}})
+        streams.append({"codec_type": "audio", "disposition": {"default": 1, "visual_impaired": 1},
+                        "tags": {"title": "AD", "language": "eng"}})
     streams.append({"codec_type": "audio", "disposition": {"default": 0}})
     for _ in range(subs):
         streams.append({"codec_type": "subtitle"})
