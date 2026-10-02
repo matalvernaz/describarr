@@ -218,6 +218,7 @@ def run(
         "--yes",
         "--output_dir", str(run_output_dir),
         "--alignment_dir", str(alignment_dir),
+        "--ad_language", AD_LANGUAGE,
     ]
     if stretch_audio:
         cmd.append("--stretch_audio")
@@ -818,6 +819,40 @@ def _subtitle_stream_count(probe: dict) -> int:
     return sum(1 for s in probe.get("streams", []) if s.get("codec_type") == "subtitle")
 
 
+# The language every published AD track is given. describarr refuses narration
+# in any other language (matcher._foreign_narration), so this states a fact.
+# Passed to the engine explicitly rather than inherited from the video's first
+# audio track, which in a MULTi release can be French.
+AD_LANGUAGE = "eng"
+# Containers whose audio tracks carry a language ffprobe reads back. AVI has no
+# such field, so an AVI output is published without one.
+_LANGUAGE_CONTAINERS = frozenset({".mkv", ".mp4", ".m4v", ".mov", ".webm"})
+
+
+def _has_expected_ad_language(probe: dict, output: Path) -> bool:
+    """Verify the AD track reads back as English wherever the container can say so.
+
+    An unlabelled AD track is a default audio track with no language, which
+    Jellyfin's Smart subtitle mode reads as foreign: it turns on full English
+    subtitles over English audio, and EchoFin's Spoken Subtitles then read every
+    line aloud over the programme. Every AD track published before engine
+    v2.2.6 was unlabelled (3,149 titles, relabelled in place 2026-10-02).
+    """
+    if output.suffix.lower() not in _LANGUAGE_CONTAINERS:
+        return True
+    audio = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
+    tags = (audio[0].get("tags") or {}) if audio else {}
+    language = (tags.get("language") or "").strip().lower()
+    if language != AD_LANGUAGE:
+        logger.error(
+            "Output a:0 language is %r, not %r: refusing to publish an unlabelled "
+            "AD track, players would read it as foreign audio.",
+            language or None, AD_LANGUAGE,
+        )
+        return False
+    return True
+
+
 def _has_expected_audio_disposition(probe: dict) -> bool:
     """Verify the AD track ended up as the default audio with the
     visual_impaired flag and no original-audio track was left as default.
@@ -1036,7 +1071,8 @@ def _validate_media_output(source: Path, output: Path) -> bool:
     Gates:
       1. ffprobe both files cleanly.
       2. Output has a real video stream with matching codec/width/height.
-      3. Output has at least source's audio stream count + 1 (the AD track).
+      3. Output has at least source's audio stream count + 1 (the AD track),
+         flagged default + visual impaired and labelled English.
       4. Output container duration is within tolerance of source.
       5. Output video packet count is within tolerance of source — both a
          relative ratio (≥95%) AND an absolute floor (lose no more than ~10 s
@@ -1089,6 +1125,10 @@ def _validate_media_output(source: Path, output: Path) -> bool:
     # Apple TV / Jellyfin clients will auto-play the wrong track even though
     # the file is structurally valid. Refuse to publish in that case.
     if not _has_expected_audio_disposition(out_probe):
+        return False
+
+    # And it must say what language it is in; see _has_expected_ad_language.
+    if not _has_expected_ad_language(out_probe, output):
         return False
 
     # describealaign maps every source subtitle stream through the mux
