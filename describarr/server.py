@@ -1216,6 +1216,9 @@ def _notify_outcome(
         # The sentinel is a signal to this function, not prose for the operator.
         reason = None
     notify.send(f"describarr: {label}", _notify_message(outcome, reason))
+    if outcome == "described":
+        # Everyone who asked to hear about new descriptions, through the homelab hub.
+        notify.send_hub("described", "Audio description added", label)
     _log_terminal_decision(config, label, outcome, reason)
     if path:
         OutcomeLog.in_cache(config.cache_dir).record(
