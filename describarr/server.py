@@ -27,7 +27,7 @@ from . import notify
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, LoginError
 from .config import Config
 from .decision_log import DecisionLog
-from .held_notifications import FILMS, HeldNotifications, group_name, show_group
+from .held_notifications import FILMS, Due, HeldNotifications, entry, group_name, show_group
 from .nomatch_cache import NoMatchCache
 from .outcome_log import OutcomeLog, key as outcome_key
 from .pending_queue import PendingQueue
@@ -1247,11 +1247,18 @@ def _notify_outcome(
         reason = None
     message = _notify_message(outcome, reason)
     held = _held_notifications(config)
-    if held.offer(group or _notify_group(label), label, outcome, message, time.time()):
-        notify.send(f"describarr: {label}", message)
-        if outcome == "described":
-            # Everyone who asked to hear about new descriptions, through the homelab hub.
-            notify.send_hub("described", "Audio description added", label)
+    group = group or _notify_group(label)
+    now = time.time()
+    if held.offer(group, label, outcome, message, now):
+        unsent = Due(group, last=now)
+        if not notify.send(f"describarr: {label}", message):
+            unsent.operator, unsent.operator_since = [entry(label, outcome, message)], now
+        # Everyone who asked to hear about new descriptions, through the homelab hub.
+        if outcome == "described" and not notify.send_hub(
+                "described", "Audio description added", label):
+            unsent.everyone, unsent.everyone_since = [label], now
+        if unsent.operator or unsent.everyone:
+            held.put_back(unsent)
     _log_terminal_decision(config, label, outcome, reason)
     if path:
         OutcomeLog.in_cache(config.cache_dir).record(

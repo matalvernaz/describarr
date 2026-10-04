@@ -61,10 +61,10 @@ def test_a_hub_failure_is_swallowed(monkeypatch):
 
 def test_only_a_described_outcome_reaches_the_hub(tmp_path, monkeypatch):
     config = fake_config(cache_dir=tmp_path)
-    monkeypatch.setattr(srv.notify, "send", lambda *a, **k: None)
+    monkeypatch.setattr(srv.notify, "send", lambda *a, **k: True)
     monkeypatch.setattr(srv, "_log_terminal_decision", lambda *a, **k: None)
     hub = []
-    monkeypatch.setattr(srv.notify, "send_hub", lambda *a, **k: hub.append(a))
+    monkeypatch.setattr(srv.notify, "send_hub", lambda *a, **k: hub.append(a) or True)
 
     srv._notify_outcome(config, "Heat (1995)", "described", None, path="/movies/Heat (1995)/Heat.mkv")
     srv._notify_outcome(config, "Ronin (1998)", "no_match", None)

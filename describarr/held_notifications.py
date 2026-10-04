@@ -55,6 +55,11 @@ def group_name(group: str) -> str:
     return group.removeprefix("show:")
 
 
+def entry(label: str, outcome: str, message: str) -> dict:
+    """One outcome, as the operator's part of a group holds it."""
+    return {"label": label, "outcome": outcome, "message": message}
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -133,8 +138,7 @@ class HeldNotifications:
                                 "everyone": [], "everyone_since": None}
                 send_now = True
             else:
-                held.setdefault("operator", []).append(
-                    {"label": label, "outcome": outcome, "message": message})
+                held.setdefault("operator", []).append(entry(label, outcome, message))
                 if held.get("operator_since") is None:
                     held["operator_since"] = now
                 if outcome == "described":
@@ -162,14 +166,17 @@ class HeldNotifications:
                 held = state[group]
                 quiet = now - held["last"] >= self._quiet
                 due = Due(group, last=held["last"])
+                # A part put back after a failed send goes at the next check.
                 if held.get("operator") and (
-                        quiet or _waited(held.get("operator_since"), self._max_wait, now)):
+                        quiet or held.get("operator_tries")
+                        or _waited(held.get("operator_since"), self._max_wait, now)):
                     due.operator = held["operator"]
                     due.operator_since = held.get("operator_since")
                     due.operator_tries = held.pop("operator_tries", 0)
                     held["operator"], held["operator_since"] = [], None
                 if held.get("everyone") and (
-                        quiet or _waited(held.get("everyone_since"), self._everyone_max_wait, now)):
+                        quiet or held.get("everyone_tries")
+                        or _waited(held.get("everyone_since"), self._everyone_max_wait, now)):
                     due.everyone = held["everyone"]
                     due.everyone_since = held.get("everyone_since")
                     due.everyone_tries = held.pop("everyone_tries", 0)
@@ -186,8 +193,11 @@ class HeldNotifications:
 
     def put_back(self, due: Due) -> None:
         """Hold again what could not be sent, ahead of anything held since, to
-        go at the next check that finds it due; given up after `RETRY_LIMIT`
-        tries."""
+        go at the next check; given up after `RETRY_LIMIT` tries.
+
+        A retry is a send of its own, so one that reached the far end but lost
+        the answer goes twice. The hub drops the same text within 30 minutes,
+        recorded before it fans out, so everyone is not told twice."""
         with _LOCK:
             state = self._load()
             created = due.group not in state

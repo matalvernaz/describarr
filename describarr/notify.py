@@ -39,9 +39,9 @@ def _deliver(request: Request, service: str) -> bool:
     trying again later could succeed: no answer, a server error, or being
     told to slow down. Anything else refused is refused for good."""
     try:
-        with urlopen(request, timeout=10) as resp:
-            if resp.status >= 400:
-                logger.warning("%s returned HTTP %d", service, resp.status)
+        # urlopen raises HTTPError for any status from 400 up.
+        with urlopen(request, timeout=10):
+            pass
     except HTTPError as exc:
         logger.warning("%s refused the notification: HTTP %d.", service, exc.code)
         return exc.code < 500 and exc.code != 429

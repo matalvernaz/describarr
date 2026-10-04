@@ -245,11 +245,12 @@ def test_a_summary_pushover_did_not_take_is_tried_again(tmp_path, monkeypatch):
 
 
 def test_a_summary_the_hub_did_not_take_is_tried_again_on_its_own(tmp_path, monkeypatch):
-    up = {"hub": False}
+    up = {}
     config, clock, pushes, hub = _wire(monkeypatch, tmp_path, up=up)
 
     _land(config, clock, "Friends S04E01")
     _land(config, clock, "Friends S04E02")
+    up["hub"] = False
     _go_quiet(config, clock)
     up["hub"] = True
     clock.advance(0.5)
@@ -262,11 +263,13 @@ def test_a_summary_the_hub_did_not_take_is_tried_again_on_its_own(tmp_path, monk
 
 def test_a_summary_is_given_up_after_an_hour_of_tries(tmp_path, monkeypatch):
     from describarr.held_notifications import RETRY_LIMIT
-    config, clock, pushes, _ = _wire(monkeypatch, tmp_path, up={"pushover": False})
+    up = {}
+    config, clock, pushes, _ = _wire(monkeypatch, tmp_path, up=up)
 
     _land(config, clock, "Friends S04E01")
     _land(config, clock, "Friends S04E02")
     _land(config, clock, "Friends S04E03")
+    up["pushover"] = False
     clock.advance(30)
     for _ in range(RETRY_LIMIT + 5):
         clock.advance(0.5)
@@ -274,6 +277,37 @@ def test_a_summary_is_given_up_after_an_hour_of_tries(tmp_path, monkeypatch):
 
     assert len(pushes) == 1 + RETRY_LIMIT
     assert not (config.cache_dir / HELD_FILENAME).read_text().strip("{}\n ")
+
+
+def test_a_first_notification_that_did_not_go_is_tried_at_the_next_check(tmp_path, monkeypatch):
+    up = {"pushover": False, "hub": False}
+    config, clock, pushes, hub = _wire(monkeypatch, tmp_path, up=up)
+
+    clock.advance(2)
+    srv._notify_outcome(config, "Friends S04E10", "described")
+    up.update(pushover=True, hub=True)
+    clock.advance(0.5)
+    srv._send_held_notifications(config)
+    clock.advance(0.5)
+    srv._send_held_notifications(config)
+
+    assert pushes == [("describarr: Friends S04E10", _DESCRIBED)] * 2
+    assert hub == ["Friends S04E10"] * 2
+
+
+def test_a_summary_put_back_into_a_new_window_goes_at_the_next_check(tmp_path):
+    """The show was heard from again while its summary was being sent: the
+    summary that failed does not wait for the new window to go quiet."""
+    held = HeldNotifications(tmp_path / HELD_FILENAME, quiet_seconds=1800, max_wait_seconds=7200)
+    assert held.offer(FILMS, "Heat (1995)", "described", _DESCRIBED, now=0)
+    assert not held.offer(FILMS, "Ronin (1998)", "described", _DESCRIBED, now=60)
+    [taken] = held.due(now=2000)
+    assert held.offer(FILMS, "Cars (2006)", "described", _DESCRIBED, now=2001)
+    held.put_back(taken)
+
+    [again] = held.due(now=2030)
+    assert [e["label"] for e in again.operator] == ["Ronin (1998)"]
+    assert again.everyone == ["Ronin (1998)"]
 
 
 def test_a_summary_put_back_after_the_show_came_back_is_not_lost(tmp_path):
