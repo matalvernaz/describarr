@@ -27,6 +27,7 @@ from . import notify
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, LoginError
 from .config import Config
 from .decision_log import DecisionLog
+from .held_notifications import FILMS, Due, HeldNotifications, entry, group_name, show_group
 from .nomatch_cache import NoMatchCache
 from .outcome_log import OutcomeLog, key as outcome_key
 from .pending_queue import PendingQueue
@@ -296,7 +297,29 @@ def serve(port: int = 8686) -> None:
     logger.info("describarr webhook server listening on port %d", port)
     threading.Thread(target=_midnight_drain_loop, daemon=True).start()
     threading.Thread(target=_worker_loop, daemon=True).start()
+    threading.Thread(target=_held_notifications_loop, daemon=True).start()
     server.serve_forever()
+
+
+# How often held notifications are checked for being due.
+_HELD_CHECK_SECONDS = 30
+
+
+def _held_notifications_loop() -> None:
+    """Background thread: send each show's held notifications once they are due.
+
+    Not the worker's job: a retry-queue drain is one item that can run for
+    hours, and a summary would wait behind it."""
+    while True:
+        time.sleep(_HELD_CHECK_SECONDS)
+        try:
+            config = Config.from_env()
+        except ValueError:
+            continue  # the worker says why, once a minute
+        try:
+            _send_held_notifications(config)
+        except Exception:
+            logger.exception("Sending held notifications failed; trying again shortly.")
 
 
 def _midnight_drain_loop() -> None:
@@ -1006,12 +1029,14 @@ def _sonarr(config: Config, env: dict[str, str]) -> dict | None:
             series_title, season, episodes, str(video_path), series_year=series_year,
             episode_title=episode_title,
         )
-        return {"label": label, "outcome": "queued", "path": str(video_path)}
+        return {"label": label, "outcome": "queued", "path": str(video_path),
+                "group": show_group(series_title)}
     return {
         "label": label,
         "outcome": _episode_outcome(described, reason),
         "reason": reason,
         "path": str(video_path),
+        "group": show_group(series_title),
     }
 
 
@@ -1036,12 +1061,13 @@ def _radarr(config: Config, env: dict[str, str]) -> dict | None:
             described, reason = process_movie(client, config, video_path, movie_title, movie_year)
     except DailyLimitReached:
         _get_retry_queue(config).add_movie(movie_title, movie_year, str(video_path))
-        return {"label": label, "outcome": "queued", "path": str(video_path)}
+        return {"label": label, "outcome": "queued", "path": str(video_path), "group": FILMS}
     return {
         "label": label,
         "outcome": _episode_outcome(described, reason),
         "reason": reason,
         "path": str(video_path),
+        "group": FILMS,
     }
 
 
@@ -1207,22 +1233,169 @@ def _log_terminal_decision(config: Config, label: str, outcome: str, reason: Opt
 
 def _notify_outcome(
     config: Config, label: str, outcome: str, reason: Optional[str] = None,
-    path: str | Path | None = None,
+    path: str | Path | None = None, group: Optional[str] = None,
 ) -> None:
     """Send the Pushover for an outcome (with the specific cause appended when
-    known), record the terminal decision for the /status audit trail, and,
-    where the file is known, keep it as that file's latest for /outcome."""
+    known), or hold it for its show's summary; record the terminal decision
+    for the /status audit trail, and, where the file is known, keep it as that
+    file's latest for /outcome. Only the notification waits.
+
+    *group* is the show (`show_group`) or `FILMS`; read from the label when
+    not given. See `held_notifications`."""
     if reason == ALREADY_DESCRIBED:
         # The sentinel is a signal to this function, not prose for the operator.
         reason = None
-    notify.send(f"describarr: {label}", _notify_message(outcome, reason))
-    if outcome == "described":
+    message = _notify_message(outcome, reason)
+    held = _held_notifications(config)
+    group = group or _notify_group(label)
+    now = time.time()
+    if held.offer(group, label, outcome, message, now):
+        unsent = Due(group, last=now)
+        if not notify.send(f"describarr: {label}", message):
+            unsent.operator, unsent.operator_since = [entry(label, outcome, message)], now
         # Everyone who asked to hear about new descriptions, through the homelab hub.
-        notify.send_hub("described", "Audio description added", label)
+        if outcome == "described" and not notify.send_hub(
+                "described", "Audio description added", label):
+            unsent.everyone, unsent.everyone_since = [label], now
+        if unsent.operator or unsent.everyone:
+            held.put_back(unsent)
     _log_terminal_decision(config, label, outcome, reason)
     if path:
         OutcomeLog.in_cache(config.cache_dir).record(
             path, outcome, detail=reason or "", label=label)
+
+
+def _held_notifications(config: Config) -> HeldNotifications:
+    return HeldNotifications.in_cache(
+        config.cache_dir, config.notify_quiet_minutes, config.notify_max_wait_minutes)
+
+
+# An episode's label, "Friends S04E10" or "Friends S02E12E13": the show and the code.
+_EPISODE_LABEL_RE = re.compile(r"^(.+?) (S\d+(?:E\d+)+)$")
+_EPISODE_CODE_RE = re.compile(r"^S(\d+)((?:E\d+)+)$")
+
+
+def _notify_group(label: str) -> str:
+    """The group an outcome is held in, read from its label."""
+    m = _EPISODE_LABEL_RE.match(label)
+    return show_group(m.group(1)) if m else FILMS
+
+
+def _send_held_notifications(config: Config, now: Optional[float] = None) -> None:
+    """Send every held summary that is due: the operator's by Pushover, and
+    what was described to everyone through the hub. What could not be sent
+    is put back for the next check."""
+    held = _held_notifications(config)
+    for due in held.due(time.time() if now is None else now):
+        name = group_name(due.group)
+        if due.operator:
+            title, body = _held_summary(due.group, due.operator)
+            if notify.send(title, body):
+                logger.info("Sent the held notifications for %s: %s",
+                            name, _held_counts(due.operator))
+                due.operator = []
+        if due.everyone:
+            if notify.send_hub("described", "Audio description added",
+                               _everyone_summary(due.group, due.everyone)):
+                logger.info("Told the hub about %d described for %s.",
+                            len(set(due.everyone)), name)
+                due.everyone = []
+        if due.operator or due.everyone:
+            held.put_back(due)
+
+
+# A summary lists problems first, so one cut to Pushover's length keeps them;
+# its count line leads with what was described.
+_HELD_LINE_ORDER = ("error", "no_match", "queued", "described", "already_described")
+_HELD_COUNT_WORDS = {
+    "described": "described",
+    "already_described": "already described",
+    "no_match": "no match",
+    "queued": "queued",
+    "error": "failed",
+}
+
+
+def _held_counts(entries: list[dict]) -> str:
+    """ "36 described, 1 no match." """
+    counts: dict[str, int] = {}
+    for entry in entries:
+        counts[entry["outcome"]] = counts.get(entry["outcome"], 0) + 1
+    order = [*_HELD_COUNT_WORDS, *(o for o in counts if o not in _HELD_COUNT_WORDS)]
+    return ", ".join(
+        f"{counts[o]} {_HELD_COUNT_WORDS.get(o, o)}" for o in order if o in counts) + "."
+
+
+def _held_summary(group: str, entries: list[dict]) -> tuple[str, str]:
+    """The operator's Pushover for a group's held outcomes.
+
+    One outcome reads exactly as it would have alone. More are counted, then
+    listed a line per distinct message, the episodes that share it run
+    together: "S04E11 to E24, S05E01 to E22: Described."
+    """
+    if len(entries) == 1:
+        return f"describarr: {entries[0]['label']}", entries[0]["message"]
+    if group == FILMS:
+        title = f"describarr: {len(entries)} more films"
+    else:
+        title = f"describarr: {group_name(group)}, {len(entries)} more"
+    lines: dict[tuple[str, str], list[str]] = {}
+    for entry in entries:
+        lines.setdefault((entry["outcome"], entry["message"]), []).append(entry["label"])
+    rank = {outcome: i for i, outcome in enumerate(_HELD_LINE_ORDER)}
+    ordered = sorted(lines.items(), key=lambda line: rank.get(line[0][0], -1))
+    body = "\n".join([_held_counts(entries)] + [
+        f"{_held_names(group, labels)}: {message}" for (_, message), labels in ordered])
+    return title, _cut(body, notify.MESSAGE_LIMIT)
+
+
+def _everyone_summary(group: str, labels: list[str]) -> str:
+    """What the hub tells everyone: what was described, without the workings."""
+    labels = list(dict.fromkeys(labels))
+    if len(labels) == 1:
+        return labels[0]
+    if group == FILMS:
+        return _cut(", ".join(labels), notify.MESSAGE_LIMIT)
+    return _cut(f"{group_name(group)}: {len(labels)} episodes, {_held_names(group, labels)}",
+                notify.MESSAGE_LIMIT)
+
+
+def _held_names(group: str, labels: list[str]) -> str:
+    """The files a line is about: a show's as runs of episodes, films by name."""
+    if group == FILMS:
+        return ", ".join(dict.fromkeys(labels))
+    prefix = group_name(group) + " "
+    return _episode_runs([label.removeprefix(prefix) for label in labels])
+
+
+def _episode_runs(codes: list[str]) -> str:
+    """ "S04E11 to E24, S05E01" for episode codes. A double episode counts as
+    both its episodes; anything that is not a code is named as it is."""
+    episodes: set[tuple[int, int]] = set()
+    others: list[str] = []
+    for code in codes:
+        m = _EPISODE_CODE_RE.match(code)
+        if not m:
+            others.append(code)
+            continue
+        season = int(m.group(1))
+        episodes.update((season, int(e)) for e in re.findall(r"\d+", m.group(2)))
+    runs: list[list[int]] = []  # [season, first, last]
+    for season, episode in sorted(episodes):
+        if runs and runs[-1][0] == season and runs[-1][2] == episode - 1:
+            runs[-1][2] = episode
+        else:
+            runs.append([season, episode, episode])
+    parts = [f"S{s:02d}E{a:02d}" if a == b else f"S{s:02d}E{a:02d} to E{b:02d}"
+             for s, a, b in runs]
+    return ", ".join(parts + list(dict.fromkeys(others)))
+
+
+def _cut(text: str, limit: int) -> str:
+    """*text* cut to *limit*, ending in an ellipsis when it was."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 2].rstrip() + " …"
 
 
 def _worker_handle_hook(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -1248,7 +1421,7 @@ def _worker_handle_hook(item: dict, config: Config, pending: PendingQueue) -> No
 
     _notify_outcome(
         config, result["label"], result["outcome"], result.get("reason"),
-        path=result.get("path"))
+        path=result.get("path"), group=result.get("group"))
 
 
 def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -1284,7 +1457,7 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
         _get_retry_queue(config).add_episodes(
             title, season, [episode, *extra_episodes], str(video_path), series_year=series_year,
         )
-        _notify_outcome(config, label, "queued", path=video_path)
+        _notify_outcome(config, label, "queued", path=video_path, group=show_group(title))
         return
     nomatch = NoMatchCache(
         config.cache_dir / "shows" / _safe_dirname(title) / _NOMATCH_FILENAME,
@@ -1303,7 +1476,8 @@ def _worker_handle_retry_episode(item: dict, config: Config, pending: PendingQue
         for key in keys:
             nomatch.record_miss(key, video_path)
 
-    _notify_outcome(config, label, _episode_outcome(described, reason), reason, path=video_path)
+    _notify_outcome(config, label, _episode_outcome(described, reason), reason, path=video_path,
+                    group=show_group(title))
 
 
 def _worker_handle_retry_movie(item: dict, config: Config, pending: PendingQueue) -> None:
@@ -1323,9 +1497,10 @@ def _worker_handle_retry_movie(item: dict, config: Config, pending: PendingQueue
             described, reason = process_movie(client, config, video_path, title, year_str)
     except DailyLimitReached:
         _get_retry_queue(config).add_movie(title, year_str, str(video_path))
-        _notify_outcome(config, label, "queued", path=video_path)
+        _notify_outcome(config, label, "queued", path=video_path, group=FILMS)
         return
-    _notify_outcome(config, label, _episode_outcome(described, reason), reason, path=video_path)
+    _notify_outcome(config, label, _episode_outcome(described, reason), reason, path=video_path,
+                    group=FILMS)
 
 
 def _merge_done_entries(show_cache_dir: Path, season: int, episodes: set) -> int:

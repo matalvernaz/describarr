@@ -63,10 +63,15 @@ def fake_config(tmp_path=None, **overrides):
     import types as _types
     from pathlib import Path as _Path
 
+    from describarr.config import Config as _Config
+
     base = {
         "cache_dir": (tmp_path / "cache") if tmp_path is not None else _Path("/nonexistent"),
         "nomatch_ttl_days": 30,
         "history_size": 50,
+        # As deployed: a show's later notifications are held for its summary.
+        "notify_quiet_minutes": _Config.notify_quiet_minutes,
+        "notify_max_wait_minutes": _Config.notify_max_wait_minutes,
     }
     base.update(overrides)
     return _types.SimpleNamespace(**base)

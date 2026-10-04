@@ -48,6 +48,17 @@ def _parse_bool(name: str, default: bool) -> bool:
     )
 
 
+def _parse_minutes(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        minutes = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a whole number of minutes; got {raw!r}")
+    if minutes < 0:
+        raise ValueError(f"{name} must be ≥ 0.")
+    return minutes
+
+
 @dataclass
 class Config:
     email: str
@@ -88,6 +99,14 @@ class Config:
     # show that will never match. Catalogues do gain titles, so the memory
     # expires rather than being permanent. 0 disables it (always re-search).
     nomatch_ttl_days: int = 30
+    # Adding a show sends its episodes through one after another. The first
+    # outcome for a show is notified at once; the rest are held and sent as one
+    # summary when the show has had no outcome for this many minutes, or after
+    # notify_max_wait_minutes while a long run is still going (0: no limit).
+    # Measured 2026-10-04: a bulk run's gaps between outcomes stayed under 15
+    # minutes but for two pauses in 18 hours. 0 notifies every outcome at once.
+    notify_quiet_minutes: int = 30
+    notify_max_wait_minutes: int = 120
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -147,6 +166,9 @@ class Config:
         if nomatch_ttl_days < 0:
             raise ValueError("DESCRIBARR_NOMATCH_TTL_DAYS must be ≥ 0.")
 
+        notify_quiet_minutes = _parse_minutes("DESCRIBARR_NOTIFY_QUIET_MINUTES", 30)
+        notify_max_wait_minutes = _parse_minutes("DESCRIBARR_NOTIFY_MAX_WAIT_MINUTES", 120)
+
         return cls(
             email=email,
             password=password,
@@ -160,4 +182,6 @@ class Config:
             api_key=api_key,
             history_size=history_size,
             nomatch_ttl_days=nomatch_ttl_days,
+            notify_quiet_minutes=notify_quiet_minutes,
+            notify_max_wait_minutes=notify_max_wait_minutes,
         )
