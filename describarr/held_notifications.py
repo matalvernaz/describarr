@@ -14,7 +14,8 @@ what is new, not how a backfill is getting on. Films share one group.
 
 Kept in the cache directory, so a restart does not lose what is held. A summary
 is taken out of the file before it is sent, never after, so it cannot be sent
-twice.
+twice; one that could not be sent is put back and tried at each check for
+about an hour. One taken out just as the process dies is lost.
 """
 from __future__ import annotations
 
@@ -38,6 +39,10 @@ FILMS = "films"
 #: Everyone hears about a show when it goes quiet; a run that never does is
 #: told about after this long all the same.
 EVERYONE_MAX_WAIT_SECONDS = 12 * 3600
+
+#: A summary that could not be sent is given up after this many tries, one
+#: per check: about an hour.
+RETRY_LIMIT = 120
 
 
 def show_group(title: str) -> str:
@@ -68,6 +73,12 @@ class Due:
     operator: list[dict] = field(default_factory=list)
     #: For everyone: the labels of what was described, in arrival order.
     everyone: list[str] = field(default_factory=list)
+    # How things stood when these were taken, so they can be put back so.
+    last: float = 0.0
+    operator_since: float | None = None
+    everyone_since: float | None = None
+    operator_tries: int = 0
+    everyone_tries: int = 0
 
 
 class HeldNotifications:
@@ -130,7 +141,11 @@ class HeldNotifications:
                     held.setdefault("everyone", []).append(label)
                     if held.get("everyone_since") is None:
                         held["everyone_since"] = now
-                held["last"] = now
+                # A show that has already gone quiet has its summary due: this
+                # one joins it at the next check rather than holding it up for
+                # a window of its own.
+                if now - held["last"] < self._quiet:
+                    held["last"] = now
                 send_now = False
             if not self._save(state):
                 return True
@@ -146,14 +161,18 @@ class HeldNotifications:
             for group in list(state):
                 held = state[group]
                 quiet = now - held["last"] >= self._quiet
-                due = Due(group)
+                due = Due(group, last=held["last"])
                 if held.get("operator") and (
                         quiet or _waited(held.get("operator_since"), self._max_wait, now)):
                     due.operator = held["operator"]
+                    due.operator_since = held.get("operator_since")
+                    due.operator_tries = held.pop("operator_tries", 0)
                     held["operator"], held["operator_since"] = [], None
                 if held.get("everyone") and (
                         quiet or _waited(held.get("everyone_since"), self._everyone_max_wait, now)):
                     due.everyone = held["everyone"]
+                    due.everyone_since = held.get("everyone_since")
+                    due.everyone_tries = held.pop("everyone_tries", 0)
                     held["everyone"], held["everyone_since"] = [], None
                 if due.operator or due.everyone:
                     ready.append(due)
@@ -164,6 +183,35 @@ class HeldNotifications:
             if changed and not self._save(state):
                 return []
             return ready
+
+    def put_back(self, due: Due) -> None:
+        """Hold again what could not be sent, ahead of anything held since, to
+        go at the next check that finds it due; given up after `RETRY_LIMIT`
+        tries."""
+        with _LOCK:
+            state = self._load()
+            created = due.group not in state
+            held = state.setdefault(due.group, {
+                "last": due.last, "operator": [], "operator_since": None,
+                "everyone": [], "everyone_since": None})
+            for part in ("operator", "everyone"):
+                taken = getattr(due, part)
+                if not taken:
+                    continue
+                tries = getattr(due, f"{part}_tries") + 1
+                if tries >= RETRY_LIMIT:
+                    logger.error("Gave up on %d held notification(s) for %s after %d tries.",
+                                 len(taken), group_name(due.group), tries)
+                    continue
+                held[part] = taken + held.get(part, [])
+                since = [t for t in (getattr(due, f"{part}_since"), held.get(f"{part}_since"))
+                         if t is not None]
+                held[f"{part}_since"] = min(since) if since else due.last
+                held[f"{part}_tries"] = tries
+            if created and not held["operator"] and not held["everyone"]:
+                del state[due.group]
+            if not self._save(state):
+                logger.error("Lost the unsent notifications for %s.", group_name(due.group))
 
 
 def _waited(since: float | None, limit: float, now: float) -> bool:

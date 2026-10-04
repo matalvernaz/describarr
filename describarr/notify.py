@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -33,11 +34,29 @@ def _creds() -> tuple[str, str] | None:
     return token, user
 
 
-def send(title: str, message: str) -> None:
-    """Fire-and-forget Pushover notification. Logs and swallows any failure."""
+def _deliver(request: Request, service: str) -> bool:
+    """Post *request*, logging and swallowing any failure. False only when
+    trying again later could succeed: no answer, a server error, or being
+    told to slow down. Anything else refused is refused for good."""
+    try:
+        with urlopen(request, timeout=10) as resp:
+            if resp.status >= 400:
+                logger.warning("%s returned HTTP %d", service, resp.status)
+    except HTTPError as exc:
+        logger.warning("%s refused the notification: HTTP %d.", service, exc.code)
+        return exc.code < 500 and exc.code != 429
+    except Exception:
+        logger.warning("%s notification failed.", service, exc_info=True)
+        return False
+    return True
+
+
+def send(title: str, message: str) -> bool:
+    """Fire-and-forget Pushover notification. Logs and swallows any failure;
+    False when it is worth trying again (see `_deliver`)."""
     creds = _creds()
     if creds is None:
-        return
+        return True
     token, user = creds
     data = urlencode({
         "token": token,
@@ -45,12 +64,7 @@ def send(title: str, message: str) -> None:
         "title": title[:TITLE_LIMIT],
         "message": message[:MESSAGE_LIMIT],
     }).encode()
-    try:
-        with urlopen(Request(_API_URL, data=data), timeout=10) as resp:
-            if resp.status >= 400:
-                logger.warning("Pushover returned HTTP %d", resp.status)
-    except Exception:
-        logger.warning("Pushover notification failed.", exc_info=True)
+    return _deliver(Request(_API_URL, data=data), "Pushover")
 
 
 def _hub() -> tuple[str, str] | None:
@@ -61,21 +75,17 @@ def _hub() -> tuple[str, str] | None:
     return url, token
 
 
-def send_hub(category: str, title: str, message: str, click: str | None = None) -> None:
-    """Fire-and-forget post to the notifications hub. Logs and swallows any failure."""
+def send_hub(category: str, title: str, message: str, click: str | None = None) -> bool:
+    """Fire-and-forget post to the notifications hub. Logs and swallows any
+    failure; False when it is worth trying again (see `_deliver`)."""
     hub = _hub()
     if hub is None:
-        return
+        return True
     url, token = hub
     data = json.dumps({"topic": category, "title": title, "message": message, "click": click}).encode()
     request = Request(f"{url}/", data=data, headers={
         "Content-Type": "application/json", "Authorization": f"Bearer {token}",
         "User-Agent": "describarr",
     })
-    try:
-        with urlopen(request, timeout=10) as resp:
-            if resp.status >= 400:
-                logger.warning("Notifications hub returned HTTP %d", resp.status)
-    except Exception:
-        logger.warning("Notifications hub post failed.", exc_info=True)
+    return _deliver(request, "Notifications hub")
 

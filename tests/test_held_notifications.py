@@ -37,13 +37,17 @@ class _Clock:
         return getattr(_time, name)
 
 
-def _wire(monkeypatch, tmp_path, **overrides):
+def _wire(monkeypatch, tmp_path, up=None, **overrides):
+    """Every send is recorded, delivered or not; *up* says whether Pushover
+    and the hub take it."""
     clock = _Clock()
     monkeypatch.setattr(srv, "time", clock)
+    up = up if up is not None else {}
     pushes, hub = [], []
-    monkeypatch.setattr(srv.notify, "send", lambda title, message: pushes.append((title, message)))
-    monkeypatch.setattr(srv.notify, "send_hub",
-                        lambda category, title, message, click=None: hub.append(message))
+    monkeypatch.setattr(srv.notify, "send", lambda title, message: (
+        pushes.append((title, message)) or up.get("pushover", True)))
+    monkeypatch.setattr(srv.notify, "send_hub", lambda category, title, message, click=None: (
+        hub.append(message) or up.get("hub", True)))
     return fake_config(tmp_path, **overrides), clock, pushes, hub
 
 
@@ -200,6 +204,94 @@ def test_a_show_heard_from_again_after_going_quiet_is_sent_at_once(tmp_path, mon
     assert pushes[-1] == ("describarr: Friends S04E03", _DESCRIBED)
 
 
+def test_an_episode_landing_after_the_show_went_quiet_joins_its_summary(tmp_path, monkeypatch):
+    """The background check comes round every 30 seconds. An episode landing
+    between the show going quiet and that check used to start the quiet
+    window again, holding a finished summary back for another 30 minutes."""
+    config, clock, pushes, _ = _wire(monkeypatch, tmp_path)
+
+    _land(config, clock, "Friends S04E01")
+    _land(config, clock, "Friends S04E02")
+    clock.advance(30.2)  # quiet; the check has not come round yet
+    srv._notify_outcome(config, "Friends S04E03", "described")
+    clock.advance(0.3)
+    srv._send_held_notifications(config)
+
+    assert pushes[1:] == [("describarr: Friends, 2 more",
+                           "2 described.\nS04E02 to E03: Described.")]
+
+
+def test_a_summary_pushover_did_not_take_is_tried_again(tmp_path, monkeypatch):
+    up = {"pushover": True}
+    config, clock, pushes, hub = _wire(monkeypatch, tmp_path, up=up)
+
+    _land(config, clock, "Friends S04E01")
+    _land(config, clock, "Friends S04E02")
+    _land(config, clock, "Friends S04E03")
+    up["pushover"] = False
+    _go_quiet(config, clock)
+    assert pushes[-1][0] == "describarr: Friends, 2 more"
+    # The hub took its part, so only Pushover's is tried again.
+    assert hub == ["Friends S04E01", "Friends: 2 episodes, S04E02 to E03"]
+
+    up["pushover"] = True
+    clock.advance(0.5)
+    srv._send_held_notifications(config)
+    clock.advance(0.5)
+    srv._send_held_notifications(config)
+    assert [title for title, _ in pushes] == [
+        "describarr: Friends S04E01", "describarr: Friends, 2 more", "describarr: Friends, 2 more"]
+    assert hub == ["Friends S04E01", "Friends: 2 episodes, S04E02 to E03"]
+
+
+def test_a_summary_the_hub_did_not_take_is_tried_again_on_its_own(tmp_path, monkeypatch):
+    up = {"hub": False}
+    config, clock, pushes, hub = _wire(monkeypatch, tmp_path, up=up)
+
+    _land(config, clock, "Friends S04E01")
+    _land(config, clock, "Friends S04E02")
+    _go_quiet(config, clock)
+    up["hub"] = True
+    clock.advance(0.5)
+    srv._send_held_notifications(config)
+
+    assert hub == ["Friends S04E01", "Friends S04E02", "Friends S04E02"]
+    assert [title for title, _ in pushes] == [
+        "describarr: Friends S04E01", "describarr: Friends S04E02"]
+
+
+def test_a_summary_is_given_up_after_an_hour_of_tries(tmp_path, monkeypatch):
+    from describarr.held_notifications import RETRY_LIMIT
+    config, clock, pushes, _ = _wire(monkeypatch, tmp_path, up={"pushover": False})
+
+    _land(config, clock, "Friends S04E01")
+    _land(config, clock, "Friends S04E02")
+    _land(config, clock, "Friends S04E03")
+    clock.advance(30)
+    for _ in range(RETRY_LIMIT + 5):
+        clock.advance(0.5)
+        srv._send_held_notifications(config)
+
+    assert len(pushes) == 1 + RETRY_LIMIT
+    assert not (config.cache_dir / HELD_FILENAME).read_text().strip("{}\n ")
+
+
+def test_a_summary_put_back_after_the_show_came_back_is_not_lost(tmp_path):
+    """Taken, then the show is heard from again while the send fails: the
+    new window holds the old summary too."""
+    held = HeldNotifications(tmp_path / HELD_FILENAME, quiet_seconds=1800, max_wait_seconds=7200)
+    assert held.offer(FILMS, "Heat (1995)", "described", _DESCRIBED, now=0)
+    assert not held.offer(FILMS, "Ronin (1998)", "described", _DESCRIBED, now=60)
+    [taken] = held.due(now=2000)
+    assert held.offer(FILMS, "Cars (2006)", "described", _DESCRIBED, now=2001)
+    held.put_back(taken)
+    assert not held.offer(FILMS, "Up (2009)", "described", _DESCRIBED, now=2002)
+
+    [again] = held.due(now=4000)
+    assert [e["label"] for e in again.operator] == ["Ronin (1998)", "Up (2009)"]
+    assert again.everyone == ["Ronin (1998)", "Up (2009)"]
+
+
 def test_the_outcome_is_on_record_at_once_while_its_notification_waits(tmp_path, monkeypatch):
     config, clock, pushes, _ = _wire(monkeypatch, tmp_path)
 
@@ -334,6 +426,49 @@ def test_pushover_gets_no_more_than_its_limits(monkeypatch):
     notify.send("t" * 300, "m" * 2000)
     assert len(sent["title"]) == notify.TITLE_LIMIT == 250
     assert len(sent["message"]) == notify.MESSAGE_LIMIT == 1024
+
+
+def test_only_what_could_go_later_is_worth_trying_again(monkeypatch):
+    from urllib.error import HTTPError, URLError
+    monkeypatch.setenv("PUSHOVER_TOKEN", "tok")
+    monkeypatch.setenv("PUSHOVER_USER", "usr")
+    monkeypatch.setenv("NOTIFY_HUB_URL", "http://notify:8000")
+    monkeypatch.setenv("NOTIFY_HUB_TOKEN", "tok")
+    answer = {}
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        if "error" in answer:
+            raise answer["error"]
+        return _Response()
+
+    monkeypatch.setattr(notify, "urlopen", fake_urlopen)
+
+    def refused(code):
+        return HTTPError("https://api.pushover.net", code, "no", {}, None)
+
+    for error, worth_another_go in (
+            (None, False), (URLError("no route"), True), (TimeoutError(), True),
+            (refused(503), True), (refused(429), True), (refused(400), False)):
+        answer.clear()
+        if error is not None:
+            answer["error"] = error
+        assert notify.send("t", "m") is not worth_another_go
+        assert notify.send_hub("described", "t", "m") is not worth_another_go
+
+    monkeypatch.delenv("PUSHOVER_TOKEN")
+    monkeypatch.delenv("NOTIFY_HUB_URL")
+    answer["error"] = URLError("never asked")
+    assert notify.send("t", "m") is True
+    assert notify.send_hub("described", "t", "m") is True
 
 
 def test_episodes_run_together_across_doubles_and_seasons():

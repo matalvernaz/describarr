@@ -1276,17 +1276,25 @@ def _notify_group(label: str) -> str:
 
 def _send_held_notifications(config: Config, now: Optional[float] = None) -> None:
     """Send every held summary that is due: the operator's by Pushover, and
-    what was described to everyone through the hub."""
-    for due in _held_notifications(config).due(time.time() if now is None else now):
+    what was described to everyone through the hub. What could not be sent
+    is put back for the next check."""
+    held = _held_notifications(config)
+    for due in held.due(time.time() if now is None else now):
         name = group_name(due.group)
         if due.operator:
             title, body = _held_summary(due.group, due.operator)
-            notify.send(title, body)
-            logger.info("Sent the held notifications for %s: %s", name, _held_counts(due.operator))
+            if notify.send(title, body):
+                logger.info("Sent the held notifications for %s: %s",
+                            name, _held_counts(due.operator))
+                due.operator = []
         if due.everyone:
-            notify.send_hub("described", "Audio description added",
-                            _everyone_summary(due.group, due.everyone))
-            logger.info("Told the hub about %d described for %s.", len(set(due.everyone)), name)
+            if notify.send_hub("described", "Audio description added",
+                               _everyone_summary(due.group, due.everyone)):
+                logger.info("Told the hub about %d described for %s.",
+                            len(set(due.everyone)), name)
+                due.everyone = []
+        if due.operator or due.everyone:
+            held.put_back(due)
 
 
 # A summary lists problems first, so one cut to Pushover's length keeps them;
