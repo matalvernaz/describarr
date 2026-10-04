@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 _API_URL = "https://api.pushover.net/1/messages.json"
 
+# Pushover's limits on a title and a message, in characters.
+TITLE_LIMIT = 250
+MESSAGE_LIMIT = 1024
+
 
 def _creds() -> tuple[str, str] | None:
     token = os.environ.get("PUSHOVER_TOKEN", "").strip()
@@ -38,8 +42,8 @@ def send(title: str, message: str) -> None:
     data = urlencode({
         "token": token,
         "user": user,
-        "title": title,
-        "message": message,
+        "title": title[:TITLE_LIMIT],
+        "message": message[:MESSAGE_LIMIT],
     }).encode()
     try:
         with urlopen(Request(_API_URL, data=data), timeout=10) as resp:

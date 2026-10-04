@@ -97,7 +97,10 @@ def test_notification_carries_the_note(monkeypatch, tmp_path):
     sent = []
     monkeypatch.setattr(server.notify, "send", lambda title, message: sent.append((title, message)))
     monkeypatch.setattr(server, "_log_terminal_decision", lambda *a, **k: None)
-    config = Config(email="e", password="p", cache_dir=tmp_path / "cache")
+    # Every outcome sent as it lands: the second would otherwise wait for the
+    # first one's summary.
+    config = Config(email="e", password="p", cache_dir=tmp_path / "cache",
+                    notify_quiet_minutes=0)
     server._notify_outcome(config, "Scary Movie 3 (2003)", "described",
                            "AD source is a different cut: 75 s of the picture has no description")
     assert sent == [("describarr: Scary Movie 3 (2003)",

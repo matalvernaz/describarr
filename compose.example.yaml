@@ -11,10 +11,15 @@ services:
       - DESCRIBARR_NOMATCH_TTL_DAYS=${DESCRIBARR_NOMATCH_TTL_DAYS:-30}
       # Run the daily-limit reset and overnight drain on local time, not UTC.
       - TZ=${TZ:-America/Vancouver}
-      # Optional: per-episode Pushover notification when describarr finishes.
+      # Optional: a Pushover notification when describarr finishes a file.
       # Leave unset to disable.
       - PUSHOVER_TOKEN=${PUSHOVER_TOKEN:-}
       - PUSHOVER_USER=${PUSHOVER_USER:-}
+      # A show's first outcome is sent at once; the rest are held and sent as
+      # one summary once the show has been quiet this long, or every
+      # MAX_WAIT minutes during a long run (0: no limit). 0 = send each at once.
+      - DESCRIBARR_NOTIFY_QUIET_MINUTES=${DESCRIBARR_NOTIFY_QUIET_MINUTES:-30}
+      - DESCRIBARR_NOTIFY_MAX_WAIT_MINUTES=${DESCRIBARR_NOTIFY_MAX_WAIT_MINUTES:-120}
     volumes:
       # Mount the same media paths that Sonarr/Radarr use inside their containers.
       # These must match the container-side paths exactly (e.g. /tv, /movies).

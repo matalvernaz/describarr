@@ -70,5 +70,8 @@ def test_only_a_described_outcome_reaches_the_hub(tmp_path, monkeypatch):
     srv._notify_outcome(config, "Ronin (1998)", "no_match", None)
     srv._notify_outcome(config, "Something", "error", "unhandled error")
     srv._notify_outcome(config, "Heat (1995)", "already_described", srv.ALREADY_DESCRIBED)
+    # The three that followed Heat were held for the films' summary, which
+    # has nothing described to tell everyone.
+    srv._send_held_notifications(config, now=srv.time.time() + 24 * 3600)
 
     assert hub == [("described", "Audio description added", "Heat (1995)")]
