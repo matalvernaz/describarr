@@ -76,10 +76,18 @@ def test_english_first_track_is_english(monkeypatch, tmp_path):
     assert primary_audio_is_english(tmp_path / "v.mkv")
 
 
-def test_french_first_multi_release_is_not(monkeypatch, tmp_path):
-    # This Is Us S01E12 MULTi: French default first, English second. The engine
-    # decodes the FIRST audio stream (-map 0:a:0), so this must be refused.
+def test_french_first_multi_release_is_aligned_in_english(monkeypatch, tmp_path):
+    # This Is Us S01E12 MULTi: French default first, English second. Until
+    # engine v2.2.7 the alignment read only the FIRST stream and this had to be
+    # refused; now it is aligned against the English one (--audio_stream 1).
     _probe(monkeypatch, ["fre", "eng"])
+    assert primary_audio_is_english(tmp_path / "v.mkv")
+
+
+def test_a_release_with_no_english_track_is_not(monkeypatch, tmp_path):
+    _probe(monkeypatch, ["fre", "spa"])
+    assert not primary_audio_is_english(tmp_path / "v.mkv")
+    _probe(monkeypatch, ["fre", None])
     assert not primary_audio_is_english(tmp_path / "v.mkv")
 
 

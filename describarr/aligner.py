@@ -220,6 +220,9 @@ def run(
         "--alignment_dir", str(alignment_dir),
         "--ad_language", AD_LANGUAGE,
     ]
+    audio_stream = reference_audio_stream(video_path)
+    if audio_stream:
+        cmd += ["--audio_stream", str(audio_stream)]
     if stretch_audio:
         cmd.append("--stretch_audio")
 
@@ -677,29 +680,76 @@ def piecewise_rate_fraction(report: Optional[Path]) -> float:
 
 
 _ENGLISH_LANGUAGE_TAGS = frozenset({"eng", "en", "english"})
+_UNTAGGED_LANGUAGES = frozenset({"", "und"})
+
+
+def _audio_languages(path: Path) -> Optional[list[str]]:
+    """Each audio stream's language tag, casefolded ('' when untagged), in
+    stream order; None on a probe failure."""
+    probe = _ffprobe_json(path)
+    if probe is None:
+        return None
+    return [((s.get("tags") or {}).get("language") or "").strip().casefold()
+            for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
+
+
+def _reference_stream(languages: list[str]) -> Optional[int]:
+    if not languages or languages[0] in _ENGLISH_LANGUAGE_TAGS | _UNTAGGED_LANGUAGES:
+        return 0
+    english = [i for i, lang in enumerate(languages) if lang in _ENGLISH_LANGUAGE_TAGS]
+    if english:
+        return english[0]
+    if any(lang in _UNTAGGED_LANGUAGES for lang in languages):
+        return 0
+    return None
+
+
+def reference_audio_stream(path: Path) -> Optional[int]:
+    """
+    Which of the video's audio streams describealaign aligns against and fills
+    the description's gaps from (its ``--audio_stream``), counting from 0.
+
+    The first, unless it is tagged with another language and a later stream is
+    English: a "Dual Audio" release can open with a dub (Friends' HDMAN
+    BluRays, 2026-10-04: Portuguese first, English second), and every English
+    description was compared with the Portuguese and refused. None when every
+    stream is tagged and none is English: no English description can match that
+    copy. An untagged first stream, a stream with no tag at all among foreign
+    ones, and a probe failure all keep the first, as before.
+    """
+    languages = _audio_languages(path)
+    return 0 if languages is None else _reference_stream(languages)
+
+
+def foreign_only_audio(path: Path) -> list[str]:
+    """The languages of a copy with no English audio at all (every stream
+    tagged, none English), else an empty list."""
+    languages = _audio_languages(path)
+    if not languages or _reference_stream(languages) is not None:
+        return []
+    return languages
 
 
 def primary_audio_is_english(path: Path) -> bool:
     """
     True when the audio describealaign aligns against is English.
 
-    The engine decodes the file's FIRST audio stream (``-map 0:a:0``), and that
-    stream also fills every gap in the described track. A MULTi release with
-    French first scores like a hard-to-match English one (This Is Us S01E12:
-    20.4 % over a straight native map), so a low-score acceptance must know
-    which one it has. An untagged track counts only when it is the only one.
-    False on a probe failure.
+    That stream (see :func:`reference_audio_stream`) also fills every gap in the
+    described track. A MULTi release with French first and nothing tagged
+    English scores like a hard-to-match English one (This Is Us S01E12: 20.4 %
+    over a straight native map), so a low-score acceptance must know which one
+    it has. An untagged stream counts only when it is the only one. False on a
+    probe failure.
     """
-    probe = _ffprobe_json(path)
-    if probe is None:
+    languages = _audio_languages(path)
+    if not languages:
         return False
-    audio = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
-    if not audio:
+    stream = _reference_stream(languages)
+    if stream is None:
         return False
-    language = ((audio[0].get("tags") or {}).get("language") or "").strip().casefold()
-    if language in _ENGLISH_LANGUAGE_TAGS:
+    if languages[stream] in _ENGLISH_LANGUAGE_TAGS:
         return True
-    return len(audio) == 1 and language in ("", "und")
+    return len(languages) == 1 and languages[0] in _UNTAGGED_LANGUAGES
 
 
 def _parse_tc(tc: str) -> float:

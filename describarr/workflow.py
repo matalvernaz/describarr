@@ -43,6 +43,7 @@ from .aligner import (
     source_has_ad_track,
     piecewise_rate_fraction,
     primary_audio_is_english,
+    foreign_only_audio,
 )
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
@@ -130,6 +131,31 @@ class DamagedSource(str):
     was refused or the engine failed. Like :class:`EngineFailure` it is just the
     message; the type only lets the notification say so instead of "did not
     line up"."""
+
+
+class NoEnglishAudio(DamagedSource):
+    """The copy has no English audio, so no English description can line up
+    with it. Said at once instead of after trying every recording: a whole
+    season of a Portuguese-only copy cost 5-10 minutes an episode before
+    (Friends, 2026-10-04)."""
+
+
+# Names for the language tags a foreign-only copy is reported with, so the
+# notification says "Portuguese", not "por".
+_LANGUAGE_NAMES = {
+    "por": "Portuguese", "pt": "Portuguese", "spa": "Spanish", "es": "Spanish",
+    "fre": "French", "fra": "French", "fr": "French", "ger": "German", "deu": "German",
+    "de": "German", "ita": "Italian", "it": "Italian", "jpn": "Japanese", "ja": "Japanese",
+    "rus": "Russian", "ru": "Russian", "pol": "Polish", "pl": "Polish", "hin": "Hindi",
+    "kor": "Korean", "chi": "Chinese", "zho": "Chinese", "dut": "Dutch", "nld": "Dutch",
+    "tur": "Turkish", "gre": "Greek", "ell": "Greek", "ara": "Arabic", "heb": "Hebrew",
+}
+
+
+def _no_english_reason(languages: list[str]) -> NoEnglishAudio:
+    names = list(dict.fromkeys(_LANGUAGE_NAMES.get(code, code) for code in languages))
+    spoken = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    return NoEnglishAudio(f"this copy has no English audio, only {spoken}")
 
 
 class Refusal(str):
@@ -263,6 +289,11 @@ def process_episode(
     if source_has_ad_track(video_path):
         logger.info("%s already has an audio-description track — skipping.", video_path.name)
         return True, ALREADY_DESCRIBED
+    foreign = foreign_only_audio(video_path)
+    if foreign:
+        reason = _no_english_reason(foreign)
+        logger.info("%s: %s; not searching.", label, reason)
+        return False, reason
     if len(all_episodes) == 1:
         logger.info("Looking up: %s S%02dE%02d", series_title, season, episode)
     else:
@@ -462,6 +493,11 @@ def process_movie(
     if source_has_ad_track(video_path):
         logger.info("%s already has an audio-description track — skipping.", video_path.name)
         return True, ALREADY_DESCRIBED
+    foreign = foreign_only_audio(video_path)
+    if foreign:
+        reason = _no_english_reason(foreign)
+        logger.info("%s: %s; not searching.", label, reason)
+        return False, reason
     logger.info("Looking up movie: %s (%s)", movie_title, movie_year)
 
     search_title = _strip_title_qualifiers(movie_title)
