@@ -37,14 +37,18 @@ def _creds() -> tuple[str, str] | None:
 
 
 def _never_arrived(exc: BaseException) -> bool:
-    """Whether the request certainly never reached the server: refused,
-    unresolvable or unroutable, as opposed to a timeout or a dropped answer,
-    after which the server may well have acted on it."""
-    reason = exc.reason if isinstance(exc, URLError) and not isinstance(exc, HTTPError) else exc
-    if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
+    """Whether the server certainly never acted on the request.
+
+    urlopen wraps in URLError whatever goes wrong while connecting and sending
+    (refused, unresolvable, unroutable, a connect timeout): the request never
+    arrived whole, so nothing was done. Errors while reading the answer (a read
+    timeout, a dropped connection) come unwrapped, after the server may well
+    have acted."""
+    if isinstance(exc, URLError) and not isinstance(exc, HTTPError):
         return True
-    return isinstance(reason, OSError) and reason.errno in (
-        errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH)
+    return isinstance(exc, (ConnectionRefusedError, socket.gaierror)) or (
+        isinstance(exc, OSError) and exc.errno in (
+            errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH))
 
 
 def _deliver(request: Request, service: str, retry_unsure: bool = True) -> bool:
@@ -61,7 +65,9 @@ def _deliver(request: Request, service: str, retry_unsure: bool = True) -> bool:
             pass
     except HTTPError as exc:
         logger.warning("%s refused the notification: HTTP %d.", service, exc.code)
-        if exc.code >= 500 or exc.code == 429:
+        if exc.code in (429, 503):
+            return False  # turned away before it was acted on
+        if exc.code >= 500:
             return not retry_unsure
         return True
     except Exception as exc:

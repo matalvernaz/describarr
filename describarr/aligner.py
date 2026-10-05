@@ -705,14 +705,21 @@ LANGUAGE_NAMES = {
 
 
 def _normalise_language(tag: str) -> str:
-    """'eng' for any English tag (en-US, ENG, English), '' for a tag that does
-    not say, else the tag's base subtag, casefolded."""
+    """'eng' for any English tag (en-US, ENG, English), else the tag's base
+    subtag, casefolded ('' when untagged)."""
     base = re.split(r"[-_]", (tag or "").strip().casefold(), maxsplit=1)[0]
-    if base in _ENGLISH_LANGUAGE_TAGS:
-        return "eng"
-    if base in _UNTAGGED_LANGUAGES or (len(base) == 3 and "qaa" <= base <= "qtz"):
-        return ""
-    return base
+    return "eng" if base in _ENGLISH_LANGUAGE_TAGS else base
+
+
+def _says_no_language(lang: str) -> bool:
+    """A tag that does not say which language is spoken. Not a reason to
+    refuse a copy, and not evidence that it is English either."""
+    return lang in _UNTAGGED_LANGUAGES or (len(lang) == 3 and "qaa" <= lang <= "qtz")
+
+
+# A description track a release did not flag as one, known by its title.
+_DESCRIPTION_TITLE_RE = re.compile(
+    r"descri(?:pt|bed)|audio description|\bAD\b|commentary", re.IGNORECASE)
 
 
 def _audio_tracks(path: Path) -> Optional[list[tuple[str, bool]]]:
@@ -729,19 +736,19 @@ def _audio_tracks(path: Path) -> Optional[list[tuple[str, bool]]]:
         disposition = stream.get("disposition") or {}
         extra = bool(disposition.get("comment") or disposition.get("visual_impaired")
                      or disposition.get("hearing_impaired")
-                     or "commentary" in (tags.get("title") or "").casefold())
+                     or _DESCRIPTION_TITLE_RE.search(tags.get("title") or ""))
         tracks.append((_normalise_language(tags.get("language") or ""), extra))
     return tracks
 
 
 def _reference_stream(tracks: list[tuple[str, bool]]) -> Optional[int]:
-    if not tracks or tracks[0][0] in ("eng", ""):
+    if not tracks or tracks[0][0] == "eng" or _says_no_language(tracks[0][0]):
         return 0
     english = ([i for i, (lang, extra) in enumerate(tracks) if lang == "eng" and not extra]
                or [i for i, (lang, _) in enumerate(tracks) if lang == "eng"])
     if english:
         return english[0]
-    if any(lang == "" for lang, _ in tracks):
+    if any(_says_no_language(lang) for lang, _ in tracks):
         return 0
     return None
 
@@ -751,7 +758,9 @@ def _aligned_english(tracks: Optional[list[tuple[str, bool]]], stream: Optional[
         return False
     if tracks[stream][0] == "eng":
         return True
-    return len(tracks) == 1 and tracks[0][0] == ""
+    # Only a lone stream with no tag at all; mul, qaa and the like say nothing
+    # about English (a dub can be a release's "original audio").
+    return len(tracks) == 1 and tracks[0][0] in ("", "und")
 
 
 def reference_audio_stream(path: Path) -> Optional[int]:

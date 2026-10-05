@@ -584,14 +584,20 @@ def test_only_what_could_go_later_is_worth_trying_again(monkeypatch):
     # (error, Pushover worth another go, hub worth another go). The hub is
     # only tried again when the request never reached it: a retry after a lost
     # answer is a second message to everyone.
+    # urlopen wraps what goes wrong while connecting and sending in URLError
+    # (the request never arrived whole); a read timeout or a dropped answer
+    # comes unwrapped, after the hub may have told everyone.
     for error, pushover_again, hub_again in (
             (None, False, False),
             (URLError(ConnectionRefusedError(111, "refused")), True, True),
             (ConnectionRefusedError(111, "refused"), True, True),
             (URLError(socket.gaierror(-2, "Name or service not known")), True, True),
-            (URLError("no route"), True, False),
-            (TimeoutError(), True, False),
-            (refused(503), True, False), (refused(429), True, False),
+            (URLError("no route"), True, True),
+            (URLError(TimeoutError("connect timed out")), True, True),
+            (TimeoutError("read timed out"), True, False),
+            (ConnectionResetError(104, "reset"), True, False),
+            (refused(503), True, True), (refused(429), True, True),
+            (refused(500), True, False), (refused(504), True, False),
             (refused(400), False, False)):
         answer.clear()
         if error is not None:

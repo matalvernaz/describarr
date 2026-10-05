@@ -359,9 +359,14 @@ def process_episode(
                 if _already_tried(audio_path, tried, label):
                     same_from.append(_AUDIOVAULT_LABEL)
                     continue
+                # A double episode's lone first-number recording comes from
+                # inside the extract dir; a join of its parts lives beside it.
+                whole_double = len(all_episodes) > 1 and extract_dir in audio_path.parents
                 published, reason = _align_and_keep(
                     config, video_path, audio_path, label=label, episode_title=title,
                     series_title=series_title,
+                    **({"max_undescribed_fraction": _WHOLE_DOUBLE_MAX_UNDESCRIBED}
+                       if whole_double else {}),
                 )
                 if published:
                     for ep in all_episodes:
@@ -710,6 +715,11 @@ _UNDESCRIBED_NOTE_MIN_SEC = 20.0
 # sources sit far below it — the widest measured here is an unrated film
 # against a theatrical recording at ~8%.
 _UNDESCRIBED_MAJOR_FRACTION = 0.4
+# The same refusal, tighter, for a double episode described from a recording
+# filed under its first number only (see _one_recording_for_all): its length
+# can pass with one part's description and padding, and leave the other part
+# silent under 40% of the whole.
+_WHOLE_DOUBLE_MAX_UNDESCRIBED = 0.2
 # How many undescribed spans the note names before collapsing the rest.
 _UNDESCRIBED_SPANS_SHOWN = 3
 
@@ -1366,6 +1376,7 @@ def _align_and_keep(
     label: Optional[str] = None,
     episode_title: str = "",
     series_title: str = "",
+    max_undescribed_fraction: float = _UNDESCRIBED_MAJOR_FRACTION,
 ) -> tuple[bool, Optional[str]]:
     """Run alignment and either keep or discard the combined output.
 
@@ -1515,7 +1526,7 @@ def _align_and_keep(
         primary_audio_english=primary_english,
     )
     if accepted and runtime > 0 and (picture > 0 or note) \
-            and unreached >= _UNDESCRIBED_MAJOR_FRACTION * runtime:
+            and unreached >= max_undescribed_fraction * runtime:
         accepted, decision_detail = False, (
             _undescribed_note(unreached, dropped, spans, runtime)
             or f"{_fmt_duration(unreached)} of {_fmt_duration(runtime)} has no description"
