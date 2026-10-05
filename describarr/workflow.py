@@ -1003,6 +1003,9 @@ def _episode_donors(
     for ep in episodes:
         part = extract_episode(zip_path, extract_dir, ep)
         if not part:
+            whole = _one_recording_for_all(zip_path, extract_dir, episodes, video_path, label)
+            if whole is not None:
+                return [whole]
             logger.warning(
                 "E%02d not found in %s — cannot describe %s from this entry.",
                 ep, zip_path.name, label,
@@ -1014,6 +1017,40 @@ def _episode_donors(
     )
     joined = _concat_audio(parts, joined)
     return [joined] if joined else []
+
+
+# How much of a double-episode video's length a recording filed under its
+# first number alone must run to stand for the whole of it.
+_WHOLE_DOUBLE_MIN_RATIO = 0.85
+
+
+def _one_recording_for_all(
+    zip_path: Path, extract_dir: Path, episodes: list[int], video_path: Optional[Path],
+    label: str,
+) -> Optional[Path]:
+    """The first episode's recording, when it alone runs the length of the
+    whole double-episode video.
+
+    A catalogue can file a one-hour finale once, under its first number, with
+    nothing under the second (Friends S09E23 "The One in Barbados" and S10E17
+    "The Last One", US New Description, 2026-10-05). That entry was passed
+    over as unable to cover the episode, and another catalogue's halves, from
+    a different cut, were refused. Offered only when the recording is near the
+    video's length, so half a double episode still never stands for the whole
+    (Avatar S02E12-E13); the acceptance and coverage gates judge it as any other.
+    """
+    first = extract_episode(zip_path, extract_dir, episodes[0])
+    if first is None or video_path is None:
+        return None
+    video = _audio_duration(video_path)
+    recording = _audio_duration(first)
+    if video <= 0 or recording < _WHOLE_DOUBLE_MIN_RATIO * video:
+        return None
+    logger.info(
+        "%s: %s runs %.0f s against the video's %.0f s, the whole double episode; "
+        "offered alone.", label, first.name, recording, video,
+    )
+    return first
 
 
 def _whole_recording(

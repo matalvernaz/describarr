@@ -214,3 +214,43 @@ def test_the_refusal_reads_as_the_file_left_alone_not_as_a_mismatch():
 def test_an_unknown_language_is_named_by_its_code(monkeypatch):
     assert str(workflow._no_english_reason(["por", "xho", "por"])) == (
         "this copy has no English audio, only Portuguese and xho")
+
+
+# --- a double episode catalogued once, under its first number ---------------
+
+def _catalogue(monkeypatch, tmp_path, files, lengths, video_length):
+    """extract_episode finds *files* (episode -> name); lengths by file name."""
+    paths = {ep: tmp_path / name for ep, name in files.items()}
+    for path in paths.values():
+        path.write_bytes(b"a")
+    video = tmp_path / "Friends.S09E23E24.mkv"
+    video.write_bytes(b"v")
+    monkeypatch.setattr(workflow, "extract_episode", lambda zip_path, extract_dir, ep: paths.get(ep))
+    monkeypatch.setattr(workflow, "_audio_duration",
+                        lambda p: video_length if p == video else lengths.get(p.name, 0.0))
+    monkeypatch.setattr(workflow, "_concat_audio", lambda parts, out: out)
+    return video
+
+
+def test_a_finale_filed_once_stands_for_the_whole_double_episode(monkeypatch, tmp_path):
+    video = _catalogue(monkeypatch, tmp_path, {23: "Friends S09E23 The One in Barbados.mp3"},
+                       {"Friends S09E23 The One in Barbados.mp3": 3000.0}, video_length=3006.0)
+    donors = workflow._episode_donors(tmp_path / "s9.zip", tmp_path / "x", [23, 24],
+                                      "Friends S09E23E24", video_path=video)
+    assert [d.name for d in donors] == ["Friends S09E23 The One in Barbados.mp3"]
+
+
+def test_half_a_double_episode_still_does_not(monkeypatch, tmp_path):
+    # Avatar S02E12-E13: one half's description left 23 minutes silent.
+    video = _catalogue(monkeypatch, tmp_path, {12: "Avatar S02E12.mp3"},
+                       {"Avatar S02E12.mp3": 1380.0}, video_length=2760.0)
+    assert workflow._episode_donors(tmp_path / "s2.zip", tmp_path / "x", [12, 13],
+                                    "Avatar S02E12E13", video_path=video) == []
+
+
+def test_both_halves_on_file_are_still_joined(monkeypatch, tmp_path):
+    video = _catalogue(monkeypatch, tmp_path, {23: "9.23 Part 1.mp3", 24: "9.24 Part 2.mp3"},
+                       {"9.23 Part 1.mp3": 1200.0, "9.24 Part 2.mp3": 1200.0}, video_length=2400.0)
+    donors = workflow._episode_donors(tmp_path / "s9.zip", tmp_path / "x", [23, 24],
+                                      "Friends S09E23E24", video_path=video)
+    assert [d.name for d in donors] == ["E23E24.mp3"]
