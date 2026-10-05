@@ -44,6 +44,8 @@ from .aligner import (
     piecewise_rate_fraction,
     primary_audio_is_english,
     foreign_only_audio,
+    reference_audio_stream,
+    LANGUAGE_NAMES,
 )
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
@@ -140,20 +142,8 @@ class NoEnglishAudio(DamagedSource):
     (Friends, 2026-10-04)."""
 
 
-# Names for the language tags a foreign-only copy is reported with, so the
-# notification says "Portuguese", not "por".
-_LANGUAGE_NAMES = {
-    "por": "Portuguese", "pt": "Portuguese", "spa": "Spanish", "es": "Spanish",
-    "fre": "French", "fra": "French", "fr": "French", "ger": "German", "deu": "German",
-    "de": "German", "ita": "Italian", "it": "Italian", "jpn": "Japanese", "ja": "Japanese",
-    "rus": "Russian", "ru": "Russian", "pol": "Polish", "pl": "Polish", "hin": "Hindi",
-    "kor": "Korean", "chi": "Chinese", "zho": "Chinese", "dut": "Dutch", "nld": "Dutch",
-    "tur": "Turkish", "gre": "Greek", "ell": "Greek", "ara": "Arabic", "heb": "Hebrew",
-}
-
-
 def _no_english_reason(languages: list[str]) -> NoEnglishAudio:
-    names = list(dict.fromkeys(_LANGUAGE_NAMES.get(code, code) for code in languages))
+    names = list(dict.fromkeys(LANGUAGE_NAMES.get(code, code) for code in languages))
     spoken = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
     return NoEnglishAudio(f"this copy has no English audio, only {spoken}")
 
@@ -804,7 +794,10 @@ _TRUNCATION_PROBE_TIMEOUT_SEC = 900
 
 
 def _decoded_audio_seconds(path: Path) -> float:
-    """How far *path*'s first audio stream actually decodes, in seconds; 0.0 when unknown.
+    """How far *path*'s audio actually decodes, in seconds; 0.0 when unknown.
+
+    The stream measured is the one aligned against (see
+    ``reference_audio_stream``): on a dub-first copy, the English one.
 
     The container's stated duration can promise more than the file holds: an
     incomplete download keeps its header, so ffprobe reports the full length
@@ -813,7 +806,7 @@ def _decoded_audio_seconds(path: Path) -> float:
     try:
         proc = subprocess.run(
             ["ffmpeg", "-nostdin", "-v", "quiet", "-progress", "pipe:1",
-             "-i", str(path), "-map", "0:a:0", "-f", "null", "-"],
+             "-i", str(path), "-map", f"0:a:{reference_audio_stream(path) or 0}", "-f", "null", "-"],
             capture_output=True, text=True, timeout=_TRUNCATION_PROBE_TIMEOUT_SEC, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1297,7 +1290,7 @@ def _log_decision(
 
 def _corroboration(
     video_path: Path, audio_path: Path, episode_title: str, score: float,
-    series_title: str = "",
+    series_title: str = "", aligned_english: Optional[bool] = None,
 ) -> tuple[bool, bool]:
     """Title and language evidence for the corroborated rescue.
 
@@ -1311,7 +1304,15 @@ def _corroboration(
         return False, False
     readings = donor_title_readings(audio_path.name, series_title)
     agree = donor_names_episode(episode_title, audio_path.name, series_title=series_title)
-    english = primary_audio_is_english(video_path) if agree else False
+    # The run's own answer when there is one: a second probe could disagree
+    # with the one that chose the track (an NFS blip), and grant the rescue to
+    # an alignment made against a dub.
+    if not agree:
+        english = False
+    elif aligned_english is not None:
+        english = aligned_english
+    else:
+        english = primary_audio_is_english(video_path)
     logger.info(
         "Corroboration for %s: episode title %r vs donor read as %s → %s; "
         "first audio track English: %s",
@@ -1423,6 +1424,7 @@ def _align_and_keep(
     )
     title_corroborated, primary_english = _corroboration(
         video_path, audio_path, episode_title, score, series_title,
+        aligned_english=result.aligned_english,
     )
 
     # Coverage is a separate question from sync. similarity says the narration

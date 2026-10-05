@@ -7,6 +7,7 @@ operator and each description a message to everyone on the notifications hub.
 
 import json
 import os
+import socket
 import time as _time
 
 import pytest
@@ -483,11 +484,27 @@ def test_files_numbered_one_behind_share_a_line(tmp_path, monkeypatch):
     assert pushes[-1][1] == "\n".join([
         "5 described.",
         "S06E03 to E05: Described, each with the recording filed one episode earlier: "
-        "these files may be numbered one behind.",
+        "each file may hold the episode before the one its name says.",
         "S06E09: Described, each with the recording filed 2 episodes later: "
-        "these files may be numbered 2 ahead.",
+        "each file may hold the episode 2 after the one its name says.",
         "S06E10: " + note.format(q="'", name="E23E24"),
     ])
+
+
+def test_a_double_episode_matching_either_half_is_not_a_shift():
+    note = ("Described. (matched the recording filed as 'Friends S01E02 The One with "
+            "the Sonogram', so the catalogue, or this file, names a different episode)")
+    entry = {"label": "Friends S01E01E02", "outcome": "described", "message": note}
+    assert srv._summary_message(entry) == note
+
+
+def test_a_title_with_a_dotted_number_is_not_read_as_an_episode():
+    note = ("Described. (matched the recording filed as 'Mr. Robot - eps1.1_ones-and-zer0es', "
+            "so the catalogue, or this file, names a different episode)")
+    entry = {"label": "Mr. Robot S01E02", "outcome": "described", "message": note}
+    assert srv._summary_message(entry) == note
+    dotted = note.replace("Mr. Robot - eps1.1_ones-and-zer0es", "1.01 eps1.0_hellofriend")
+    assert "one episode earlier" in srv._summary_message(dict(entry, message=dotted))
 
 
 def test_drained_descriptions_reach_the_hub_a_message_a_show(tmp_path, monkeypatch):
@@ -564,14 +581,23 @@ def test_only_what_could_go_later_is_worth_trying_again(monkeypatch):
     def refused(code):
         return HTTPError("https://api.pushover.net", code, "no", {}, None)
 
-    for error, worth_another_go in (
-            (None, False), (URLError("no route"), True), (TimeoutError(), True),
-            (refused(503), True), (refused(429), True), (refused(400), False)):
+    # (error, Pushover worth another go, hub worth another go). The hub is
+    # only tried again when the request never reached it: a retry after a lost
+    # answer is a second message to everyone.
+    for error, pushover_again, hub_again in (
+            (None, False, False),
+            (URLError(ConnectionRefusedError(111, "refused")), True, True),
+            (ConnectionRefusedError(111, "refused"), True, True),
+            (URLError(socket.gaierror(-2, "Name or service not known")), True, True),
+            (URLError("no route"), True, False),
+            (TimeoutError(), True, False),
+            (refused(503), True, False), (refused(429), True, False),
+            (refused(400), False, False)):
         answer.clear()
         if error is not None:
             answer["error"] = error
-        assert notify.send("t", "m") is not worth_another_go
-        assert notify.send_hub("described", "t", "m") is not worth_another_go
+        assert notify.send("t", "m") is not pushover_again, error
+        assert notify.send_hub("described", "t", "m") is not hub_again, error
 
     monkeypatch.delenv("PUSHOVER_TOKEN")
     monkeypatch.delenv("NOTIFY_HUB_URL")

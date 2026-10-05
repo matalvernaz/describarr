@@ -1357,7 +1357,10 @@ def _held_summary(group: str, entries: list[dict]) -> tuple[str, str]:
 _FILED_AS_RE = re.compile(
     r"^Described\. \(matched the recording filed as (['\"])(?P<name>.+)\1, so the "
     r"catalogue, or this file, names a different episode\)$")
-_RECORDING_CODE_RE = re.compile(r"S(\d+)\s*E(\d+)|(?<![\d.])(\d+)\.(\d+)(?![\d.])", re.IGNORECASE)
+# "S06E01" or "S01 E03", or the "6.01 Title" numbering some catalogues use
+# (a two-digit episode with nothing before the season but a separator, so
+# Mr. Robot's "eps1.1_..." is not read as a code).
+_RECORDING_CODE_RE = re.compile(r"S(\d+)\s*E(\d+)|(?<![\w.])(\d{1,2})\.(\d{2})(?![\d.])", re.IGNORECASE)
 # A refusal's own words count the recordings tried, which differ from file to
 # file; in a summary refusals share a line per cause instead.
 _REFUSAL_CAUSE_RE = re.compile(
@@ -1372,14 +1375,14 @@ def _summary_message(entry: dict) -> str:
     if filed:
         mine = _EPISODE_LABEL_RE.match(entry["label"])
         theirs = _RECORDING_CODE_RE.search(filed.group("name"))
-        if mine and theirs:
-            code = _EPISODE_CODE_RE.match(mine.group(2))
-            season = int(code.group(1))
-            episode = int(re.findall(r"\d+", code.group(2))[0])
+        code = _EPISODE_CODE_RE.match(mine.group(2)) if mine else None
+        episodes = [int(e) for e in re.findall(r"\d+", code.group(2))] if code else []
+        # A double episode can rightly match the recording of either half.
+        if theirs and len(episodes) == 1:
             filed_season = int(theirs.group(1) or theirs.group(3))
             filed_episode = int(theirs.group(2) or theirs.group(4))
-            if filed_season == season and filed_episode != episode:
-                return _shift_message(filed_episode - episode)
+            if filed_season == int(code.group(1)) and filed_episode != episodes[0]:
+                return _shift_message(filed_episode - episodes[0])
         return message
     cause = _REFUSAL_CAUSE_RE.match(message)
     if cause:
@@ -1391,12 +1394,15 @@ def _summary_message(entry: dict) -> str:
 
 
 def _shift_message(delta: int) -> str:
-    """ "Described, each with the recording filed one episode earlier: ..." """
+    """ "Described, each with the recording filed one episode earlier: each
+    file may hold the episode before the one its name says." Said without
+    "ahead" or "behind", which two reviewers read opposite ways."""
     n = abs(delta)
     count = "one episode" if n == 1 else f"{n} episodes"
-    return (f"Described, each with the recording filed {count} "
-            f"{'earlier' if delta < 0 else 'later'}: these files may be numbered "
-            f"{'one' if n == 1 else n} {'behind' if delta < 0 else 'ahead'}.")
+    way = "earlier" if delta < 0 else "later"
+    holds = ("the episode " + ("" if n == 1 else f"{n} ")
+             + ("before" if delta < 0 else "after") + " the one its name says")
+    return f"Described, each with the recording filed {count} {way}: each file may hold {holds}."
 
 
 def _everyone_summary(group: str, labels: list[str]) -> str:
