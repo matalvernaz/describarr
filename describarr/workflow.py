@@ -43,6 +43,9 @@ from .aligner import (
     source_has_ad_track,
     piecewise_rate_fraction,
     primary_audio_is_english,
+    foreign_only_audio,
+    reference_audio_stream,
+    LANGUAGE_NAMES,
 )
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
@@ -130,6 +133,19 @@ class DamagedSource(str):
     was refused or the engine failed. Like :class:`EngineFailure` it is just the
     message; the type only lets the notification say so instead of "did not
     line up"."""
+
+
+class NoEnglishAudio(DamagedSource):
+    """The copy has no English audio, so no English description can line up
+    with it. Said at once instead of after trying every recording: a whole
+    season of a Portuguese-only copy cost 5-10 minutes an episode before
+    (Friends, 2026-10-04)."""
+
+
+def _no_english_reason(languages: list[str]) -> NoEnglishAudio:
+    names = list(dict.fromkeys(LANGUAGE_NAMES.get(code, code) for code in languages))
+    spoken = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    return NoEnglishAudio(f"this copy has no English audio, only {spoken}")
 
 
 class Refusal(str):
@@ -263,6 +279,11 @@ def process_episode(
     if source_has_ad_track(video_path):
         logger.info("%s already has an audio-description track — skipping.", video_path.name)
         return True, ALREADY_DESCRIBED
+    foreign = foreign_only_audio(video_path)
+    if foreign:
+        reason = _no_english_reason(foreign)
+        logger.info("%s: %s; not searching.", label, reason)
+        return False, reason
     if len(all_episodes) == 1:
         logger.info("Looking up: %s S%02dE%02d", series_title, season, episode)
     else:
@@ -338,9 +359,14 @@ def process_episode(
                 if _already_tried(audio_path, tried, label):
                     same_from.append(_AUDIOVAULT_LABEL)
                     continue
+                # A double episode's lone first-number recording comes from
+                # inside the extract dir; a join of its parts lives beside it.
+                whole_double = len(all_episodes) > 1 and extract_dir in audio_path.parents
                 published, reason = _align_and_keep(
                     config, video_path, audio_path, label=label, episode_title=title,
                     series_title=series_title,
+                    **({"max_undescribed_fraction": _WHOLE_DOUBLE_MAX_UNDESCRIBED}
+                       if whole_double else {}),
                 )
                 if published:
                     for ep in all_episodes:
@@ -462,6 +488,11 @@ def process_movie(
     if source_has_ad_track(video_path):
         logger.info("%s already has an audio-description track — skipping.", video_path.name)
         return True, ALREADY_DESCRIBED
+    foreign = foreign_only_audio(video_path)
+    if foreign:
+        reason = _no_english_reason(foreign)
+        logger.info("%s: %s; not searching.", label, reason)
+        return False, reason
     logger.info("Looking up movie: %s (%s)", movie_title, movie_year)
 
     search_title = _strip_title_qualifiers(movie_title)
@@ -684,6 +715,11 @@ _UNDESCRIBED_NOTE_MIN_SEC = 20.0
 # sources sit far below it — the widest measured here is an unrated film
 # against a theatrical recording at ~8%.
 _UNDESCRIBED_MAJOR_FRACTION = 0.4
+# The same refusal, tighter, for a double episode described from a recording
+# filed under its first number only (see _one_recording_for_all): its length
+# can pass with one part's description and padding, and leave the other part
+# silent under 40% of the whole.
+_WHOLE_DOUBLE_MAX_UNDESCRIBED = 0.2
 # How many undescribed spans the note names before collapsing the rest.
 _UNDESCRIBED_SPANS_SHOWN = 3
 
@@ -768,7 +804,10 @@ _TRUNCATION_PROBE_TIMEOUT_SEC = 900
 
 
 def _decoded_audio_seconds(path: Path) -> float:
-    """How far *path*'s first audio stream actually decodes, in seconds; 0.0 when unknown.
+    """How far *path*'s audio actually decodes, in seconds; 0.0 when unknown.
+
+    The stream measured is the one aligned against (see
+    ``reference_audio_stream``): on a dub-first copy, the English one.
 
     The container's stated duration can promise more than the file holds: an
     incomplete download keeps its header, so ffprobe reports the full length
@@ -777,7 +816,7 @@ def _decoded_audio_seconds(path: Path) -> float:
     try:
         proc = subprocess.run(
             ["ffmpeg", "-nostdin", "-v", "quiet", "-progress", "pipe:1",
-             "-i", str(path), "-map", "0:a:0", "-f", "null", "-"],
+             "-i", str(path), "-map", f"0:a:{reference_audio_stream(path) or 0}", "-f", "null", "-"],
             capture_output=True, text=True, timeout=_TRUNCATION_PROBE_TIMEOUT_SEC, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -974,6 +1013,9 @@ def _episode_donors(
     for ep in episodes:
         part = extract_episode(zip_path, extract_dir, ep)
         if not part:
+            whole = _one_recording_for_all(zip_path, extract_dir, episodes, video_path, label)
+            if whole is not None:
+                return [whole]
             logger.warning(
                 "E%02d not found in %s — cannot describe %s from this entry.",
                 ep, zip_path.name, label,
@@ -985,6 +1027,40 @@ def _episode_donors(
     )
     joined = _concat_audio(parts, joined)
     return [joined] if joined else []
+
+
+# How much of a double-episode video's length a recording filed under its
+# first number alone must run to stand for the whole of it.
+_WHOLE_DOUBLE_MIN_RATIO = 0.85
+
+
+def _one_recording_for_all(
+    zip_path: Path, extract_dir: Path, episodes: list[int], video_path: Optional[Path],
+    label: str,
+) -> Optional[Path]:
+    """The first episode's recording, when it alone runs the length of the
+    whole double-episode video.
+
+    A catalogue can file a one-hour finale once, under its first number, with
+    nothing under the second (Friends S09E23 "The One in Barbados" and S10E17
+    "The Last One", US New Description, 2026-10-05). That entry was passed
+    over as unable to cover the episode, and another catalogue's halves, from
+    a different cut, were refused. Offered only when the recording is near the
+    video's length, so half a double episode still never stands for the whole
+    (Avatar S02E12-E13); the acceptance and coverage gates judge it as any other.
+    """
+    first = extract_episode(zip_path, extract_dir, episodes[0])
+    if first is None or video_path is None:
+        return None
+    video = _audio_duration(video_path)
+    recording = _audio_duration(first)
+    if video <= 0 or recording < _WHOLE_DOUBLE_MIN_RATIO * video:
+        return None
+    logger.info(
+        "%s: %s runs %.0f s against the video's %.0f s, the whole double episode; "
+        "offered alone.", label, first.name, recording, video,
+    )
+    return first
 
 
 def _whole_recording(
@@ -1261,7 +1337,7 @@ def _log_decision(
 
 def _corroboration(
     video_path: Path, audio_path: Path, episode_title: str, score: float,
-    series_title: str = "",
+    series_title: str = "", aligned_english: Optional[bool] = None,
 ) -> tuple[bool, bool]:
     """Title and language evidence for the corroborated rescue.
 
@@ -1275,7 +1351,15 @@ def _corroboration(
         return False, False
     readings = donor_title_readings(audio_path.name, series_title)
     agree = donor_names_episode(episode_title, audio_path.name, series_title=series_title)
-    english = primary_audio_is_english(video_path) if agree else False
+    # The run's own answer when there is one: a second probe could disagree
+    # with the one that chose the track (an NFS blip), and grant the rescue to
+    # an alignment made against a dub.
+    if not agree:
+        english = False
+    elif aligned_english is not None:
+        english = aligned_english
+    else:
+        english = primary_audio_is_english(video_path)
     logger.info(
         "Corroboration for %s: episode title %r vs donor read as %s → %s; "
         "first audio track English: %s",
@@ -1292,6 +1376,7 @@ def _align_and_keep(
     label: Optional[str] = None,
     episode_title: str = "",
     series_title: str = "",
+    max_undescribed_fraction: float = _UNDESCRIBED_MAJOR_FRACTION,
 ) -> tuple[bool, Optional[str]]:
     """Run alignment and either keep or discard the combined output.
 
@@ -1387,6 +1472,7 @@ def _align_and_keep(
     )
     title_corroborated, primary_english = _corroboration(
         video_path, audio_path, episode_title, score, series_title,
+        aligned_english=result.aligned_english,
     )
 
     # Coverage is a separate question from sync. similarity says the narration
@@ -1440,7 +1526,7 @@ def _align_and_keep(
         primary_audio_english=primary_english,
     )
     if accepted and runtime > 0 and (picture > 0 or note) \
-            and unreached >= _UNDESCRIBED_MAJOR_FRACTION * runtime:
+            and unreached >= max_undescribed_fraction * runtime:
         accepted, decision_detail = False, (
             _undescribed_note(unreached, dropped, spans, runtime)
             or f"{_fmt_duration(unreached)} of {_fmt_duration(runtime)} has no description"

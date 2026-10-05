@@ -10,10 +10,12 @@ ntfy's JSON form (topic, title, message, click), so an ntfy server fits there to
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
-from urllib.error import HTTPError
+import socket
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -34,20 +36,45 @@ def _creds() -> tuple[str, str] | None:
     return token, user
 
 
-def _deliver(request: Request, service: str) -> bool:
-    """Post *request*, logging and swallowing any failure. False only when
-    trying again later could succeed: no answer, a server error, or being
-    told to slow down. Anything else refused is refused for good."""
+def _never_arrived(exc: BaseException) -> bool:
+    """Whether the server certainly never acted on the request.
+
+    urlopen wraps in URLError whatever goes wrong while connecting and sending
+    (refused, unresolvable, unroutable, a connect timeout): the request never
+    arrived whole, so nothing was done. Errors while reading the answer (a read
+    timeout, a dropped connection) come unwrapped, after the server may well
+    have acted."""
+    if isinstance(exc, URLError) and not isinstance(exc, HTTPError):
+        return True
+    return isinstance(exc, (ConnectionRefusedError, socket.gaierror)) or (
+        isinstance(exc, OSError) and exc.errno in (
+            errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH))
+
+
+def _deliver(request: Request, service: str, retry_unsure: bool = True) -> bool:
+    """Post *request*, logging and swallowing any failure. False when it is
+    worth trying again later: it never arrived, or (with *retry_unsure*) no
+    answer came, the server failed, or it said to slow down. Anything else
+    refused is refused for good. Without *retry_unsure* only a request that
+    never arrived is tried again: a retry after a lost answer is a second
+    message to everyone, and a hub that merged new news into it could not
+    tell it was the same."""
     try:
         # urlopen raises HTTPError for any status from 400 up.
         with urlopen(request, timeout=10):
             pass
     except HTTPError as exc:
         logger.warning("%s refused the notification: HTTP %d.", service, exc.code)
-        return exc.code < 500 and exc.code != 429
-    except Exception:
+        if exc.code in (429, 503):
+            return False  # turned away before it was acted on
+        if exc.code >= 500:
+            return not retry_unsure
+        return True
+    except Exception as exc:
         logger.warning("%s notification failed.", service, exc_info=True)
-        return False
+        if _never_arrived(exc):
+            return False
+        return not retry_unsure
     return True
 
 
@@ -87,5 +114,5 @@ def send_hub(category: str, title: str, message: str, click: str | None = None) 
         "Content-Type": "application/json", "Authorization": f"Bearer {token}",
         "User-Agent": "describarr",
     })
-    return _deliver(request, "Notifications hub")
+    return _deliver(request, "Notifications hub", retry_unsure=False)
 

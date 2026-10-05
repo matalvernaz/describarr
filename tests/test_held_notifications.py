@@ -7,6 +7,7 @@ operator and each description a message to everyone on the notifications hub.
 
 import json
 import os
+import socket
 import time as _time
 
 import pytest
@@ -426,15 +427,106 @@ def test_a_long_summary_fits_pushover(tmp_path, monkeypatch):
 
     _land(config, clock, "Friends S01E01")
     for episode in range(2, 200):
-        _land(config, clock, f"Friends S01E{episode:02d}", "no_match",
-              f"similarity {episode % 50}.0% — no trusted sync signal")
+        _land(config, clock, f"Friends S01E{episode:02d}", "error",
+              f"AD is {episode % 50} min vs 22 min video, likely wrong/truncated episode")
     _go_quiet(config, clock)
 
     title, body = pushes[-1]
     assert title == "describarr: Friends, 198 more"
     assert len(body) <= notify.MESSAGE_LIMIT
-    assert body.startswith("198 no match.\n")
+    assert body.startswith("198 failed.\n")
     assert body.endswith(" …")
+
+
+# A whole season refused: the refusal's own words count the recordings tried,
+# so each was a line of its own and the summary was cut after four (Friends
+# Season 1, 2026-10-04).
+_REFUSED = ("Tried 3 audio descriptions (3 from AudioVault) and {n} more filed near this "
+            "episode, in case the catalogue mislabelled it; none lined up with this copy, "
+            "so the file was left alone. LivingAudio had the same recording. ({cause})")
+
+
+def test_refusals_share_a_line_per_cause(tmp_path, monkeypatch):
+    config, clock, pushes, _ = _wire(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "_notify_message", lambda outcome, reason: reason)
+
+    _land(config, clock, "Friends S01E01", "no_match", _REFUSED.format(n=12, cause="the sound did not match"))
+    for episode in range(2, 12):
+        _land(config, clock, f"Friends S01E{episode:02d}", "no_match",
+              _REFUSED.format(n=10 + episode, cause="the sound did not match"))
+    _land(config, clock, "Friends S01E12", "no_match", _REFUSED.format(n=9, cause="match score 2%"))
+    _land(config, clock, "Friends S01E13", "no_match", _REFUSED.format(n=9, cause="match score 6%"))
+    _go_quiet(config, clock)
+
+    assert pushes[-1] == ("describarr: Friends, 12 more", "\n".join([
+        "12 no match.",
+        "S01E02 to E11: No recording lined up with this copy, so the file was left alone "
+        "(the sound did not match).",
+        "S01E12 to E13: No recording lined up with this copy, so the file was left alone "
+        "(match score too low).",
+    ]))
+
+
+def test_files_numbered_one_behind_share_a_line(tmp_path, monkeypatch):
+    config, clock, pushes, _ = _wire(monkeypatch, tmp_path)
+    note = ("Described. (matched the recording filed as {q}{name}{q}, so the catalogue, "
+            "or this file, names a different episode)")
+    monkeypatch.setattr(srv, "_notify_message", lambda outcome, reason: reason)
+
+    _land(config, clock, "Friends S06E02", "described", note.format(q="'", name="Friends S06E01 The One After Vegas"))
+    _land(config, clock, "Friends S06E03", "described", note.format(q="'", name="Friends S06E02 The One Where Ross Hugs Rachel"))
+    _land(config, clock, "Friends S06E04", "described", note.format(q='"', name="Friends S06E03 The One with Ross' Denial"))
+    _land(config, clock, "Friends S06E05", "described", note.format(q="'", name="6.04 The One Where Joey Loses His Insurance"))
+    _land(config, clock, "Friends S06E09", "described", note.format(q="'", name="Friends S06E11 The One with the Apothecary Table"))
+    _land(config, clock, "Friends S06E10", "described", note.format(q="'", name="E23E24"))
+    _go_quiet(config, clock)
+
+    assert pushes[-1][1] == "\n".join([
+        "5 described.",
+        "S06E03 to E05: Described, each with the recording filed one episode earlier: "
+        "each file may hold the episode before the one its name says.",
+        "S06E09: Described, each with the recording filed 2 episodes later: "
+        "each file may hold the episode 2 after the one its name says.",
+        "S06E10: " + note.format(q="'", name="E23E24"),
+    ])
+
+
+def test_a_double_episode_matching_either_half_is_not_a_shift():
+    note = ("Described. (matched the recording filed as 'Friends S01E02 The One with "
+            "the Sonogram', so the catalogue, or this file, names a different episode)")
+    entry = {"label": "Friends S01E01E02", "outcome": "described", "message": note}
+    assert srv._summary_message(entry) == note
+
+
+def test_a_title_with_a_dotted_number_is_not_read_as_an_episode():
+    note = ("Described. (matched the recording filed as 'Mr. Robot - eps1.1_ones-and-zer0es', "
+            "so the catalogue, or this file, names a different episode)")
+    entry = {"label": "Mr. Robot S01E02", "outcome": "described", "message": note}
+    assert srv._summary_message(entry) == note
+    dotted = note.replace("Mr. Robot - eps1.1_ones-and-zer0es", "1.01 eps1.0_hellofriend")
+    assert "one episode earlier" in srv._summary_message(dict(entry, message=dotted))
+
+
+def test_drained_descriptions_reach_the_hub_a_message_a_show(tmp_path, monkeypatch):
+    config, clock, pushes, hub = _wire(monkeypatch, tmp_path)
+    srv._tell_everyone_drained(config, {"described_labels": [
+        "Friends S04E01", "Friends S04E02", "Heat (1995)", "Friends S04E03"]})
+    assert sorted(hub) == sorted(["Friends: 3 episodes, S04E01 to E03", "Heat (1995)"])
+
+    hub.clear()
+    srv._tell_everyone_drained(config, None)
+    srv._tell_everyone_drained(config, {"described": 0, "described_labels": []})
+    assert hub == []
+
+
+def test_a_drained_description_the_hub_did_not_take_is_tried_again(tmp_path, monkeypatch):
+    up = {"hub": False}
+    config, clock, pushes, hub = _wire(monkeypatch, tmp_path, up=up)
+    srv._tell_everyone_drained(config, {"described_labels": ["Friends S04E01", "Friends S04E02"]})
+    up["hub"] = True
+    clock.advance(0.5)
+    srv._send_held_notifications(config)
+    assert hub == ["Friends: 2 episodes, S04E01 to E02"] * 2
 
 
 def test_pushover_gets_no_more_than_its_limits(monkeypatch):
@@ -489,14 +581,29 @@ def test_only_what_could_go_later_is_worth_trying_again(monkeypatch):
     def refused(code):
         return HTTPError("https://api.pushover.net", code, "no", {}, None)
 
-    for error, worth_another_go in (
-            (None, False), (URLError("no route"), True), (TimeoutError(), True),
-            (refused(503), True), (refused(429), True), (refused(400), False)):
+    # (error, Pushover worth another go, hub worth another go). The hub is
+    # only tried again when the request never reached it: a retry after a lost
+    # answer is a second message to everyone.
+    # urlopen wraps what goes wrong while connecting and sending in URLError
+    # (the request never arrived whole); a read timeout or a dropped answer
+    # comes unwrapped, after the hub may have told everyone.
+    for error, pushover_again, hub_again in (
+            (None, False, False),
+            (URLError(ConnectionRefusedError(111, "refused")), True, True),
+            (ConnectionRefusedError(111, "refused"), True, True),
+            (URLError(socket.gaierror(-2, "Name or service not known")), True, True),
+            (URLError("no route"), True, True),
+            (URLError(TimeoutError("connect timed out")), True, True),
+            (TimeoutError("read timed out"), True, False),
+            (ConnectionResetError(104, "reset"), True, False),
+            (refused(503), True, True), (refused(429), True, True),
+            (refused(500), True, False), (refused(504), True, False),
+            (refused(400), False, False)):
         answer.clear()
         if error is not None:
             answer["error"] = error
-        assert notify.send("t", "m") is not worth_another_go
-        assert notify.send_hub("described", "t", "m") is not worth_another_go
+        assert notify.send("t", "m") is not pushover_again, error
+        assert notify.send_hub("described", "t", "m") is not hub_again, error
 
     monkeypatch.delenv("PUSHOVER_TOKEN")
     monkeypatch.delenv("NOTIFY_HUB_URL")
@@ -566,3 +673,21 @@ def test_retries_hold_by_the_shows_title(tmp_path, monkeypatch):
         {"title": "Heat", "path": str(film), "year": "1995"}, fake_config(tmp_path), None)
 
     assert seen == [show_group("Friends"), FILMS]
+
+
+def test_the_overnight_drain_tells_the_hub(tmp_path, monkeypatch):
+    config, clock, pushes, hub = _wire(monkeypatch, tmp_path)
+
+    class _Queue:
+        def load(self):
+            return [{"type": "episode"}]
+
+    monkeypatch.setattr(srv, "_get_retry_queue", lambda config: _Queue())
+    monkeypatch.setattr(srv, "_get_client", lambda config: object())
+    monkeypatch.setattr(srv, "drain_retry_queue", lambda queue, client, config: {
+        "described": 2, "described_labels": ["Friends S04E01", "Friends S04E02"],
+        "abandoned": 0, "remaining": 0})
+    srv._worker_handle_drain({"type": "drain"}, config, None)
+
+    assert hub == ["Friends: 2 episodes, S04E01 to E02"]
+    assert pushes[-1][0] == "describarr: described 2 queued title(s)"

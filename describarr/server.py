@@ -1341,12 +1341,68 @@ def _held_summary(group: str, entries: list[dict]) -> tuple[str, str]:
         title = f"describarr: {group_name(group)}, {len(entries)} more"
     lines: dict[tuple[str, str], list[str]] = {}
     for entry in entries:
-        lines.setdefault((entry["outcome"], entry["message"]), []).append(entry["label"])
+        lines.setdefault((entry["outcome"], _summary_message(entry)), []).append(entry["label"])
     rank = {outcome: i for i, outcome in enumerate(_HELD_LINE_ORDER)}
     ordered = sorted(lines.items(), key=lambda line: rank.get(line[0][0], -1))
     body = "\n".join([_held_counts(entries)] + [
         f"{_held_names(group, labels)}: {message}" for (_, message), labels in ordered])
     return title, _cut(body, notify.MESSAGE_LIMIT)
+
+
+# A described file that matched the recording filed under another episode
+# carries workflow.py's note naming that recording. Listed a line each, one
+# release numbered one episode behind told the operator the same thing 60
+# times (Friends Seasons 6, 9 and 10, 2026-10-04); in a summary they share a
+# line that says what the files have in common.
+_FILED_AS_RE = re.compile(
+    r"^Described\. \(matched the recording filed as (['\"])(?P<name>.+)\1, so the "
+    r"catalogue, or this file, names a different episode\)$")
+# "S06E01" or "S01 E03", or the "6.01 Title" numbering some catalogues use
+# (a two-digit episode with nothing before the season but a separator, so
+# Mr. Robot's "eps1.1_..." is not read as a code).
+_RECORDING_CODE_RE = re.compile(r"S(\d+)\s*E(\d+)|(?<![\w.])(\d{1,2})\.(\d{2})(?![\d.])", re.IGNORECASE)
+# A refusal's own words count the recordings tried, which differ from file to
+# file; in a summary refusals share a line per cause instead.
+_REFUSAL_CAUSE_RE = re.compile(
+    r"^(?:Found an audio description|Tried \d+ audio description).*\((?P<cause>[^()]*)\)$")
+
+
+def _summary_message(entry: dict) -> str:
+    """What a held outcome is listed under in a summary: its own message,
+    unless it is one of the kinds whose wording differs per file only in detail."""
+    message = entry["message"]
+    filed = _FILED_AS_RE.match(message)
+    if filed:
+        mine = _EPISODE_LABEL_RE.match(entry["label"])
+        theirs = _RECORDING_CODE_RE.search(filed.group("name"))
+        code = _EPISODE_CODE_RE.match(mine.group(2)) if mine else None
+        episodes = [int(e) for e in re.findall(r"\d+", code.group(2))] if code else []
+        # A double episode can rightly match the recording of either half.
+        if theirs and len(episodes) == 1:
+            filed_season = int(theirs.group(1) or theirs.group(3))
+            filed_episode = int(theirs.group(2) or theirs.group(4))
+            if filed_season == int(code.group(1)) and filed_episode != episodes[0]:
+                return _shift_message(filed_episode - episodes[0])
+        return message
+    cause = _REFUSAL_CAUSE_RE.match(message)
+    if cause:
+        why = cause.group("cause")
+        if re.fullmatch(r"match score \d+%", why):
+            why = "match score too low"
+        return f"No recording lined up with this copy, so the file was left alone ({why})."
+    return message
+
+
+def _shift_message(delta: int) -> str:
+    """ "Described, each with the recording filed one episode earlier: each
+    file may hold the episode before the one its name says." Said without
+    "ahead" or "behind", which two reviewers read opposite ways."""
+    n = abs(delta)
+    count = "one episode" if n == 1 else f"{n} episodes"
+    way = "earlier" if delta < 0 else "later"
+    holds = ("the episode " + ("" if n == 1 else f"{n} ")
+             + ("before" if delta < 0 else "after") + " the one its name says")
+    return f"Described, each with the recording filed {count} {way}: each file may hold {holds}."
 
 
 def _everyone_summary(group: str, labels: list[str]) -> str:
@@ -1700,6 +1756,27 @@ def _worker_handle_drain(item: dict, config: Config, pending: PendingQueue) -> N
     with _set_current_job({"type": "drain", "title": "retry queue drain"}):
         summary = drain_retry_queue(queue, client, config)
     _notify_drain_summary(summary)
+    _tell_everyone_drained(config, summary)
+
+
+def _tell_everyone_drained(config: Config, summary: dict | None) -> None:
+    """The drain's descriptions, to everyone through the hub: a message a show.
+
+    A description that waited for the daily download allowance used to reach
+    only the operator's drain summary, never the people who asked to hear
+    about new ones. What the hub does not take is held and tried again."""
+    labels = (summary or {}).get("described_labels") or []
+    by_group: dict[str, list[str]] = {}
+    for label in labels:
+        by_group.setdefault(_notify_group(label), []).append(label)
+    now = time.time()
+    for group, group_labels in by_group.items():
+        if notify.send_hub("described", "Audio description added",
+                           _everyone_summary(group, group_labels)):
+            logger.info("Told the hub about %d drained for %s.", len(group_labels), group_name(group))
+        else:
+            _held_notifications(config).put_back(
+                Due(group, everyone=group_labels, last=now, everyone_since=now))
 
 
 # How many described titles to name in the drain notification before

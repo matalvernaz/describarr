@@ -157,7 +157,7 @@ class AlignResult:
     a property of the video's decode footprint rather than of the AD candidate.
     """
 
-    __slots__ = ("output", "report", "failure_reason", "returncode")
+    __slots__ = ("output", "report", "failure_reason", "returncode", "aligned_english")
 
     def __init__(
         self,
@@ -165,11 +165,16 @@ class AlignResult:
         report: Optional[Path],
         failure_reason: Optional[str] = None,
         returncode: Optional[int] = None,
+        aligned_english: Optional[bool] = None,
     ) -> None:
         self.output = output
         self.report = report
         self.failure_reason = failure_reason
         self.returncode = returncode
+        # Whether the track this run aligned against is English, from the
+        # same probe that chose it (see primary_audio_is_english); None when
+        # not known, and the caller probes for itself.
+        self.aligned_english = aligned_english
 
 
 def run(
@@ -220,6 +225,11 @@ def run(
         "--alignment_dir", str(alignment_dir),
         "--ad_language", AD_LANGUAGE,
     ]
+    tracks = _audio_tracks(video_path)
+    audio_stream = _reference_stream(tracks) if tracks is not None else 0
+    if audio_stream:
+        cmd += ["--audio_stream", str(audio_stream)]
+    aligned_english = _aligned_english(tracks, audio_stream or 0)
     if stretch_audio:
         cmd.append("--stretch_audio")
 
@@ -289,7 +299,7 @@ def run(
     # NOTE: caller is responsible for cleaning up `output` (and its parent
     # run dir) after copying. We can't blow away the run dir here without
     # making the caller copy first; that contract is documented in workflow.
-    return AlignResult(output=output, report=report)
+    return AlignResult(output=output, report=report, aligned_english=aligned_english)
 
 
 def _run_subprocess(cmd: list[str]) -> tuple[int, str, str]:
@@ -677,29 +687,124 @@ def piecewise_rate_fraction(report: Optional[Path]) -> float:
 
 
 _ENGLISH_LANGUAGE_TAGS = frozenset({"eng", "en", "english"})
+# Tags that do not say which language is spoken: none, undetermined, several,
+# not coded, no speech, and the private-use range qaa-qtz ("original audio").
+_UNTAGGED_LANGUAGES = frozenset({"", "und", "mul", "mis", "zxx"})
+
+# The languages a copy can be refused for at once, with their names for the
+# notification ("Portuguese", not "por"). A code not here is never proof that
+# a copy has no English: a mislabelled track goes through the normal search.
+LANGUAGE_NAMES = {
+    "por": "Portuguese", "pt": "Portuguese", "spa": "Spanish", "es": "Spanish",
+    "fre": "French", "fra": "French", "fr": "French", "ger": "German", "deu": "German",
+    "de": "German", "ita": "Italian", "it": "Italian", "jpn": "Japanese", "ja": "Japanese",
+    "rus": "Russian", "ru": "Russian", "pol": "Polish", "pl": "Polish", "hin": "Hindi",
+    "kor": "Korean", "chi": "Chinese", "zho": "Chinese", "dut": "Dutch", "nld": "Dutch",
+    "tur": "Turkish", "gre": "Greek", "ell": "Greek", "ara": "Arabic", "heb": "Hebrew",
+}
+
+
+def _normalise_language(tag: str) -> str:
+    """'eng' for any English tag (en-US, ENG, English), else the tag's base
+    subtag, casefolded ('' when untagged)."""
+    base = re.split(r"[-_]", (tag or "").strip().casefold(), maxsplit=1)[0]
+    return "eng" if base in _ENGLISH_LANGUAGE_TAGS else base
+
+
+def _says_no_language(lang: str) -> bool:
+    """A tag that does not say which language is spoken. Not a reason to
+    refuse a copy, and not evidence that it is English either."""
+    return lang in _UNTAGGED_LANGUAGES or (len(lang) == 3 and "qaa" <= lang <= "qtz")
+
+
+# A description track a release did not flag as one, known by its title.
+_DESCRIPTION_TITLE_RE = re.compile(
+    r"descri(?:pt|bed)|audio description|\bAD\b|commentary", re.IGNORECASE)
+
+
+def _audio_tracks(path: Path) -> Optional[list[tuple[str, bool]]]:
+    """(language, extra) for each audio stream in order, *extra* marking a
+    commentary, description or hearing-impaired track; None on a probe failure."""
+    probe = _ffprobe_json(path)
+    if probe is None:
+        return None
+    tracks = []
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") != "audio":
+            continue
+        tags = stream.get("tags") or {}
+        disposition = stream.get("disposition") or {}
+        extra = bool(disposition.get("comment") or disposition.get("visual_impaired")
+                     or disposition.get("hearing_impaired")
+                     or _DESCRIPTION_TITLE_RE.search(tags.get("title") or ""))
+        tracks.append((_normalise_language(tags.get("language") or ""), extra))
+    return tracks
+
+
+def _reference_stream(tracks: list[tuple[str, bool]]) -> Optional[int]:
+    if not tracks or tracks[0][0] == "eng" or _says_no_language(tracks[0][0]):
+        return 0
+    english = ([i for i, (lang, extra) in enumerate(tracks) if lang == "eng" and not extra]
+               or [i for i, (lang, _) in enumerate(tracks) if lang == "eng"])
+    if english:
+        return english[0]
+    if any(_says_no_language(lang) for lang, _ in tracks):
+        return 0
+    return None
+
+
+def _aligned_english(tracks: Optional[list[tuple[str, bool]]], stream: Optional[int]) -> bool:
+    if not tracks or stream is None:
+        return False
+    if tracks[stream][0] == "eng":
+        return True
+    # Only a lone stream with no tag at all; mul, qaa and the like say nothing
+    # about English (a dub can be a release's "original audio").
+    return len(tracks) == 1 and tracks[0][0] in ("", "und")
+
+
+def reference_audio_stream(path: Path) -> Optional[int]:
+    """
+    Which of the video's audio streams describealaign aligns against and fills
+    the description's gaps from (its ``--audio_stream``), counting from 0.
+
+    The first, unless it is tagged with another language and a later stream is
+    English: a "Dual Audio" release can open with a dub (Friends' HDMAN
+    BluRays, 2026-10-04: Portuguese first, English second), and every English
+    description was compared with the Portuguese and refused. A commentary or
+    description track is passed over for the programme's own English when
+    there is one. None when every stream is tagged and none is English. An
+    untagged first stream, a stream that does not say among foreign ones, and
+    a probe failure all keep the first, as before.
+    """
+    tracks = _audio_tracks(path)
+    return 0 if tracks is None else _reference_stream(tracks)
+
+
+def foreign_only_audio(path: Path) -> list[str]:
+    """The language codes of a copy with no English audio at all, else [].
+
+    Only when every stream is tagged with a language in ``LANGUAGE_NAMES``:
+    a tag that does not say, or one not known here, is not proof."""
+    tracks = _audio_tracks(path)
+    if not tracks or not all(lang in LANGUAGE_NAMES for lang, _ in tracks):
+        return []
+    return [lang for lang, _ in tracks]
 
 
 def primary_audio_is_english(path: Path) -> bool:
     """
     True when the audio describealaign aligns against is English.
 
-    The engine decodes the file's FIRST audio stream (``-map 0:a:0``), and that
-    stream also fills every gap in the described track. A MULTi release with
-    French first scores like a hard-to-match English one (This Is Us S01E12:
-    20.4 % over a straight native map), so a low-score acceptance must know
-    which one it has. An untagged track counts only when it is the only one.
-    False on a probe failure.
+    That stream (see :func:`reference_audio_stream`) also fills every gap in the
+    described track. A MULTi release with French first and nothing tagged
+    English scores like a hard-to-match English one (This Is Us S01E12: 20.4 %
+    over a straight native map), so a low-score acceptance must know which one
+    it has. An untagged stream counts only when it is the only one. False on a
+    probe failure. :func:`run` records the same answer for the run it made.
     """
-    probe = _ffprobe_json(path)
-    if probe is None:
-        return False
-    audio = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
-    if not audio:
-        return False
-    language = ((audio[0].get("tags") or {}).get("language") or "").strip().casefold()
-    if language in _ENGLISH_LANGUAGE_TAGS:
-        return True
-    return len(audio) == 1 and language in ("", "und")
+    tracks = _audio_tracks(path)
+    return _aligned_english(tracks, _reference_stream(tracks) if tracks else None)
 
 
 def _parse_tc(tc: str) -> float:
