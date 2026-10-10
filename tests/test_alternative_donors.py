@@ -20,13 +20,14 @@ with the real file names, so each one fails on the code that refused them.
 
 import json
 import zipfile
+from pathlib import Path
 
 import pytest
 
 import describarr.workflow as workflow
 from describarr.aligner import AlignResult
 from describarr.config import Config
-from describarr.matcher import extract_episode
+from describarr.matcher import _consecutive_parts, _numbered, extract_episode
 from describarr.workflow import process_episode
 
 from test_coverage_2026_09_26 import FAMILY_GUY_S21E01
@@ -216,9 +217,9 @@ PART_1 = "13 - 01  Family Guy - the Simpsons Guy part 1.mp3"
 PART_2 = "13 - 01  Family Guy - The simpson guy part 2.mp3"
 
 
-def _measured(monkeypatch, video_seconds):
+def _measured(monkeypatch, video_seconds, lengths=None):
     """ffprobe stand-in: the two halves as measured on 2026-10-01, and the video."""
-    lengths = {PART_1: 1222.872, PART_2: 1217.76}
+    lengths = {PART_1: 1222.872, PART_2: 1217.76} if lengths is None else lengths
 
     def duration(path):
         return lengths.get(path.name, video_seconds if path.suffix == ".mkv" else 0.0)
@@ -253,6 +254,113 @@ def test_one_half_of_a_split_episode_is_not_joined(monkeypatch, tmp_path):
     _, aligned = _walk(monkeypatch, tmp_path, SEASON_13, video, 13, 1)
     assert joins == []
     assert aligned[0][0] == PART_1
+
+
+# ── a finale filed once in the library, catalogued as halves under two numbers ──
+
+# AudioVault "Star Trek: Deep Space Nine - Season 7 (1999)", as cached 2026-10-10:
+# the two-hour finale is "[S07.E25] … Part 1" and "[S07.E26] … Part  2", and the
+# library holds it as one 92-minute file numbered E25. Each half alone left the
+# other 49 minutes undescribed and was refused; the walk then tried E24 and E23.
+DS9_SEASON_7 = (
+    "Star Trek: Deep Space Nine - Season 7 (1999)",
+    ["[S07.E23] Extreme Measures.mp3", "[S07.E24] The Dogs Of War.mp3",
+     "[S07.E25] What You Leave Behind, Part 1.mp3",
+     "[S07.E26] What You Leave Behind, Part  2.mp3"],
+)
+FINALE = "DS9 s07e25 What You Leave Behind- AIU 1080p+ H265.mkv"
+HALVES = ["[S07.E25] What You Leave Behind, Part 1.mp3",
+          "[S07.E26] What You Leave Behind, Part  2.mp3"]
+WHOLE = "[S07.E25] What You Leave Behind.mp3"
+DS9_LENGTHS = {HALVES[0]: 2695.704, HALVES[1]: 2699.064}
+
+
+def test_a_finale_filed_as_halves_under_two_numbers_is_joined(monkeypatch, tmp_path):
+    # A manual retry: no Sonarr title, no .nfo, and a release name that reads as none.
+    joins = _measured(monkeypatch, 5516.421, lengths=DS9_LENGTHS)
+    video = _video(tmp_path, 7, FINALE)
+    described, aligned = _walk(monkeypatch, tmp_path, DS9_SEASON_7, video, 7, 25, accept={WHOLE})
+    assert described
+    assert joins == [HALVES]
+    assert aligned[0][0] == WHOLE
+
+
+def test_sonarrs_part_one_title_finds_the_same_join(monkeypatch, tmp_path):
+    joins = _measured(monkeypatch, 5516.421, lengths=DS9_LENGTHS)
+    video = _video(tmp_path, 7, FINALE)
+    described, aligned = _walk(monkeypatch, tmp_path, DS9_SEASON_7, video, 7, 25, accept={WHOLE},
+                               episode_title="What You Leave Behind (1)")
+    assert described
+    assert joins == [HALVES]
+    assert aligned == [(WHOLE, "What You Leave Behind (1)")]
+
+
+def test_a_library_that_splits_the_finale_gets_one_half_each(monkeypatch, tmp_path):
+    joins = _measured(monkeypatch, 2700.0, lengths=DS9_LENGTHS)
+    first = _video(tmp_path, 7, "DS9 s07e25 What You Leave Behind (1).mkv")
+    _, aligned = _walk(monkeypatch, tmp_path, DS9_SEASON_7, first, 7, 25,
+                       episode_title="What You Leave Behind (1)")
+    assert joins == []
+    assert aligned[0][0] == HALVES[0]
+    second = _video(tmp_path, 7, "DS9 s07e26 What You Leave Behind (2).mkv")
+    _, aligned = _walk(monkeypatch, tmp_path, DS9_SEASON_7, second, 7, 26,
+                       episode_title="What You Leave Behind (2)")
+    assert joins == []
+    assert aligned[0][0] == HALVES[1]
+
+
+THREE_PARTS = ["[S07.E25] What You Leave Behind, Part 1.mp3",
+               "[S07.E26] What You Leave Behind, Part 2.mp3",
+               "[S07.E27] What You Leave Behind, Part 3.mp3"]
+
+
+@pytest.mark.parametrize("files, episode, expected", [
+    (HALVES, 25, HALVES),                                   # part 1, then part 2 under the next number
+    (HALVES, 26, []),                                       # part 2 is not where a recording starts
+    ([THREE_PARTS[0], "[S07.E26] What You Leave Behind, Part 3.mp3"], 25, []),   # part 3 does not follow part 1
+    (THREE_PARTS, 25, THREE_PARTS),
+    (THREE_PARTS, 26, []),
+])
+def test_the_parts_must_count_from_one_in_number_order(files, episode, expected):
+    paths = [Path(f) for f in files]
+    first = _numbered(paths, episode)[0]
+    assert [p.name for p in _consecutive_parts(paths, episode, first)] == expected
+
+
+# A title can end in a bracketed number that is not a part marker. Reading
+# "(1990)" as part 1990 would drop the search for the parts titled as it.
+FLASHBACK = ("Show - Season 1 (1990)",
+             ["[S01.E01] Another Episode.mp3", "[S01.E03] Flashback (1990) Part 1.mp3",
+              "[S01.E04] Flashback (1990) Part 2.mp3"])
+
+
+def test_a_title_ending_in_a_year_still_finds_its_titled_parts(monkeypatch, tmp_path):
+    joins = _measured(monkeypatch, 2600.0, lengths={FLASHBACK[1][1]: 1300.0, FLASHBACK[1][2]: 1300.0})
+    video = _video(tmp_path, 1, "Show.S01E01.Flashback.1990.1080p.WEB-DL.mkv")
+    whole = "[S01.E03] Flashback (1990).mp3"
+    described, aligned = _walk(monkeypatch, tmp_path, FLASHBACK, video, 1, 1, accept={whole},
+                               episode_title="Flashback (1990)")
+    assert described
+    assert joins == [FLASHBACK[1][1:]]
+    assert aligned[0][0] == whole
+
+
+def test_consecutive_numbers_that_are_two_episodes_are_not_joined(monkeypatch, tmp_path):
+    joins = _measured(monkeypatch, 5516.421, lengths=DS9_LENGTHS)
+    video = _video(tmp_path, 7, "DS9 s07e23 Extreme Measures- AIU 1080p+ H265.mkv")
+    _, aligned = _walk(monkeypatch, tmp_path, DS9_SEASON_7, video, 7, 23)
+    assert joins == []
+    assert aligned[0][0] == "[S07.E23] Extreme Measures.mp3"
+
+
+def test_parts_of_two_different_recordings_are_not_joined(monkeypatch, tmp_path):
+    pack = ("Family Guy - Season 9 (2010) [AudioVault Original]",
+            ["[S09.E08] Road to the North Pole Pt 1.mp3", "[S09.E09] Something Else Pt 2.mp3"])
+    joins = _measured(monkeypatch, 2624.6, lengths={pack[1][0]: 1360.0, pack[1][1]: 1360.0})
+    video = _video(tmp_path, 9, "Family.Guy.S09E08.1080p.WEB-DL.DD5.1.H.264-CtrlHD.mkv")
+    _, aligned = _walk(monkeypatch, tmp_path, pack, video, 9, 8)
+    assert joins == []
+    assert aligned[0][0] == "[S09.E08] Road to the North Pole Pt 1.mp3"
 
 
 # ── a pack numbered like a CD ────────────────────────────────────────────────

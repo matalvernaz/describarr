@@ -47,6 +47,29 @@ def test_parse_episode_marker_without_a_marker():
     assert srv._parse_episode_marker("Inception.2010.mkv") is None
 
 
+# The "17x06" a scene release writes instead of S17E06: every directory scan
+# skipped "greys.anatomy.17x06.ita-eng.1080p.webmux…" with "Could not parse
+# SxxExx" (2026-10-10). A resolution has more digits before its x than a
+# season has, and a codec has none.
+@pytest.mark.parametrize("name, expected", [
+    ("greys.anatomy.17x06.ita-eng.1080p.webmux.dd5.1.h264-novarip.mkv", (17, [6])),
+    ("Show 1x01 Pilot.mkv", (1, [1])),
+    ("Show.1x01-02.mkv", (1, [1, 2])),
+    ("Show.1x01.1920x1080.mkv", (1, [1])),
+    ("Show.S01E01.1920x1080.mkv", (1, [1])),
+    ("Movie.2010.1920x1080.x264.mkv", None),
+    ("Movie.2010.1280x720.mkv", None),
+    ("Show.1x01-1x02.mkv", (1, [1, 2])),                 # the marker repeated, as with SxxEyy
+    ("Show.1x01.1x02.mkv", (1, [1, 2])),
+    ("Show.3x01-3x02.mkv", (3, [1, 2])),                 # the repeat's season is not an episode
+    ("Show.3x01-02.mkv", (3, [1, 2])),
+    ("Show.S03E01-S03E02.mkv", (3, [1, 2])),
+    ("Show.1x09.2x01.mkv", (1, [9])),                    # another season is another file
+])
+def test_parse_episode_marker_reads_the_x_form(name, expected):
+    assert srv._parse_episode_marker(name) == expected
+
+
 # ── the covered episodes travel with the retry items ─────────────────────────
 
 class _FakePending:

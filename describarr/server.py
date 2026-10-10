@@ -115,6 +115,11 @@ _WORKER_RETRY_MAX_SECONDS = 3600
 
 _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
+# The "17x06" a scene release writes instead ("greys.anatomy.17x06.ita-eng…",
+# skipped by every scan as "Could not parse SxxExx" until 2026-10-10). A
+# resolution has more digits before its x than a season has ("1920x1080"), and
+# a codec has none ("x264").
+_EPISODE_X_RE = re.compile(r"(?<![\dA-Za-z])(\d{1,2})x(\d{2,3})(?![\dA-Za-z])")
 # What may follow the first SxxEyy of a multi-episode name, in every style
 # Sonarr writes: E02 (Repeat), -E02 (Scene, Prefixed Range), -02 (Extend, Range).
 _EPISODE_CONTINUATION_RE = re.compile(r"-?[Ee](\d+)|-(\d+)")
@@ -152,8 +157,9 @@ def _parse_episode_marker(name: str) -> Optional[tuple[int, list[int]]]:
     every episode it covers is returned, because describing it with the first
     episode's AD alone leaves the rest of the picture silent. A single
     hyphen-joined pair is an inclusive range: ``S03E18-E21`` is four episodes.
+    A name without an SxxEyy may carry the ``17x06`` form instead.
     """
-    m = _EPISODE_RE.search(name)
+    m = _EPISODE_RE.search(name) or _EPISODE_X_RE.search(name)
     if not m:
         return None
     season = int(m.group(1))
@@ -162,6 +168,10 @@ def _parse_episode_marker(name: str) -> Optional[tuple[int, list[int]]]:
     listed: list[int] = []
     pos = m.end()
     while True:
+        # A repeated marker ("3x01-3x02") is for the pass below: read here, its
+        # season would pass for a continuation and E03 would be invented.
+        if name[pos:pos + 1] in "-." and m.re.match(name, pos + 1):
+            break
         c = _EPISODE_CONTINUATION_RE.match(name, pos)
         if not c:
             break
@@ -174,8 +184,9 @@ def _parse_episode_marker(name: str) -> Optional[tuple[int, list[int]]]:
         episodes.extend(range(first + 1, listed[0] + 1))
     else:
         episodes.extend(n for n in listed if n not in episodes)
-    # Duplicate style repeats the season for every episode: "S01E01.S01E02".
-    for again in _EPISODE_RE.finditer(name, pos):
+    # Duplicate style repeats the season for every episode: "S01E01.S01E02",
+    # "1x01-1x02" — in whichever form the first marker took.
+    for again in m.re.finditer(name, pos):
         number = int(again.group(2))
         if int(again.group(1)) == season and first < number <= first + _MAX_EPISODE_SPAN \
                 and number not in episodes:

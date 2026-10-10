@@ -15,6 +15,7 @@ from typing import Optional
 
 from .titles import (
     _TRACK_NUMBER_MAX_DIGITS, donor_episode_title, donor_names_episode, says_undescribed,
+    titles_agree,
 )
 
 logger = logging.getLogger(__name__)
@@ -314,6 +315,9 @@ _TRACK_NUMBERING_FIRST_MAX = 1
 # recorded in pieces. Family Guy's double-length "The Simpsons Guy" is filed as
 # "13 - 01 … the Simpsons Guy part 1" and "13 - 01 … The simpson guy part 2".
 _PART_SUFFIX_RE = re.compile(r"(?i)(?:\b(?:part|pt)\.?\s*(\d+)|\((\d+)\))\s*\)?\s*$")
+# What a name sheds with its part number: "…, Part 1" and "… - Pt 2" leave a
+# title, not a title and a comma.
+_PART_TRAILING = " -_.(,"
 
 # How well a donor's name agrees with the episode's title, for ranking files.
 _TITLE_EXACT = 2
@@ -404,6 +408,17 @@ def episode_donor_options(
         positional = _positional(audio_files, episode, episode_title, series_title)
         primary = (positional,) if positional else ()
     options = [primary] if primary else []
+    # The number's file can be part 1 of a recording whose later parts are
+    # filed under the next numbers; the files say so themselves, no title
+    # needed (see :func:`_consecutive_parts`).
+    if numbered and not parts:
+        consecutive = _consecutive_parts(audio_files, episode, numbered[0])
+        if consecutive:
+            logger.info(
+                "%s continues as %s — offering the whole recording.",
+                numbered[0].name, ", ".join(p.name for p in consecutive[1:]),
+            )
+            options.insert(0, consecutive)
     if not episode_title:
         return options
     primary_level = (
@@ -425,13 +440,77 @@ def episode_donor_options(
         options.insert(0, (titled,))
     # The parts of one recording can be filed under consecutive numbers too: the
     # "AudioVault Original" season 9 has "[S09.E01] And Then There Were Fewer Pt
-    # 1" and "[S09.E02] ... Pt 2" for the library's one 49-minute S09E01.
+    # 1" and "[S09.E02] ... Pt 2" for the library's one 49-minute S09E01. Sonarr
+    # titles a two-parter's episodes "What You Leave Behind (1)" and "(2)": the
+    # parts are titled as the whole, so when nothing is titled as the title
+    # given, its own part number is set aside; a title that says part 2 or
+    # later is never the whole recording. The title as given goes first because
+    # a bracketed number can be part of it: "Flashback (1990)" is no part 1990.
+    whole_title, title_part = _title_less_part(episode_title)
     titled_parts = _title_parts(audio_files, episode_title, series_title)
+    if not titled_parts and title_part == 1:
+        titled_parts = _title_parts(audio_files, whole_title, series_title)
     if titled_parts and titled_parts not in options:
         logger.info("%d parts are titled as %r: %s.", len(titled_parts), episode_title,
                     ", ".join(p.name for p in titled_parts))
         options.insert(0, titled_parts)
     return options
+
+
+def _title_less_part(episode_title: str) -> tuple[str, Optional[int]]:
+    """*episode_title* without the part number it ends in, and that number.
+
+    ``("What You Leave Behind", 1)`` for ``"What You Leave Behind (1)"``;
+    ``(title, None)`` for a title that carries none.
+    """
+    m = _PART_SUFFIX_RE.search(episode_title or "")
+    if not m:
+        return episode_title, None
+    whole = _PART_SUFFIX_RE.sub("", episode_title).rstrip(_PART_TRAILING).strip()
+    return whole, int(m.group(1) or m.group(2))
+
+
+def _consecutive_parts(audio_files: list[Path], episode: int, first: Path) -> tuple[Path, ...]:
+    """*first* and the files numbered after it, when they are parts 1..N of one
+    recording; else ``()``.
+
+    A library can hold a feature-length finale as one file under its first
+    number, where the catalogue has its halves under consecutive numbers:
+    "[S07.E25] What You Leave Behind, Part 1" and "[S07.E26] What You Leave
+    Behind, Part  2" for one 92-minute S07E25 (Deep Space Nine, 2026-10-10).
+    Either half alone left the other 49 minutes undescribed and was refused,
+    and no title said the two belonged together: a manual retry carries none.
+    The files must say it themselves — part 1, then part 2 under the next
+    number, titled alike — so two episodes that merely follow each other are
+    never joined. Whether the video is the whole or one part is for
+    :func:`workflow._whole_recording` to measure.
+    """
+    if _part_number(first) != 1:
+        return ()
+    title = _part_title(first)
+    parts = [first]
+    number = episode
+    while True:
+        number += 1
+        picks = _numbered(audio_files, number)
+        if len(picks) != 1 or _part_number(picks[0]) != len(parts) + 1:
+            break
+        if not title or titles_agree(title, _part_title(picks[0]), fuzzy=True) is not True:
+            break
+        parts.append(picks[0])
+    return tuple(parts) if len(parts) > 1 else ()
+
+
+def _part_number(audio: Path) -> Optional[int]:
+    """The part number *audio*'s name ends in, or None."""
+    m = _PART_SUFFIX_RE.search(audio.stem)
+    return int(m.group(1) or m.group(2)) if m else None
+
+
+def _part_title(audio: Path) -> str:
+    """The episode title a part's name carries, less its part number."""
+    whole = _PART_SUFFIX_RE.sub("", audio.stem).rstrip(_PART_TRAILING)
+    return donor_episode_title(whole + audio.suffix)
 
 
 def _title_parts(
@@ -448,7 +527,7 @@ def _title_parts(
         m = _PART_SUFFIX_RE.search(audio.stem)
         if not m:
             continue
-        whole = _PART_SUFFIX_RE.sub("", audio.stem).rstrip(" -_.(")
+        whole = _PART_SUFFIX_RE.sub("", audio.stem).rstrip(_PART_TRAILING)
         if donor_names_episode(
             episode_title, whole + audio.suffix, series_title=series_title, fuzzy=True,
         ) is not True:
@@ -615,7 +694,7 @@ def whole_recording_stem(parts: tuple[Path, ...]) -> str:
     ``13 - 01  Family Guy - the Simpsons Guy part 1`` gives ``13 - 01  Family
     Guy - the Simpsons Guy``, which still reads as naming the episode.
     """
-    stem = _PART_SUFFIX_RE.sub("", parts[0].stem).rstrip(" -_.(")
+    stem = _PART_SUFFIX_RE.sub("", parts[0].stem).rstrip(_PART_TRAILING)
     return stem or parts[0].stem
 
 
@@ -817,6 +896,45 @@ def _extra_title_words(query: str, candidate: str) -> set[str]:
     if not query_tokens < candidate_tokens:  # strict subset ⇒ candidate adds words
         return set()
     return candidate_tokens - query_tokens - _REGION_QUALIFIERS
+
+
+# Where one part of a title ends and the next begins: a colon, or a dash with
+# a space either side. A dash inside a word ("Spider-Man") joins, never splits.
+_TITLE_SEGMENT_RE = re.compile(r"\s*(?::|\s[-–—]\s)\s*")
+
+
+def search_segments(title: str) -> list[str]:
+    """The parts of *title* worth searching for on their own, longest first.
+
+    AudioVault's search is a literal substring match, so a colon the catalogue
+    writes as a dash hides every entry spelt that way: "Star Trek: Deep Space
+    Nine" found seasons 1-3, 6 and 7 and not "Star Trek - Deep Space Nine -
+    Season 5 (1997)" (2026-10-10), while "Deep Space Nine" finds all seven.
+    A segment is what lies between colons or spaced dashes, offered when it
+    has a word of three letters or more that is not a region qualifier; a
+    title with no such break has no segments.
+    """
+    whole = title.strip()
+    segments: list[str] = []
+    for segment in _TITLE_SEGMENT_RE.split(whole):
+        segment = segment.strip()
+        words = _title_tokens(segment) - _REGION_QUALIFIERS
+        if segment and segment != whole and segment not in segments \
+                and any(len(word) >= 3 for word in words):
+            segments.append(segment)
+    return sorted(segments, key=len, reverse=True)
+
+
+def names_whole_title(title: str, name: str) -> bool:
+    """True when the catalogue entry *name* carries every word of *title*.
+
+    A search on one segment of a title widens the pool to every show sharing
+    those words ("The Next Generation" is Degrassi's as much as Star Trek's),
+    so only an entry that spells the whole title out is handed to the matcher.
+    Region qualifiers are not counted: "The Office (US)" is "The Office [US]".
+    """
+    wanted = _title_tokens(title) - _REGION_QUALIFIERS
+    return bool(wanted) and wanted <= _title_tokens(name)
 
 
 def _title_similarity(a: str, b: str) -> float:
