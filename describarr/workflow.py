@@ -56,7 +56,9 @@ from .matcher import (
     extract_episode,
     find_movie,
     find_season,
+    names_whole_title,
     neighbour_donors,
+    search_segments,
     whole_recording_stem,
 )
 from .retry_queue import RetryQueue
@@ -321,6 +323,11 @@ def process_episode(
         )
         if not candidates:
             logger.warning("No season %d entry found for %r.", season, series_title)
+    if not candidates:
+        candidates = _season_by_title_segments(
+            client, search_title, series_title, season,
+            series_year or _year_suffix(series_title),
+        )
 
     # Season zips are cached by download URL so we only fetch each season once.
     # Each candidate gets its own extract subdirectory so different zips don't
@@ -470,6 +477,32 @@ def process_episode(
         return False, str(exc)
 
     return False, _as_refusal(last_reason, refused_from, same_from, nearby_refused)
+
+
+def _season_by_title_segments(
+    client: AudioVaultClient, search_title: str, series_title: str, season: int, year: str,
+) -> list[dict]:
+    """The season's catalogue entries found by searching the title's own parts.
+
+    AudioVault's search is a literal substring match, so a catalogue entry
+    punctuated differently from the title is invisible to it: "Star Trek: Deep
+    Space Nine" found five seasons and not "Star Trek - Deep Space Nine -
+    Season 5 (1997)", and the directory retry's "Law & Order - Special Victims
+    Unit" found nothing at all (2026-10-10). Each segment of the title is
+    searched in turn, longest first, and only an entry that carries the whole
+    title goes to the matcher (see :func:`matcher.names_whole_title`). Tried
+    only once the title's own search has found no entry for the season, so a
+    show the search answers costs no further request.
+    """
+    for segment in search_segments(search_title):
+        results = [r for r in client.search_shows(segment) if names_whole_title(search_title, r["name"])]
+        if not results:
+            continue
+        candidates = find_season(results, series_title, season, year)
+        if candidates:
+            logger.info("Season %d of %r found by searching %r.", season, series_title, segment)
+            return candidates
+    return []
 
 
 def process_movie(

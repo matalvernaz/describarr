@@ -31,6 +31,32 @@ def _normalize_search_query(query: str) -> str:
     return " ".join(_SEARCH_FALLBACK_PUNCT_RE.sub(" ", query).split())
 
 
+# "&" and "and" are two spellings of one title, and the literal search knows
+# only the catalogue's: Sonarr's "Law & Order: Special Victims Unit" is
+# AudioVault's "Law and Order: Special Victims Unit", and 595 episodes were
+# recorded as having no source (2026-10-10).
+_AMPERSAND_RE = re.compile(r"\s*&\s*")
+_AND_WORD_RE = re.compile(r"\band\b", re.IGNORECASE)
+
+
+def _swap_ampersand(query: str) -> str:
+    """*query* with its "&" written "and", or its "and" written "&"."""
+    if "&" in query:
+        return _AMPERSAND_RE.sub(" and ", query).strip()
+    return _AND_WORD_RE.sub("&", query)
+
+
+def _search_queries(query: str) -> list[str]:
+    """The spellings of *query* searched: as given, with "&" and "and"
+    swapped, then each with its punctuation collapsed."""
+    spellings = (query, _swap_ampersand(query))
+    queries: list[str] = []
+    for variant in spellings + tuple(_normalize_search_query(s) for s in spellings):
+        if variant and variant not in queries:
+            queries.append(variant)
+    return queries
+
+
 def _is_login_url(url: str) -> bool:
     """True iff *url* is the AudioVault login endpoint, with or without
     query string. ``url.endswith("/login")`` alone misses ``/login?next=…``
@@ -237,17 +263,22 @@ class AudioVaultClient:
         return self._search("/movies", title)
 
     def _search(self, path: str, query: str) -> list[dict]:
-        results = self._search_once(path, query)
-        if results:
-            return results
-        normalized = _normalize_search_query(query)
-        if normalized and normalized != query:
-            logger.info(
-                "No results for %r — retrying with punctuation stripped: %r",
-                query,
-                normalized,
-            )
-            return self._search_once(path, normalized)
+        """Every entry any spelling of *query* finds, each once, as-given first.
+
+        One spelling's hit must not end the search: "Tom & Jerry: The Movie
+        (2021)" answers the swapped spelling and the film asked for, "Tom and
+        Jerry The Movie (1992)", answers only the collapsed one. The matcher
+        chooses between them (by year, by title words), so it sees them all.
+        """
+        results: list[dict] = []
+        seen: set[str] = set()
+        for spelling in _search_queries(query):
+            if spelling != query:
+                logger.info("Searching %r as %r as well.", query, spelling)
+            for entry in self._search_once(path, spelling):
+                if entry["url"] not in seen:
+                    seen.add(entry["url"])
+                    results.append(entry)
         return results
 
     def _search_once(self, path: str, query: str) -> list[dict]:
