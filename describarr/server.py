@@ -545,6 +545,8 @@ class _HookHandler(BaseHTTPRequestHandler):
             self._handle_status()
         elif path == "/queue":
             self._handle_queue_get()
+        elif path == "/pending":
+            self._handle_pending_get()
         elif path == "/outcome":
             self._handle_outcome(params)
         elif path == "/retry":
@@ -596,6 +598,10 @@ class _HookHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return
             self._handle_queue_delete()
+        elif parsed.path == "/pending":
+            if not self._authorized():
+                return
+            self._handle_pending_delete()
         else:
             self._respond(404, "Not found.")
 
@@ -679,6 +685,30 @@ class _HookHandler(BaseHTTPRequestHandler):
         n = len(queue.load())
         queue.clear()
         self._respond(200, f"Cleared {n} item(s) from retry queue.")
+
+    def _handle_pending_get(self) -> None:
+        """The work waiting for the worker, in order, then what it has claimed."""
+        try:
+            config = Config.from_env()
+        except ValueError as exc:
+            self._respond(500, str(exc))
+            return
+        pending = _get_pending_queue(config)
+        self._respond_json(200, {"pending": pending.load(), "inflight": pending.inflight()})
+
+    def _handle_pending_delete(self) -> None:
+        """Stop a run: drop everything waiting; the current job finishes.
+
+        ``DELETE /queue`` empties only the daily-limit retry queue, which is
+        not where a directory retry's hundreds of episodes wait (2026-10-10).
+        """
+        try:
+            config = Config.from_env()
+        except ValueError as exc:
+            self._respond(500, str(exc))
+            return
+        n = _get_pending_queue(config).clear()
+        self._respond(200, f"Cleared {n} pending item(s); the current job will finish.")
 
     def _handle_drain(self) -> None:
         try:
