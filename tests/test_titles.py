@@ -261,3 +261,19 @@ def test_a_pack_or_folder_that_says_it_is_not_described(text):
 def test_an_ordinary_pack_name(text):
     from describarr.titles import says_undescribed
     assert not says_undescribed(text)
+
+
+# A release that writes "Title- GROUP" (every Deep Space Nine file: "DS9 s07e25
+# What You Leave Behind- AIU 1080p+ H265.mkv") read as "What You Leave Behind
+# AIU 1080p+": nothing stopped at the group, and "1080p+" is a resolution with
+# a plus (2026-10-10). A word that ends in a hyphen ends the title.
+@pytest.mark.parametrize("name, title", [
+    ("DS9 s07e25 What You Leave Behind- AIU 1080p+ H265.mkv", "What You Leave Behind"),
+    ("DS9 s04e25 Broken Link- AIU 1080p+ H265.mkv", "Broken Link"),
+    ("Ds9 S07e06 Treachery, Faith, And The Great River- AIU 1080p+ H265.mkv",
+     "Treachery, Faith, And The Great River"),
+    ("Show S01E01 Pilot 1080p+ WEB.mkv", "Pilot"),
+    ("Show - S01E01 - Spider-Man Returns - 1080p.mkv", "Spider Man Returns"),
+])
+def test_a_title_ends_at_a_trailing_hyphen_or_a_plus_resolution(name, title):
+    assert episode_title_from_filename(name) == title

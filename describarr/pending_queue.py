@@ -154,6 +154,20 @@ class PendingQueue:
             self._cv.notify_all()
             return len(items)
 
+    def clear(self) -> int:
+        """Drop every waiting item and return how many there were.
+
+        The in-flight item is left alone: the worker is on it, and dropping
+        its claim would only make the recovery pass replay it. This is the
+        one lever that stops a long run (a show's directory retry expands
+        into hundreds of items; 2026-10-10: 595 for one show).
+        """
+        with self._cv:
+            items = self._load()
+            self._save([])
+            self._cv.notify_all()
+            return len(items)
+
     def push_front(self, item: dict) -> None:
         with self._cv:
             items = self._load()

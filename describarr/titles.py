@@ -32,7 +32,7 @@ _EPISODE_TOKEN_RE = re.compile(r"(?i)\bS\d{1,3}E\d{1,4}(?:-?E\d{1,4})*\b")
 # codec and audio words, matched against one separator-split word whatever
 # its case. None of them is an ordinary title word.
 _RELEASE_WORD_RE = re.compile(
-    r"(?i)^(?:\d{3,4}[pi]|4k|uhd|hdr\d*|sdr|"
+    r"(?i)^(?:\d{3,4}[pi]\+?|4k|uhd|hdr\d*|sdr|"
     r"web|webrip|web-?dl|webdl|web-?rip|bluray|blu-?ray|bdrip|brrip|remux|hdtv|pdtv|sdtv|dvdrip|"
     r"amzn|dsnp|hulu|nf|hmax|atvp|pcok|pmtp|"
     r"repack\d*|x26[45]|h\.?26[45]|hevc|avc|av1|xvid|10bit|8bit|"
@@ -101,13 +101,18 @@ def episode_title_from_filename(name: str) -> str:
     if not match:
         return ""
     words = []
-    for word in re.split(r"[\s._]+|(?<=\w)-(?=\w)|\s-\s", stem[match.end():]):
-        word = word.strip(" -")
+    for raw in re.split(r"[\s._]+|(?<=\w)-(?=\w)|\s-\s", stem[match.end():]):
+        word = raw.strip(" -")
         if not word:
             continue
         if _is_release_word(word):
             break
         words.append(word)
+        # "What You Leave Behind- AIU 1080p+": a word that ends in a hyphen
+        # ends the title, whatever follows (a release group is not in the
+        # list above and never can be in full).
+        if raw.endswith("-"):
+            break
     return " ".join(words)
 
 

@@ -252,6 +252,14 @@ If the folder name doesn't include the year (or the AudioVault title differs), p
 
 ---
 
+### Stopping a run
+
+A directory retry expands into one item per episode, so a whole show can be hundreds of
+items. `GET /pending` lists what is waiting (and what the worker has claimed), and
+`DELETE /pending` drops everything waiting; the job already running finishes. `DELETE
+/queue` is a different thing: it empties the retry queue of items waiting for the next
+day's download allowance.
+
 ## Monitoring
 
 `GET /status` is a status page showing the current job, the download-cap and queue counts, and a **recent-decisions** table: the last N accept / reject / skip / no-match decisions with their scores and reasons (`DESCRIBARR_HISTORY_SIZE`, default 50). It's a plain semantic page — headings and real tables — so it reads cleanly with a screen reader, and there's a `?format=json` view for programmatic polling. It replaces grepping container logs to see what happened overnight.
