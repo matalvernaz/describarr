@@ -29,6 +29,8 @@ from typing import Optional
 import requests
 
 from .aligner import (
+    _UNREPLACED_RATE_PCT,
+    _read_metrics,
     OUTPUT_VALIDATION_FAILED,
     EngineFailure,
     described_seconds,
@@ -37,6 +39,7 @@ from .aligner import (
     content_score,
     slope_stability,
     sync_quality,
+    segment_extent,
     uncovered_ends,
     undescribed_seconds,
     undescribed_spans,
@@ -52,6 +55,7 @@ from .config import Config
 from .decision_log import DecisionLog
 from .outcome_log import OutcomeLog
 from .matcher import (
+    _title_less_part,
     episode_donor_options,
     extract_episode,
     find_movie,
@@ -635,7 +639,11 @@ _MIXED_RATE_MIN_COVERAGE = 99.0
 # filename names this episode, and the aligned (first) audio track is English.
 # 20 % is describealaign's own "mismatched" line; nothing below it is rescued.
 _CORROBORATED_MIN_SCORE = 20.0
-_CORROBORATED_MIN_STABLE_FRACTION = 99.0
+# One title-card seam is not a broken line: SVU's LivingAudio recordings run
+# straight at 0.00 % but for a 31 s stretch at +3-5 % where the opening titles
+# differ, 98.7-98.8 % of a 43-minute episode (2026-10-10). Two per cent is one
+# such seam on a 21-minute one; the Family Guy data this was set on had none.
+_CORROBORATED_MIN_STABLE_FRACTION = 98.0
 _CORROBORATED_MIN_COVERAGE = 99.0
 
 
@@ -753,8 +761,47 @@ _UNDESCRIBED_MAJOR_FRACTION = 0.4
 # can pass with one part's description and padding, and leave the other part
 # silent under 40% of the whole.
 _WHOLE_DOUBLE_MAX_UNDESCRIBED = 0.2
+# A rescue (an accept below the similarity floor) is judged where the
+# description lands, so the picture it leaves alone gets two checks of its own.
+# More than this share uncovered, and the donor must be corroborated (its name
+# agrees with the episode's title, the aligned track is English): a straight
+# line in the covered part proves a uniform mapping, not the right episode, and
+# that much silence is what a wrong recording's partial match looks like too.
+# A tenth is what the whole-map trunk used to allow (2026-10-11).
+_RESCUE_UNCORROBORATED_MAX_UNCOVERED = 0.10
+# And no single uncovered stretch may run longer than this share of the
+# picture: an extra scene in a longer cut is minutes, never a tenth of the film,
+# while a block of narration placed after such a gap could be that far off
+# (roundtable thread 349, 2026-10-11). The two real joins: 4.3 % and 5.4 %.
+_RESCUE_MAX_UNCOVERED_STRETCH = 0.10
 # How many undescribed spans the note names before collapsing the rest.
 _UNDESCRIBED_SPANS_SHOWN = 3
+
+
+def _uncovered_stretches(report, runtime: float) -> list[tuple[float, float]]:
+    """The stretches of a *runtime*-second picture no replaced segment covers.
+
+    The complement of the replaced intervals (|rate| ≤ 10 %), so a hole the
+    engine left between two segments counts as much as an unreplaced segment
+    or an uncovered end (roundtable thread 349, 2026-10-11); adjacent pieces
+    merge into one stretch. ``(start, end)`` pairs in picture order.
+    """
+    metrics = _read_metrics(report) or {}
+    covered = sorted(
+        (float(seg["video_start_sec"]), float(seg["video_end_sec"]))
+        for seg in metrics.get("segments", [])
+        if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT
+        and seg["video_end_sec"] > seg["video_start_sec"]
+    )
+    stretches: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in covered:
+        if start > cursor + 1.0:
+            stretches.append((cursor, start))
+        cursor = max(cursor, end)
+    if runtime > cursor + 1.0:
+        stretches.append((cursor, runtime))
+    return stretches
 
 
 def _fmt_clock(seconds: float) -> str:
@@ -1347,9 +1394,16 @@ def _log_decision(
     path: Optional[str] = None,
     undescribed: Optional[float] = None,
     dropped: Optional[float] = None,
+    described_trunk: Optional[float] = None,
+    described_rate: Optional[float] = None,
 ) -> None:
     """Record one decision in the audit log. Best-effort: a logging failure
-    must never break the alignment path."""
+    must never break the alignment path.
+
+    ``stable_fraction`` and ``median_rate`` are the whole map's;
+    ``described_trunk`` and ``described_rate`` are the replaced segments', the
+    figures the rescue gate judged, so an audit can see which measure decided.
+    """
     try:
         DecisionLog(config.cache_dir / "decisions.json", config.history_size).append({
             "title": title,
@@ -1363,6 +1417,8 @@ def _log_decision(
             "path": path,
             "undescribed": undescribed,
             "dropped": dropped,
+            "described_trunk": described_trunk,
+            "described_rate": described_rate,
         })
     except Exception:
         logger.debug("Decision-log write failed.", exc_info=True)
@@ -1371,19 +1427,28 @@ def _log_decision(
 def _corroboration(
     video_path: Path, audio_path: Path, episode_title: str, score: float,
     series_title: str = "", aligned_english: Optional[bool] = None,
+    needed: bool = False,
 ) -> tuple[bool, bool]:
     """Title and language evidence for the corroborated rescue.
 
     Returns ``(title_corroborated, primary_audio_english)``. Probed only when
-    the score falls in the band that rescue covers, so ordinary alignments pay
-    for no extra ffprobe; logged so the decision can be audited. The donor's
-    name must give the episode's title EXACTLY; *series_title* only lets a name
-    that repeats the show's own ("Family Guy - Baking Bad") be read by the rest.
+    the score falls in the band that rescue covers, or when *needed* (a rescue
+    that leaves more than a tenth of the picture uncovered), so ordinary
+    alignments pay for no extra ffprobe; logged so the decision can be audited.
+    The donor's name must give the episode's title EXACTLY; *series_title*
+    only lets a name that repeats the show's own ("Family Guy - Baking Bad")
+    be read by the rest. Sonarr titles a two-parter's episodes "(1)" and "(2)",
+    and a recording joined from its halves is named as the whole, so a part-1
+    title also agrees with the title less its marker.
     """
-    if not (_CORROBORATED_MIN_SCORE <= score < _RESCUE_MIN_SCORE):
+    if not (needed or _CORROBORATED_MIN_SCORE <= score < _RESCUE_MIN_SCORE):
         return False, False
     readings = donor_title_readings(audio_path.name, series_title)
     agree = donor_names_episode(episode_title, audio_path.name, series_title=series_title)
+    if agree is not True:
+        whole, part = _title_less_part(episode_title)
+        if part == 1:
+            agree = donor_names_episode(whole, audio_path.name, series_title=series_title)
     # The run's own answer when there is one: a second probe could disagree
     # with the one that chose the track (an NFS blip), and grant the rescue to
     # an alignment made against a dub.
@@ -1495,19 +1560,23 @@ def _align_and_keep(
     score = parse_score(report)
     cscore = content_score(report)
     median_rate, stable_fraction, total_runtime = slope_stability(report)
+    # The gate judges uniformity where the description lands: the picture the
+    # recording never covers keeps its own soundtrack and is weighed below, by
+    # the undescribed gate. The whole-map figures stay in the log and the
+    # decision record so an audit can see both.
+    described_rate, described_trunk, described_runtime = slope_stability(
+        report, described_only=True,
+    )
     piecewise = piecewise_rate_fraction(report)
 
     # Always log every metric so acceptance decisions are auditable.
     logger.info(
         "Metrics for %s: similarity=%.1f%% coverage=%.1f%% "
-        "slope_stability=%.1f%% median_rate=%.2f%% runtime=%.0fs piecewise=%.1f%%",
+        "slope_stability=%.1f%% median_rate=%.2f%% runtime=%.0fs piecewise=%.1f%% "
+        "described_trunk=%.1f%% at %.2f%% over %.0fs",
         video_path.name, score, cscore, stable_fraction, median_rate, total_runtime, piecewise,
+        described_trunk, described_rate, described_runtime,
     )
-    title_corroborated, primary_english = _corroboration(
-        video_path, audio_path, episode_title, score, series_title,
-        aligned_english=result.aligned_english,
-    )
-
     # Coverage is a separate question from sync. similarity says the narration
     # lands at the right TIME; it says nothing about how much of the picture
     # carries narration at all, because it is measured only over the part the
@@ -1532,8 +1601,28 @@ def _align_and_keep(
         unreached = max(undescribed, picture - described_seconds(report))
         runtime = picture
     else:
-        unreached, runtime = undescribed, total_runtime
+        # The length could not be read; the map's own extent says the picture
+        # is at least that long, and a hole between segments counts in it.
+        runtime = max(total_runtime, segment_extent(report))
+        unreached = max(undescribed, runtime - described_seconds(report))
     note = _undescribed_note(undescribed, dropped, spans, runtime)
+
+    # The guard below caps any one uncovered stretch at a tenth of the picture
+    # and, past a tenth uncovered in all, wants the donor's name and language to
+    # vouch for a rescue; the probe runs only where it could matter.
+    stretches = _uncovered_stretches(report, runtime)
+    longest = max(stretches, key=lambda span: span[1] - span[0], default=None)
+    stretch_too_long = (
+        longest is not None and longest[1] - longest[0] > _RESCUE_MAX_UNCOVERED_STRETCH * runtime
+    )
+    corroboration_needed = (
+        score < config.min_score and runtime > 0 and not stretch_too_long
+        and unreached > _RESCUE_UNCORROBORATED_MAX_UNCOVERED * runtime
+    )
+    title_corroborated, primary_english = _corroboration(
+        video_path, audio_path, episode_title, score, series_title,
+        aligned_english=result.aligned_english, needed=corroboration_needed,
+    )
 
     # similarity is describealaign's match-confidence metric: the fraction of
     # the AD release's embedded program audio that aligned against the video.
@@ -1546,24 +1635,43 @@ def _align_and_keep(
     # was removed: "few seam artifacts" says nothing about whether the
     # narration is on time, which is the entire point of the alignment.
     sync_ok, sync_reason = sync_quality(report)
+    described_sync_ok, _ = sync_quality(report, described_only=True)
     accepted, accept_path, decision_detail = _acceptance_decision(
         score=score,
         content_coverage=cscore,
-        stable_fraction=stable_fraction,
-        median_rate=median_rate,
-        total_runtime=total_runtime,
-        sync_ok=sync_ok,
+        stable_fraction=described_trunk,
+        median_rate=described_rate,
+        total_runtime=described_runtime,
+        sync_ok=described_sync_ok,
         min_score=config.min_score,
         piecewise_fraction=piecewise,
         title_corroborated=title_corroborated,
         primary_audio_english=primary_english,
     )
-    if accepted and runtime > 0 and (picture > 0 or note) \
-            and unreached >= max_undescribed_fraction * runtime:
+    # With the length unread the picture is at least the map's extent, so the
+    # line is drawn there too (a note is not required: holes make none).
+    if accepted and runtime > 0 and unreached >= max_undescribed_fraction * runtime:
         accepted, decision_detail = False, (
-            _undescribed_note(unreached, dropped, spans, runtime)
+            _undescribed_note(unreached, dropped, stretches, runtime)
             or f"{_fmt_duration(unreached)} of {_fmt_duration(runtime)} has no description"
         )
+    # A rescue is judged where the description lands; the picture it leaves
+    # alone is bounded here (see _RESCUE_MAX_UNCOVERED_STRETCH and
+    # _RESCUE_UNCORROBORATED_MAX_UNCOVERED). The similarity path is as before.
+    if accepted and accept_path != "similarity" and runtime > 0:
+        if stretch_too_long:
+            accepted, decision_detail = False, (
+                f"{_fmt_duration(longest[1] - longest[0])} of the picture at "
+                f"{_fmt_clock(longest[0])}–{_fmt_clock(longest[1])} has no recording, more than "
+                f"a tenth of it; the recording may be placed that far off after such a gap"
+            )
+        elif unreached > _RESCUE_UNCORROBORATED_MAX_UNCOVERED * runtime \
+                and not (title_corroborated and primary_english):
+            accepted, decision_detail = False, (
+                f"{_fmt_duration(unreached)} of {_fmt_duration(runtime)} has no description and "
+                f"the donor is not corroborated (names the episode: {title_corroborated}, "
+                f"English track: {primary_english})"
+            )
     if not accepted:
         logger.warning("Discarding %s — %s", video_path.name, decision_detail)
         _cleanup_combined(combined)
@@ -1571,6 +1679,7 @@ def _align_and_keep(
             config, entry_title, "rejected", decision_detail,
             score=score, coverage=cscore, stable_fraction=stable_fraction,
             median_rate=median_rate, runtime=total_runtime, path=accept_path,
+            described_trunk=described_trunk, described_rate=described_rate,
         )
         return False, decision_detail
     logger.info("Accepting %s via %s path — %s", video_path.name, accept_path, decision_detail)
@@ -1613,6 +1722,7 @@ def _align_and_keep(
         score=score, coverage=cscore, stable_fraction=stable_fraction,
         undescribed=undescribed, dropped=dropped,
         median_rate=median_rate, runtime=total_runtime, path=accept_path,
+            described_trunk=described_trunk, described_rate=described_rate,
     )
     return True, note
 

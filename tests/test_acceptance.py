@@ -204,7 +204,7 @@ def test_corroboration_never_goes_below_the_engines_own_mismatch_line():
 
 
 def test_corroboration_needs_an_almost_perfect_native_line():
-    assert not _corroborated(stable_fraction=98.0)[0]
+    assert not _corroborated(stable_fraction=97.9)[0]
     assert not _corroborated(median_rate=1.0)[0]
     assert not _corroborated(sync_ok=False)[0]
     assert not _corroborated(content_coverage=95.0)[0]

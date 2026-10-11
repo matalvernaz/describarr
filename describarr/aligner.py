@@ -452,7 +452,31 @@ def content_score(report: Optional[Path]) -> float:
     return score
 
 
-def slope_stability(report: Optional[Path]) -> tuple[float, float, float]:
+def _map_segments(metrics: dict, described_only: bool) -> list[dict]:
+    """The map's segments with a video span; with *described_only*, those the
+    engine replaces (|rate| ≤ 10 %), which is where the description lands."""
+    segments = [seg for seg in metrics.get("segments", []) if _segment_duration(seg) > 0]
+    if described_only:
+        segments = [seg for seg in segments
+                    if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT]
+    return segments
+
+
+def _weighted_median_rate(segments: list[dict]) -> float:
+    """The rate half the segments' video time runs at or below."""
+    pairs = sorted((seg["rate_pct"], _segment_duration(seg)) for seg in segments)
+    half = sum(dur for _, dur in pairs) / 2.0
+    seen = 0.0
+    for rate, dur in pairs:
+        seen += dur
+        if seen >= half:
+            return rate
+    return 0.0
+
+
+def slope_stability(
+    report: Optional[Path], described_only: bool = False,
+) -> tuple[float, float, float]:
     """
     Summarise the structural stability of an alignment report.
 
@@ -462,24 +486,34 @@ def slope_stability(report: Optional[Path]) -> tuple[float, float, float]:
     the ``Stable Trunk Fraction`` text line for older reports). When neither
     is present, it's re-derived locally from the per-segment rates using the
     same tolerance describealaign uses internally so both paths agree.
+
+    With *described_only* the trunk is measured over the replaced segments
+    alone, from their own duration-weighted median rate: the picture the
+    recording never covers (a feature cut's extra footage, the recap between
+    two joined halves, end credits) keeps its original soundtrack and is
+    weighed by the undescribed gate, not here. Deep Space Nine's joined
+    finale had every replaced stretch at 0.00 % and a whole-map trunk of
+    89.5 % (2026-10-10).
     """
     metrics = _read_metrics(report)
     if metrics is None:
         return 0.0, 0.0, 0.0
 
-    median_rate = float(metrics.get("median_rate_pct", 0.0))
+    segments = _map_segments(metrics, described_only)
+    if described_only:
+        median_rate = _weighted_median_rate(segments) if segments else 0.0
+    else:
+        median_rate = float(metrics.get("median_rate_pct", 0.0))
 
     total_dur = 0.0
     stable_dur = 0.0
-    for seg in metrics.get("segments", []):
+    for seg in segments:
         dur = _segment_duration(seg)
-        if dur <= 0:
-            continue
         total_dur += dur
         if abs(seg["rate_pct"] - median_rate) <= _STABLE_RATE_TOLERANCE_PP:
             stable_dur += dur
 
-    if "stable_trunk_fraction_pct" in metrics:
+    if not described_only and "stable_trunk_fraction_pct" in metrics:
         fraction = float(metrics["stable_trunk_fraction_pct"])
     elif total_dur > 0.0:
         fraction = (stable_dur / total_dur) * 100.0
@@ -572,6 +606,14 @@ def described_seconds(report: Optional[Path]) -> float:
     )
 
 
+def segment_extent(report: Optional[Path]) -> float:
+    """How far into the picture the map reaches: the last segment's end, in seconds."""
+    metrics = _read_metrics(report)
+    if metrics is None:
+        return 0.0
+    return max((float(seg["video_end_sec"]) for seg in metrics.get("segments", [])), default=0.0)
+
+
 def uncovered_ends(report: Optional[Path], video_duration: float) -> list[tuple[float, float]]:
     """The video before the first aligned segment and after the last, when longer than ordinary.
 
@@ -601,26 +643,29 @@ def uncovered_ends(report: Optional[Path], video_duration: float) -> list[tuple[
     return ends
 
 
-def sync_quality(report: Optional[Path]) -> tuple[bool, str]:
+def sync_quality(report: Optional[Path], described_only: bool = False) -> tuple[bool, str]:
     """
     Return (ok, reason) where ok=False means the alignment is likely unreliable.
 
     Clean alignments — including ones with many commercial-break seams —
     have a tight cluster of segments around the median rate. The check
     requires the stable trunk to dominate the runtime AND have a small
-    internal rate variance.
+    internal rate variance. *described_only* judges the replaced segments
+    alone, as :func:`slope_stability` does.
     """
     metrics = _read_metrics(report)
     if metrics is None:
         return True, ""
 
-    median_rate = float(metrics.get("median_rate_pct", 0.0))
+    segments = _map_segments(metrics, described_only)
+    if described_only:
+        median_rate = _weighted_median_rate(segments) if segments else 0.0
+    else:
+        median_rate = float(metrics.get("median_rate_pct", 0.0))
     stable: list[tuple[float, float]] = []
     total_dur = 0.0
-    for seg in metrics.get("segments", []):
+    for seg in segments:
         dur = _segment_duration(seg)
-        if dur <= 0:
-            continue
         total_dur += dur
         if abs(seg["rate_pct"] - median_rate) <= _STABLE_RATE_TOLERANCE_PP:
             stable.append((seg["rate_pct"], dur))
