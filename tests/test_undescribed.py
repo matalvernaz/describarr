@@ -85,7 +85,7 @@ def test_process_movie_passes_the_success_note_through(monkeypatch, tmp_path):
     monkeypatch.setattr(workflow, "load_extra_sources", lambda: [])
     monkeypatch.setattr(
         workflow, "_align_and_keep",
-        lambda config, video_path, audio_path, label=None: (True, "AD source is a different cut: 75 s of the picture has no description"),
+        lambda config, video_path, audio_path, label=None, source="": (True, "AD source is a different cut: 75 s of the picture has no description"),
     )
     described, reason = process_movie(FakeClient(), config, video, "Movie", "2020")
     assert described

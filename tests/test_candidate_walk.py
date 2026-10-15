@@ -41,7 +41,7 @@ def _setup(monkeypatch, tmp_path, n_candidates, align_behavior):
 
     attempts = []
 
-    def fake_align_and_keep(config, video_path, audio_path, label=None):
+    def fake_align_and_keep(config, video_path, audio_path, label=None, source=""):
         attempts.append(audio_path)
         return align_behavior(len(attempts))
 

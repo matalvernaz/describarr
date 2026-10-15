@@ -49,10 +49,12 @@ from .aligner import (
     foreign_only_audio,
     reference_audio_stream,
     LANGUAGE_NAMES,
+    engine_version,
 )
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
 from .decision_log import DecisionLog
+from .log_files import history_dir
 from .outcome_log import OutcomeLog
 from .matcher import (
     _title_less_part,
@@ -375,7 +377,7 @@ def process_episode(
                 whole_double = len(all_episodes) > 1 and extract_dir in audio_path.parents
                 published, reason = _align_and_keep(
                     config, video_path, audio_path, label=label, episode_title=title,
-                    series_title=series_title,
+                    series_title=series_title, source=_AUDIOVAULT_LABEL,
                     **({"max_undescribed_fraction": _WHOLE_DOUBLE_MAX_UNDESCRIBED}
                        if whole_double else {}),
                 )
@@ -417,7 +419,7 @@ def process_episode(
                         continue
                     published, reason = _align_and_keep(
                         config, video_path, audio_path, label=label, episode_title=title,
-                        series_title=series_title,
+                        series_title=series_title, source=_source_label(source),
                     )
                     if published:
                         # An extra source may deliver a bare per-episode file with
@@ -461,7 +463,7 @@ def process_episode(
                     # _align_and_keep is what stops a partial match publishing.
                     published, reason = _align_and_keep(
                         config, video_path, audio_path, label=label, episode_title=title,
-                        series_title=series_title,
+                        series_title=series_title, source=_AUDIOVAULT_LABEL,
                     )
                     if published:
                         _mark_episode_done(zip_cache_dir, season, episode, extract_dir, zip_path)
@@ -571,7 +573,8 @@ def process_movie(
             if _already_tried(audio_path, tried, label):
                 same_from.append(_AUDIOVAULT_LABEL)
                 continue
-            published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+            published, reason = _align_and_keep(config, video_path, audio_path, label=label,
+                                                source=_AUDIOVAULT_LABEL)
             if published:
                 return True, reason
             last_reason = reason
@@ -590,7 +593,8 @@ def process_movie(
                     if _already_tried(audio_path, tried, label):
                         same_from.append(_source_label(source))
                         continue
-                    published, reason = _align_and_keep(config, video_path, audio_path, label=label)
+                    published, reason = _align_and_keep(config, video_path, audio_path, label=label,
+                                                        source=_source_label(source))
                     if published:
                         return True, reason
                     last_reason = reason
@@ -936,6 +940,7 @@ def _concat_audio(parts: list[Path], out: Path) -> Optional[Path]:
     """
     expected = sum(_audio_duration(p) for p in parts)
     if out.exists() and abs(_audio_duration(out) - expected) <= _CONCAT_DURATION_TOLERANCE_SEC:
+        logger.info("Reusing %s, joined from %s.", out.name, " + ".join(str(p) for p in parts))
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
     list_file = out.with_name(out.name + ".list")
@@ -959,7 +964,8 @@ def _concat_audio(parts: list[Path], out: Path) -> Optional[Path]:
             got = _audio_duration(tmp) if tmp.exists() else 0.0
             if proc.returncode == 0 and abs(got - expected) <= _CONCAT_DURATION_TOLERANCE_SEC:
                 tmp.replace(out)
-                logger.info("Joined %d AD files into %s (%.0f s).", len(parts), out.name, expected)
+                logger.info("Joined %d AD files into %s (%.0f s): %s.", len(parts), out.name,
+                            expected, " + ".join(str(p) for p in parts))
                 return out
             logger.warning(
                 "Joining %s with %s gave %.0f s for an expected %.0f s%s",
@@ -1396,6 +1402,7 @@ def _log_decision(
     dropped: Optional[float] = None,
     described_trunk: Optional[float] = None,
     described_rate: Optional[float] = None,
+    context: Optional[dict] = None,
 ) -> None:
     """Record one decision in the audit log. Best-effort: a logging failure
     must never break the alignment path.
@@ -1403,9 +1410,14 @@ def _log_decision(
     ``stable_fraction`` and ``median_rate`` are the whole map's;
     ``described_trunk`` and ``described_rate`` are the replaced segments', the
     figures the rescue gate judged, so an audit can see which measure decided.
+    *context* adds what was tried and what the gate read (see
+    ``_align_and_keep``); the ring keeps it too, the history keeps it for good.
     """
     try:
-        DecisionLog(config.cache_dir / "decisions.json", config.history_size).append({
+        DecisionLog(
+            config.cache_dir / "decisions.json", config.history_size,
+            history_dir=history_dir(config.cache_dir),
+        ).append({
             "title": title,
             "outcome": outcome,
             "detail": detail,
@@ -1419,9 +1431,25 @@ def _log_decision(
             "dropped": dropped,
             "described_trunk": described_trunk,
             "described_rate": described_rate,
+            **(context or {}),
         })
     except Exception:
         logger.debug("Decision-log write failed.", exc_info=True)
+
+
+def _corroboration_probed(score: float, needed: bool) -> bool:
+    """Whether :func:`_corroboration` looks at all: in the corroborated
+    rescue's score band, or when a rescue leaving much uncovered needs it."""
+    return needed or _CORROBORATED_MIN_SCORE <= score < _RESCUE_MIN_SCORE
+
+
+def _cache_relative(path: Path, cache_dir: Path) -> str:
+    """*path* as the history names a recording: inside the cache, relative to
+    it, which shows the source's own folder and the file; otherwise whole."""
+    try:
+        return str(Path(path).relative_to(cache_dir))
+    except ValueError:
+        return str(path)
 
 
 def _corroboration(
@@ -1441,7 +1469,7 @@ def _corroboration(
     and a recording joined from its halves is named as the whole, so a part-1
     title also agrees with the title less its marker.
     """
-    if not (needed or _CORROBORATED_MIN_SCORE <= score < _RESCUE_MIN_SCORE):
+    if not _corroboration_probed(score, needed):
         return False, False
     readings = donor_title_readings(audio_path.name, series_title)
     agree = donor_names_episode(episode_title, audio_path.name, series_title=series_title)
@@ -1475,6 +1503,7 @@ def _align_and_keep(
     episode_title: str = "",
     series_title: str = "",
     max_undescribed_fraction: float = _UNDESCRIBED_MAJOR_FRACTION,
+    source: str = "",
 ) -> tuple[bool, Optional[str]]:
     """Run alignment and either keep or discard the combined output.
 
@@ -1492,6 +1521,16 @@ def _align_and_keep(
     alignment_dir = config.cache_dir / "alignments"
     tmp_output_dir = config.cache_dir / "output"
     entry_title = label or video_path.name
+    # What every decision below records about this attempt, so the history can
+    # say which recording was tried on which file, from where, without the log.
+    context = {
+        "video": str(video_path),
+        "donor": _cache_relative(audio_path, config.cache_dir),
+        "source": source or None,
+        "engine": engine_version(),
+        "episode_title": episode_title or None,
+        "min_score": config.min_score,
+    }
 
     # Refuse the stretch-video path (config.stretch_audio is False) for an
     # in-place library replacement unless Matt has explicitly opted into the
@@ -1508,7 +1547,7 @@ def _align_and_keep(
         )
         reason = ("stretch-video path disabled; set DESCRIBARR_STRETCH_AUDIO=true "
                   "or DESCRIBARR_ALLOW_VIDEO_RETIME=true")
-        _log_decision(config, entry_title, "error", reason)
+        _log_decision(config, entry_title, "error", reason, context=context)
         return False, reason
 
     # Snapshot the source fingerprint BEFORE alignment, not after. Alignment
@@ -1520,6 +1559,8 @@ def _align_and_keep(
         pre_fp = _file_fingerprint(video_path)
     except FileNotFoundError:
         logger.error("Source video vanished before alignment could start: %s", video_path)
+        _log_decision(config, entry_title, "error", "source file vanished before alignment",
+                      context=context)
         return False, "source file vanished before alignment"
 
     result = align(video_path, audio_path, tmp_output_dir, alignment_dir, config.stretch_audio)
@@ -1527,7 +1568,9 @@ def _align_and_keep(
         reason = (result.failure_reason if result is not None else None) \
             or EngineFailure("alignment produced no validated output")
         logger.error("Alignment produced no validated output file: %s", reason)
-        _log_decision(config, entry_title, "failed", reason)
+        _log_decision(config, entry_title, "failed", reason, context={
+            **context, "diagnostic": getattr(result, "diagnostic", None),
+        })
         if result is not None and result.returncode is not None and result.returncode < 0:
             raise AlignmentResourceKill(
                 f"{reason} — killed by signal, likely the container memory cap; "
@@ -1648,6 +1691,19 @@ def _align_and_keep(
         title_corroborated=title_corroborated,
         primary_audio_english=primary_english,
     )
+    # What the gate read, for the history. None where it never asked: the
+    # corroboration probe runs only in its score band (or when a rescue needs
+    # it), and the track's language is looked at only once the title agrees.
+    probed = _corroboration_probed(score, corroboration_needed)
+    gate = {
+        "piecewise": piecewise,
+        "sync_ok": described_sync_ok,
+        "described_runtime": described_runtime,
+        "title_corroborated": title_corroborated if probed else None,
+        "english_track": primary_english if probed and title_corroborated else None,
+        "uncovered": unreached,
+        "longest_gap": (longest[1] - longest[0]) if longest is not None else 0.0,
+    }
     # With the length unread the picture is at least the map's extent, so the
     # line is drawn there too (a note is not required: holes make none).
     if accepted and runtime > 0 and unreached >= max_undescribed_fraction * runtime:
@@ -1680,6 +1736,7 @@ def _align_and_keep(
             score=score, coverage=cscore, stable_fraction=stable_fraction,
             median_rate=median_rate, runtime=total_runtime, path=accept_path,
             described_trunk=described_trunk, described_rate=described_rate,
+            context={**context, **gate},
         )
         return False, decision_detail
     logger.info("Accepting %s via %s path — %s", video_path.name, accept_path, decision_detail)
@@ -1723,6 +1780,7 @@ def _align_and_keep(
         undescribed=undescribed, dropped=dropped,
         median_rate=median_rate, runtime=total_runtime, path=accept_path,
             described_trunk=described_trunk, described_rate=described_rate,
+            context={**context, **gate},
     )
     return True, note
 

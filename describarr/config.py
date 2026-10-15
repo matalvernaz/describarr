@@ -48,6 +48,14 @@ def _parse_bool(name: str, default: bool) -> bool:
     )
 
 
+def cache_dir_from_env() -> Path:
+    """Where describarr keeps its state: ``DESCRIBARR_CACHE_DIR``, else
+    ``~/.cache/describarr``. Needs no credentials, so the log file can be set
+    up before (or without) a loadable :class:`Config`; both read it here."""
+    raw_cache = os.environ.get("DESCRIBARR_CACHE_DIR", "")
+    return Path(raw_cache).expanduser() if raw_cache else Path.home() / ".cache" / "describarr"
+
+
 def _parse_minutes(name: str, default: int) -> int:
     raw = os.environ.get(name, str(default)).strip()
     try:
@@ -125,8 +133,7 @@ class Config:
                 f"DESCRIBARR_MIN_SCORE must be between 0 and 100, got {min_score!r}"
             )
 
-        raw_cache = os.environ.get("DESCRIBARR_CACHE_DIR", "")
-        cache_dir = Path(raw_cache).expanduser() if raw_cache else Path.home() / ".cache" / "describarr"
+        cache_dir = cache_dir_from_env()
 
         stretch_audio = _parse_bool("DESCRIBARR_STRETCH_AUDIO", default=True)
         allow_video_retime = _parse_bool("DESCRIBARR_ALLOW_VIDEO_RETIME", default=False)

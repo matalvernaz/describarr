@@ -18,10 +18,11 @@ import sys
 
 from .audiovault import AudioVaultClient, LoginError
 from .config import Config
+from .log_files import LOG_FORMAT
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s: %(message)s",
+    format=LOG_FORMAT,
     stream=sys.stderr,
 )
 logger = logging.getLogger("describarr")
