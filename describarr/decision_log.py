@@ -16,6 +16,9 @@ import os
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
+
+from .log_files import append_history
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +42,16 @@ def _atomic_write_text(path: Path, content: str) -> None:
 class DecisionLog:
     """Bounded ring of recent decision entries persisted as a JSON list,
     newest last. ``append`` trims to *max_entries* so the file can't grow
-    without bound."""
+    without bound.
 
-    def __init__(self, state_path: Path, max_entries: int = 50) -> None:
+    With *history_dir*, every entry is also kept for good in that directory's
+    monthly history (see :mod:`describarr.log_files`), whatever the ring keeps."""
+
+    def __init__(self, state_path: Path, max_entries: int = 50,
+                 history_dir: Optional[Path] = None) -> None:
         self._path = state_path
         self._max = max(0, int(max_entries))
+        self._history_dir = history_dir
 
     def load(self) -> list[dict]:
         if not self._path.exists():
@@ -56,11 +64,16 @@ class DecisionLog:
         return data if isinstance(data, list) else []
 
     def append(self, entry: dict) -> None:
-        if self._max == 0:
-            return
         record = dict(entry)
         record.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
         with _LOCK:
+            # The history first: it is the record that outlives the ring, so
+            # neither a ring of size 0 nor one that cannot be written may cost
+            # it a line. It never raises; the ring's failure still does.
+            if self._history_dir is not None:
+                append_history(self._history_dir, record)
+            if self._max == 0:
+                return
             items = self.load()
             items.append(record)
             if len(items) > self._max:

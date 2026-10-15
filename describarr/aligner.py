@@ -17,6 +17,8 @@ alongside its PNG plot in alignment_dir.
 
 from __future__ import annotations
 
+import functools
+import importlib.metadata
 import json
 import logging
 import os
@@ -157,7 +159,8 @@ class AlignResult:
     a property of the video's decode footprint rather than of the AD candidate.
     """
 
-    __slots__ = ("output", "report", "failure_reason", "returncode", "aligned_english")
+    __slots__ = ("output", "report", "failure_reason", "returncode", "aligned_english",
+                 "diagnostic")
 
     def __init__(
         self,
@@ -166,11 +169,16 @@ class AlignResult:
         failure_reason: Optional[str] = None,
         returncode: Optional[int] = None,
         aligned_english: Optional[bool] = None,
+        diagnostic: Optional[dict] = None,
     ) -> None:
         self.output = output
         self.report = report
         self.failure_reason = failure_reason
         self.returncode = returncode
+        # The engine's own measurements behind a refusal (its *.fail.json,
+        # cut to its scalar figures), for the decision history; the sidecar
+        # itself is overwritten by the next candidate's run.
+        self.diagnostic = diagnostic
         # Whether the track this run aligned against is English, from the
         # same probe that chose it (see primary_audio_is_english); None when
         # not known, and the caller probes for itself.
@@ -267,6 +275,7 @@ def run(
         # Surface it at ERROR (the raw stderr stays at DEBUG) and hand the
         # human summary back so the caller can tell the operator the cause.
         reason = _read_failure_sidecar(video_path, alignment_dir, run_start)
+        diagnostic = _failure_diagnostic(video_path, alignment_dir, run_start)
         if reason:
             logger.error("describealaign could not align %s: %s", video_path.name, reason)
         else:
@@ -283,7 +292,7 @@ def run(
                 )
             logger.error("describealaign exited with code %d.", returncode)
         _cleanup_run_dir(run_output_dir)
-        return AlignResult(None, None, reason, returncode=returncode)
+        return AlignResult(None, None, reason, returncode=returncode, diagnostic=diagnostic)
 
     output = _find_output(video_path, run_output_dir, run_start)
     if output is None:
@@ -374,13 +383,13 @@ def _find_report(
     return candidates[0]
 
 
-def _read_failure_sidecar(
+def _failure_sidecar_data(
     video_path: Path,
     alignment_dir: Path,
     min_mtime: float = 0.0,
-) -> Optional[str]:
-    """Return the human ``summary`` from describealaign's ``<stem>.fail.json``
-    for this run, or None if absent/unreadable.
+) -> Optional[dict]:
+    """The parsed ``<stem>.fail.json`` describealaign wrote for this run, or
+    None if absent/unreadable.
 
     Written by describealaign ≥2.1.9 when an alignment is rejected as a
     mismatch. Mirrors :func:`_find_report`'s stem+mtime matching so a stale
@@ -398,8 +407,64 @@ def _read_failure_sidecar(
         data = json.loads(candidates[0].read_text())
     except (json.JSONDecodeError, OSError):
         return None
-    summary = data.get("summary") if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def _read_failure_sidecar(
+    video_path: Path,
+    alignment_dir: Path,
+    min_mtime: float = 0.0,
+) -> Optional[str]:
+    """Return the human ``summary`` from describealaign's ``<stem>.fail.json``
+    for this run, or None if absent/unreadable."""
+    data = _failure_sidecar_data(video_path, alignment_dir, min_mtime)
+    summary = data.get("summary") if data is not None else None
     return summary or None
+
+
+# A diagnosis kept in the decision history is a handful of figures; this bounds
+# what an unexpected sidecar can add to one history line.
+_DIAGNOSTIC_MAX_KEYS = 20
+_DIAGNOSTIC_MAX_TEXT = 200
+
+
+def _failure_diagnostic(
+    video_path: Path,
+    alignment_dir: Path,
+    min_mtime: float = 0.0,
+) -> Optional[dict]:
+    """The engine's measurements behind this run's refusal: the sidecar's
+    ``error`` code and the scalar figures of its ``diagnostic`` (durations,
+    energy and quiet ratios), or None. Nested values are dropped and text is
+    cut short, so a history line stays a line."""
+    data = _failure_sidecar_data(video_path, alignment_dir, min_mtime)
+    if data is None:
+        return None
+    kept: dict = {}
+    if isinstance(data.get("error"), str):
+        kept["error"] = data["error"][:_DIAGNOSTIC_MAX_TEXT]
+    figures = data.get("diagnostic")
+    if isinstance(figures, dict):
+        for name, value in figures.items():
+            if len(kept) >= _DIAGNOSTIC_MAX_KEYS:
+                break
+            if name == "summary" or not isinstance(name, str):
+                continue  # the summary is already the decision's detail
+            if isinstance(value, str):
+                kept[name] = value[:_DIAGNOSTIC_MAX_TEXT]
+            elif value is None or isinstance(value, (bool, int, float)):
+                kept[name] = value
+    return kept or None
+
+
+@functools.lru_cache(maxsize=1)
+def engine_version() -> Optional[str]:
+    """The installed describealaign's version, for the decision history; None
+    when it is not installed (the tests, a bare checkout)."""
+    try:
+        return importlib.metadata.version("describealaign")
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def _segment_duration(seg: dict) -> float:

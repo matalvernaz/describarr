@@ -27,13 +27,14 @@ from . import notify
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, LoginError
 from .config import Config
 from .decision_log import DecisionLog
+from .log_files import attach_file_log, history_dir, log_settings, prune_decision_history
 from .held_notifications import FILMS, Due, HeldNotifications, entry, group_name, show_group
 from .nomatch_cache import NoMatchCache
 from .outcome_log import OutcomeLog, key as outcome_key
 from .pending_queue import PendingQueue
 from .retry_queue import RetryQueue
 from .workflow import ALREADY_DESCRIBED, DamagedSource, Refusal, drain_retry_queue, process_episode, process_movie, prune_alignment_artifacts, prune_completed_seasons, prune_output_scratch, prune_registered_backups, _safe_dirname, _atomic_write_json, _MAX_DRAIN_PASSES
-from .aligner import EngineFailure, source_has_ad_track
+from .aligner import EngineFailure, engine_version, source_has_ad_track
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +305,14 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def serve(port: int = 8686) -> None:
+    # The container's own log goes with the container; keep a copy beside the
+    # rest of describarr's state before anything is worth logging.
+    settings = log_settings()
+    if attach_file_log(settings) is not None:
+        logger.info(
+            "describarr starting with describealaign %s; log kept in %s for %d days.",
+            engine_version() or "(version unknown)", settings.log_dir, settings.retention_days,
+        )
     server = _ThreadingHTTPServer(("0.0.0.0", port), _HookHandler)
     logger.info("describarr webhook server listening on port %d", port)
     threading.Thread(target=_midnight_drain_loop, daemon=True).start()
@@ -342,6 +351,12 @@ def _midnight_drain_loop() -> None:
         sleep_secs = (next_run - now).total_seconds()
         logger.info("Retry queue drain scheduled in %.0f seconds.", sleep_secs)
         time.sleep(sleep_secs)
+        # Before the configuration loads: the history needs none, and a
+        # configuration error must not keep old months forever.
+        try:
+            prune_decision_history()
+        except Exception:
+            logger.exception("prune_decision_history failed; continuing.")
         try:
             config = Config.from_env()
         except ValueError as exc:
@@ -470,7 +485,7 @@ def _record_worker_failure(config: Config, item: dict, reason: str) -> None:
     detail = f"Description failed after {_MAX_WORKER_ATTEMPTS} attempts: {reason}"
     if path:
         OutcomeLog.in_cache(config.cache_dir).record(path, "error", detail, label)
-    _log_terminal_decision(config, label, "error", detail)
+    _log_terminal_decision(config, label, "error", detail, path=path)
 
 
 # Errors that should re-queue the pending item rather than drop it. Anything
@@ -1251,7 +1266,8 @@ def _notify_message(outcome: str, reason: Optional[str]) -> str:
     return f"{base} ({reason})" if reason else base
 
 
-def _log_terminal_decision(config: Config, label: str, outcome: str, reason: Optional[str]) -> None:
+def _log_terminal_decision(config: Config, label: str, outcome: str, reason: Optional[str],
+                           path: str | Path | None = None) -> None:
     """Record a terminal outcome that had no alignment attempt of its own.
 
     ``_align_and_keep`` already logs described/rejected/failed with scores, so
@@ -1265,8 +1281,12 @@ def _log_terminal_decision(config: Config, label: str, outcome: str, reason: Opt
     if isinstance(reason, EngineFailure):
         return  # the failed attempt is already logged
     try:
-        DecisionLog(config.cache_dir / "decisions.json", config.history_size).append({
+        DecisionLog(
+            config.cache_dir / "decisions.json", config.history_size,
+            history_dir=history_dir(config.cache_dir),
+        ).append({
             "title": label, "outcome": outcome, "detail": reason or "",
+            "video": str(path) if path else None,
         })
     except Exception:
         logger.debug("Terminal decision-log write failed.", exc_info=True)
@@ -1300,7 +1320,7 @@ def _notify_outcome(
             unsent.everyone, unsent.everyone_since = [label], now
         if unsent.operator or unsent.everyone:
             held.put_back(unsent)
-    _log_terminal_decision(config, label, outcome, reason)
+    _log_terminal_decision(config, label, outcome, reason, path=path)
     if path:
         OutcomeLog.in_cache(config.cache_dir).record(
             path, outcome, detail=reason or "", label=label)
