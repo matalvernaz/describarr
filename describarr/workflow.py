@@ -193,6 +193,35 @@ def _source_label(source) -> str:
     return label if isinstance(label, str) and label.strip() else _UNLABELLED_SOURCE
 
 
+class _WalkReasons:
+    """The reason a candidate walk reports: the first refused in rank order,
+    else the last reason seen.
+
+    Candidates come best first (the recording named for the episode, then the
+    number's pick, then extra sources), so the first refusal is the one about
+    the recording that matters; it is first in rank, not best in score. A later
+    long shot's verdict used to replace it: Phineas and Ferb S01E07 reported
+    "AD audio is 2.33x the video duration" from a 21-minute double tried by
+    number, when its own recording had been refused for running 10.3 % off
+    (2026-10-16). An engine failure is kept only when nothing was refused, so a
+    walk that failed throughout is still an error, and one whose recording was
+    refused is not made an error by a long shot that crashed.
+    """
+
+    def __init__(self) -> None:
+        self.first_refused = None
+        self.last = None
+
+    def add(self, reason) -> None:
+        self.last = reason
+        if self.first_refused is None and reason is not None and not isinstance(reason, EngineFailure):
+            self.first_refused = reason
+
+    @property
+    def reported(self):
+        return self.first_refused if self.first_refused is not None else self.last
+
+
 def _as_refusal(reason, sources: list[str], same: list[str], nearby: int = 0):
     """*reason* as a :class:`Refusal` (see its fields); an engine failure, a
     damaged source or no reason at all is passed through untouched, since the
@@ -345,7 +374,7 @@ def process_episode(
     zip_cache_dir = config.cache_dir / "shows" / _safe_dirname(series_title)
     limiter = DownloadLimiter(config.cache_dir / "daily_limit.json")
 
-    last_reason: Optional[str] = None
+    reasons = _WalkReasons()
     # For the notification: the source of every recording refused, and of every
     # one skipped as identical to a recording already refused.
     refused_from: list[str] = []
@@ -389,7 +418,7 @@ def process_episode(
                     for ep in all_episodes:
                         _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
                     return True, reason
-                last_reason = reason
+                reasons.add(reason)
                 if not isinstance(reason, EngineFailure):
                     refused_from.append(_AUDIOVAULT_LABEL)
             logger.info("Candidate %r below threshold — trying next.", candidate["name"])
@@ -433,7 +462,7 @@ def process_episode(
                         for ep in all_episodes:
                             _mark_episode_done(zip_cache_dir, season, ep)
                         return True, reason
-                    last_reason = reason
+                    reasons.add(reason)
                     if not isinstance(reason, EngineFailure):
                         refused_from.append(_source_label(source))
             finally:
@@ -486,7 +515,7 @@ def process_episode(
             return False, DamagedSource(str(exc))
         return False, str(exc)
 
-    return False, _as_refusal(last_reason, refused_from, same_from, nearby_refused)
+    return False, _as_refusal(reasons.reported, refused_from, same_from, nearby_refused)
 
 
 def _season_by_title_segments(
@@ -562,7 +591,7 @@ def process_movie(
             _MAX_MOVIE_CANDIDATES, len(candidates),
         )
 
-    last_reason: Optional[str] = None
+    reasons = _WalkReasons()
     tried: set[str] = set()
     refused_from: list[str] = []
     same_from: list[str] = []
@@ -581,7 +610,7 @@ def process_movie(
                                                 source=_AUDIOVAULT_LABEL)
             if published:
                 return True, reason
-            last_reason = reason
+            reasons.add(reason)
             if not isinstance(reason, EngineFailure):
                 refused_from.append(_AUDIOVAULT_LABEL)
             logger.info("Candidate %r below threshold — trying next.", candidate["name"])
@@ -601,7 +630,7 @@ def process_movie(
                                                         source=_source_label(source))
                     if published:
                         return True, reason
-                    last_reason = reason
+                    reasons.add(reason)
                     if not isinstance(reason, EngineFailure):
                         refused_from.append(_source_label(source))
             finally:
@@ -614,7 +643,7 @@ def process_movie(
             return False, DamagedSource(str(exc))
         return False, str(exc)
 
-    return False, _as_refusal(last_reason, refused_from, same_from)
+    return False, _as_refusal(reasons.reported, refused_from, same_from)
 
 
 # ------------------------------------------------------------------

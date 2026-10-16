@@ -78,6 +78,9 @@ _GENERIC_DONOR_RE = re.compile(r"(?i)^(?:(?:track|episode|ep|part|disc|chapter|c
 _TRACK_NUMBER_MAX_DIGITS = 3
 _TRACK_NUMBER_PREFIX_RE = re.compile(rf"^\d{{1,{_TRACK_NUMBER_MAX_DIGITS}}}\s+(?=[^\W\d_])")
 
+# A region tag a catalogue appends to a title, in a matching pair of brackets.
+_REGION_SUFFIX_RE = re.compile(r"(?i)\s*(?:\[(?:US|UK|CA|AU)\]|\((?:US|UK|CA|AU)\))\s*$")
+
 # Trailing qualifiers on a series' name ("Archer (2009)", "Heartland (2007)
 # (CA)"), which a donor that repeats the series' name leaves off.
 _SERIES_QUALIFIERS_RE = re.compile(r"(?:\s*\([^)]*\))+\s*$")
@@ -214,6 +217,13 @@ def donor_title_readings(name: str, series_title: str = "") -> list[str]:
         return []
     series = _normalise(_SERIES_QUALIFIERS_RE.sub("", series_title or ""))
     readings = [literal]
+    # A catalogue's own region tag after the title, "Doofapus [US]" (Phineas
+    # and Ferb season 3, 2026-10-16), read once from the unfolded literal, which
+    # stays first: folding would turn the tag into a word. Brackets only, and a
+    # matching pair, so "Leave the Busting to Us" keeps its last word.
+    regionless = _REGION_SUFFIX_RE.sub("", literal, count=1)
+    if regionless and regionless != literal:
+        readings.append(regionless)
     # The list grows while it is walked, so a name with both kinds of clutter
     # ("01 Family Guy - Pilot.mp3") is stripped of each in turn.
     for reading in readings:
