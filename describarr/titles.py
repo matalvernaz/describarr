@@ -54,10 +54,13 @@ def _is_release_word(word: str) -> bool:
 
 
 # Donor prefixes before the title: "[S21.E01] ", "2.07 ", "5.01,5.02 ",
-# "01 - 07 ", "S08E02 ", "E07 - ".
+# "01 - 07 ", "S08E02 ", "E07 - ". A catalogue that numbers a split-segment
+# show by half-hour slot letters each segment, "[S01.E02b] " (Phineas and
+# Ferb, 2026-10-15); the letter is read only inside the brackets, where the
+# closing one bounds it, so it can never take the first letter of a title.
 _DONOR_PREFIX_RE = re.compile(
     r"(?i)^\s*(?:"
-    r"\[\s*S\d+\s*\.?\s*E\d+\s*\]"             # [S21.E01]
+    r"\[\s*S\d+\s*\.?\s*E\d+[a-z]?\s*\]"       # [S21.E01], [S01.E02b]
     r"|S\d+\s*E\d+(?:\s*-?\s*E\d+)*"           # S08E02, S01E01-E02
     r"|\d+\.\d+(?:\s*,\s*\d+\.\d+)*"           # 2.07, 5.01,5.02
     r"|\d+\s*-\s*\d+"                          # 01 - 07

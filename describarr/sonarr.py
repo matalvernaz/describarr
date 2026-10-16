@@ -16,9 +16,9 @@ and the episodes Sonarr maps to that file. It answers only when sure: exactly
 one series with that folder name, exactly one file by that name (or by its
 path inside the series), and Sonarr's first episode for the file numbered as
 the one being searched. Otherwise "", and the .nfo and the file name are read
-as before. A file Sonarr numbers differently from its name (a release one
-episode behind TVDB), a special in season 0, or an absolute-numbered show
-therefore gets no title from here.
+as before. A file Sonarr numbers differently from the search (a release one
+episode behind TVDB, a special or an absolute-numbered episode Sonarr files
+under other numbers) therefore gets no title from here.
 
 A failure is remembered at the scope it happened (the series list for every
 lookup, one series' files for that series), so a dead Sonarr costs one slow
@@ -99,7 +99,6 @@ class SonarrTitles:
         self._series_down_until = float("-inf")
         self._files: dict[int, _SeriesFiles] = {}
         self._files_down_until: dict[int, float] = {}
-        self._refreshed_at: dict[int, float] = {}
 
     def episode_title(self, video_path: str | Path, season: int, episode: int) -> str:
         """Sonarr's title for the episode *video_path* holds, or "". Never raises."""
@@ -175,12 +174,14 @@ class SonarrTitles:
         return None, ()
 
     def _may_refresh(self, series_id: int) -> bool:
+        """Whether a miss may fetch this series afresh: only once what is cached
+        is a minute old. A refresh that works resets the minute; one that fails
+        leaves it, and the series' failure cooldown (checked before any request
+        in `_series_files`) is what stops it being tried again."""
         now = self._clock()
         with self._lock:
-            if now - self._refreshed_at.get(series_id, float("-inf")) < MISS_REFRESH_SECONDS:
-                return False
-            self._refreshed_at[series_id] = now
-            return True
+            entry = self._files.get(series_id)
+            return entry is None or now - entry.fetched_at >= MISS_REFRESH_SECONDS
 
     # -- Sonarr, cached -------------------------------------------------------
 
