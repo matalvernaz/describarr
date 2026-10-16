@@ -212,21 +212,46 @@ def test_answers_are_reused_for_ten_minutes(fake, titles, clock):
     assert (fake.count("series"), fake.count("episodefile")) == (2, 2)
 
 
-def test_a_file_imported_since_is_found_after_one_fresh_look(fake, titles, clock):
+def test_a_file_imported_since_is_found_once_the_cache_is_a_minute_old(fake, titles, clock):
     titles.episode_title(f"{SVU}/Season 22/{S22E13}", 22, 13)
     new = "Law.and.Order.SVU.S22E14.mkv"
     fake.files[26].append({"id": 4277, "relativePath": f"Season 22/{new}"})
     fake.episodes[26][1]["episodeFileId"] = 4277
+    # Fetched a moment ago: a miss now is a miss, not a reason to ask again.
+    assert titles.episode_title(f"{SVU}/Season 22/{new}", 22, 14) == ""
+    assert fake.count("episodefile") == 1
+    clock.now += sonarr.MISS_REFRESH_SECONDS
     assert titles.episode_title(f"{SVU}/Season 22/{new}", 22, 14) == "Post-Graduate Psychopath"
     assert fake.count("episodefile") == 2
 
 
-def test_ten_unknown_files_cost_one_fresh_look_a_minute(fake, titles, clock):
+def test_unknown_files_cost_one_fresh_look_a_minute(fake, titles, clock):
     titles.episode_title(f"{SVU}/Season 22/{S22E13}", 22, 13)
     for n in range(10):
         titles.episode_title(f"{SVU}/Season 22/Unknown.S22E{n + 50}.mkv", 22, n + 50)
+    assert fake.count("episodefile") == 1
+    clock.now += sonarr.MISS_REFRESH_SECONDS + 1
+    for n in range(10):
+        titles.episode_title(f"{SVU}/Season 22/Unknown.S22E{n + 70}.mkv", 22, n + 70)
     assert fake.count("episodefile") == 2
     clock.now += sonarr.MISS_REFRESH_SECONDS + 1
+    titles.episode_title(f"{SVU}/Season 22/Unknown.S22E99.mkv", 22, 99)
+    assert fake.count("episodefile") == 3
+
+
+def test_a_failing_fresh_look_is_tried_once_per_cooldown(fake, titles, clock):
+    titles.episode_title(f"{SVU}/Season 22/{S22E13}", 22, 13)
+    clock.now += sonarr.MISS_REFRESH_SECONDS + 1
+    fake.fail = lambda path: FakeResponse(500, {}) if path == "episodefile" else None
+    for step in range(5):
+        assert titles.episode_title(f"{SVU}/Season 22/Unknown.S22E{step + 50}.mkv", 22, step + 50) == ""
+        clock.now += sonarr.MISS_REFRESH_SECONDS + 1
+    # One failed refresh, then nothing until the cooldown ends; the file the
+    # cache already knew is still answered from it meanwhile.
+    assert fake.count("episodefile") == 2
+    assert titles.episode_title(f"{SVU}/Season 22/{S22E13}", 22, 13) == "Trick-Rolled at the Moulin (1)"
+    fake.fail = None
+    clock.now += sonarr.FAILURE_COOLDOWN_SECONDS
     titles.episode_title(f"{SVU}/Season 22/Unknown.S22E99.mkv", 22, 99)
     assert fake.count("episodefile") == 3
 
