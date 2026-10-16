@@ -50,6 +50,7 @@ from .aligner import (
     reference_audio_stream,
     LANGUAGE_NAMES,
     engine_version,
+    sync_check,
 )
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
@@ -729,6 +730,34 @@ _NEIGHBOUR_MAX_OWN_SCORE = 20.0
 _CORROBORATED_MIN_STABLE_FRACTION = 98.0
 _CORROBORATED_MIN_COVERAGE = 99.0
 
+# Measured-sync rescue: the engine (describealign 2.3.0, pass 3) measures,
+# every quarter second along the map it renders, where the recording matches
+# the video best, bends the map where the recording's speed changes inside one
+# of pass 2's lines, and reports how well the result holds. Broadcast recordings
+# whose time compression varies by act fail every shape test above (Law & Order:
+# SVU's AudioVault pack, 2026-10-13 to 16: trunk 13-64 %, sync_ok False) while
+# their narration lands right; this path judges them by that measurement
+# instead. Calibrated 2026-10-16 after pass 3: recordings named for their
+# episode (Phineas and Ferb, SVU) measured 92.3-99.4 % of anchors within 40 ms,
+# 0.02-1.81 % over 120 ms, and confirmed 39-77 % of the whole video; other
+# episodes' recordings sharing only the opening theme confirmed 7.7-8.0 %.
+_MEASURED_MIN_CONFIRMED_PCT = 30.0
+_MEASURED_MIN_WITHIN_PCT = 90.0
+_MEASURED_MAX_OVER_PCT = 2.0
+
+
+def _measured_sync_holds(measured: Optional[dict]) -> bool:
+    """Whether the engine's measurement clears the measured-sync rescue's timing
+    bar. Its content checks (the donor names this episode, the aligned track is
+    English) are separate. The probe for them and the gate both ask this one
+    function, so they cannot disagree about when the path applies."""
+    return (
+        measured is not None
+        and measured["confirmed_pct"] >= _MEASURED_MIN_CONFIRMED_PCT
+        and measured["within_pct"] >= _MEASURED_MIN_WITHIN_PCT
+        and measured["over_pct"] <= _MEASURED_MAX_OVER_PCT
+    )
+
 
 def _acceptance_decision(
     *,
@@ -742,6 +771,7 @@ def _acceptance_decision(
     piecewise_fraction: float = 0.0,
     title_corroborated: bool = False,
     primary_audio_english: bool = False,
+    measured_sync: Optional[dict] = None,
 ) -> tuple[bool, str, str]:
     """Decide whether an alignment is good enough to overwrite the original.
 
@@ -776,6 +806,12 @@ def _acceptance_decision(
       past PAL/NTSC's band and within the engine's replace limit (more than
       6 %, at most 10 %), with the corroborated rescue's two content checks
       and its coverage floor.
+    * ``measured-sync`` — whatever the map's shape, the engine's own
+      measurement (*measured_sync*, from :func:`aligner.sync_check`) clears
+      :func:`_measured_sync_holds`, over the rescues' runtime floor and the
+      corroborated rescue's coverage floor and two content checks. None (an
+      engine before 2.3.0, or a measurement that cannot be read) never takes
+      this path.
     """
     if score >= min_score:
         return True, "similarity", f"similarity {score:.1f}% ≥ {min_score:.0f}% (sync confident)"
@@ -839,6 +875,20 @@ def _acceptance_decision(
             f"similarity {score:.1f}% below {_RESCUE_MIN_SCORE:.0f}% but "
             f"{stable_fraction:.1f}% of the runtime is one native-rate line, the donor "
             f"names this episode and the aligned track is English — accepting"
+        )
+    if (
+        _measured_sync_holds(measured_sync)
+        and total_runtime >= _RESCUE_MIN_RUNTIME_SEC
+        and content_coverage >= _CORROBORATED_MIN_COVERAGE
+        and title_corroborated
+        and primary_audio_english
+    ):
+        return True, "measured-sync", (
+            f"similarity {score:.1f}% below {min_score:.0f}%, but the engine measured "
+            f"{measured_sync['confirmed_pct']:.0f}% of the video in sync "
+            f"({measured_sync['within_pct']:.1f}% of its anchors within 40 ms, "
+            f"{measured_sync['over_pct']:.2f}% over 120 ms); the donor names this "
+            f"episode and the aligned track is English — accepting"
         )
     return False, "reject", (
         f"similarity {score:.1f}% (coverage {content_coverage:.1f}%, stable trunk "
@@ -1561,9 +1611,11 @@ def _corroboration(
 
     Returns ``(title_corroborated, primary_audio_english)``. Probed only when
     the score falls in the band that rescue covers, or when *needed* (a rescue
-    that leaves more than a tenth of the picture uncovered, or a line past
-    PAL/NTSC's band that only the steep-drift rescue can take), so ordinary
-    alignments pay for no extra ffprobe; logged so the decision can be audited.
+    that leaves more than a tenth of the picture uncovered, a line past
+    PAL/NTSC's band that only the steep-drift rescue can take, or a recording
+    the engine measured in sync that only the measured-sync rescue can take),
+    so ordinary alignments pay for no extra ffprobe; logged so the decision can
+    be audited.
     The donor's name must give the episode's title EXACTLY; *series_title*
     only lets a name that repeats the show's own ("Family Guy - Baking Bad")
     be read by the rest. Sonarr titles a two-parter's episodes "(1)" and "(2)",
@@ -1770,9 +1822,15 @@ def _align_and_keep(
         score < config.min_score
         and _DRIFT_RATE_MAX < abs(described_rate) <= _UNREPLACED_RATE_PCT
     )
+    # The engine's own sync measurement (describealign >= 2.3.0); a recording it
+    # measures in sync is rescued only on the donor's name and language, so they
+    # are read for it too.
+    measured = sync_check(report)
+    measured_band = score < config.min_score and _measured_sync_holds(measured)
     title_corroborated, primary_english = _corroboration(
         video_path, audio_path, episode_title, score, series_title,
-        aligned_english=result.aligned_english, needed=corroboration_needed or steep_band,
+        aligned_english=result.aligned_english,
+        needed=corroboration_needed or steep_band or measured_band,
     )
 
     # similarity is describealaign's match-confidence metric: the fraction of
@@ -1798,12 +1856,13 @@ def _align_and_keep(
         piecewise_fraction=piecewise,
         title_corroborated=title_corroborated,
         primary_audio_english=primary_english,
+        measured_sync=measured,
     )
     # What the gate read, for the history. None where it never asked: the
     # corroboration probe runs only in its score band, when a rescue needs it,
     # or for a steep-rate line, and the track's language is looked at only once
     # the title agrees.
-    probed = _corroboration_probed(score, corroboration_needed or steep_band)
+    probed = _corroboration_probed(score, corroboration_needed or steep_band or measured_band)
     gate = {
         "piecewise": piecewise,
         "sync_ok": described_sync_ok,
@@ -1812,6 +1871,15 @@ def _align_and_keep(
         "english_track": primary_english if probed and title_corroborated else None,
         "uncovered": unreached,
         "longest_gap": (longest[1] - longest[0]) if longest is not None else 0.0,
+        # The engine's measurement of the map it rendered (None before 2.3.0, or
+        # unreadable); "passthrough" says it was the recording muxed untouched.
+        "sync_confirmed": measured["confirmed_pct"] if measured else None,
+        "sync_within": measured["within_pct"] if measured else None,
+        "sync_over": measured["over_pct"] if measured else None,
+        "sync_anchored": measured["anchored_pct"] if measured else None,
+        "passthrough": measured["passthrough"] if measured else None,
+        "refined_bent": measured["bent"] if measured else None,
+        "refined_max_ms": measured["max_correction_ms"] if measured else None,
     }
     # With the length unread the picture is at least the map's extent, so the
     # line is drawn there too (a note is not required: holes make none).

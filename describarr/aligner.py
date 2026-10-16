@@ -21,6 +21,7 @@ import functools
 import importlib.metadata
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -465,6 +466,54 @@ def engine_version() -> Optional[str]:
         return importlib.metadata.version("describealaign")
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+# The three figures the measured-sync rescue is judged on (describealign >= 2.3.0).
+_SYNC_CHECK_FIELDS = ("confirmed_pct", "within_pct", "over_pct")
+
+
+def _finite_number(value) -> Optional[float]:
+    """*value* as a float when it is a real, finite number (not a bool, a string
+    or NaN), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def sync_check(report: Optional[Path]) -> Optional[dict]:
+    """
+    The engine's own measurement of the map it rendered (describealign 2.3.0's
+    pass 3): how much of the whole video it confirmed within 40 ms
+    (``confirmed_pct``), and of its anchors the share within 40 ms
+    (``within_pct``) and over 120 ms (``over_pct``). Also, for the history only,
+    ``anchored_pct``, whether the recording was muxed untouched (``passthrough``)
+    and what pass 3 bent (``bent``, ``max_correction_ms``).
+
+    None when the report has no measurement, or when any of the three figures is
+    missing, not a number, not finite or outside 0-100: a measurement that cannot
+    be read accepts nothing.
+    """
+    metrics = _read_metrics(report)
+    if not isinstance(metrics, dict):
+        return None
+    check = metrics.get("sync_check")
+    if not isinstance(check, dict):
+        return None
+    measured: dict = {}
+    for field in _SYNC_CHECK_FIELDS:
+        value = _finite_number(check.get(field))
+        if value is None or not 0. <= value <= 100.:
+            return None
+        measured[field] = value
+    measured["anchored_pct"] = _finite_number(check.get("anchored_pct"))
+    passthrough = metrics.get("passthrough")
+    measured["passthrough"] = passthrough if isinstance(passthrough, bool) else None
+    refinement = metrics.get("refinement")
+    refinement = refinement if isinstance(refinement, dict) else {}
+    bent = refinement.get("bent")
+    measured["bent"] = bent if isinstance(bent, int) and not isinstance(bent, bool) else None
+    measured["max_correction_ms"] = _finite_number(refinement.get("max_correction_ms"))
+    return measured
 
 
 def _segment_duration(seg: dict) -> float:
