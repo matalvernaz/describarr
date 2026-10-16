@@ -1494,7 +1494,8 @@ def _corroboration(
 
     Returns ``(title_corroborated, primary_audio_english)``. Probed only when
     the score falls in the band that rescue covers, or when *needed* (a rescue
-    that leaves more than a tenth of the picture uncovered), so ordinary
+    that leaves more than a tenth of the picture uncovered, or a line past
+    PAL/NTSC's band that only the steep-drift rescue can take), so ordinary
     alignments pay for no extra ffprobe; logged so the decision can be audited.
     The donor's name must give the episode's title EXACTLY; *series_title*
     only lets a name that repeats the show's own ("Family Guy - Baking Bad")
@@ -1732,8 +1733,9 @@ def _align_and_keep(
         primary_audio_english=primary_english,
     )
     # What the gate read, for the history. None where it never asked: the
-    # corroboration probe runs only in its score band (or when a rescue needs
-    # it), and the track's language is looked at only once the title agrees.
+    # corroboration probe runs only in its score band, when a rescue needs it,
+    # or for a steep-rate line, and the track's language is looked at only once
+    # the title agrees.
     probed = _corroboration_probed(score, corroboration_needed or steep_band)
     gate = {
         "piecewise": piecewise,
