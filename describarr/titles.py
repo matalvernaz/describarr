@@ -136,6 +136,11 @@ def donor_episode_title(name: str) -> str:
 
 
 def _normalise(title: str) -> str:
+    # "&" is the word "and", not punctuation: AudioVault writes "Phineas & Ferb
+    # - ..." where Sonarr writes "Phineas and Ferb" (2026-10-16), and a title can
+    # be written either way. Read before the punctuation below is dropped, so
+    # "Rock&Roll" keeps its word boundaries.
+    title = title.replace("&", " and ")
     folded = unicodedata.normalize("NFKD", title)
     folded = "".join(c for c in folded if not unicodedata.combining(c)).casefold()
     folded = re.sub(r"['’`]", "", folded)
