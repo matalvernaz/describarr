@@ -157,6 +157,24 @@ def _no_english_reason(languages: list[str]) -> NoEnglishAudio:
     return NoEnglishAudio(f"this copy has no English audio, only {spoken}")
 
 
+class _Scored(str):
+    """A refusal the gate measured, carrying the similarity it measured.
+
+    Only a recording that was aligned and judged on its content has one; a
+    refusal from the engine itself (a mismatch, a duration far from the
+    video's) and every error carry none. The candidate walk reads it straight
+    off the returned reason (see `_WalkReasons`), so a score is evidence that
+    this episode's own recording matched.
+    """
+
+    score: float
+
+    def __new__(cls, detail: str, score: float) -> "_Scored":
+        scored = super().__new__(cls, detail)
+        scored.score = score
+        return scored
+
+
 class Refusal(str):
     """A refusal's reason, carrying where every refused recording came from.
 
@@ -211,8 +229,16 @@ class _WalkReasons:
     def __init__(self) -> None:
         self.first_refused = None
         self.last = None
+        # The best similarity any of the episode's own recordings scored, and
+        # which recording: the neighbour search is for recordings that held
+        # something else, not for one that matched (see process_episode).
+        self.best_score = None
+        self.best_donor = ""
 
-    def add(self, reason) -> None:
+    def add(self, reason, donor: str = "") -> None:
+        score = getattr(reason, "score", None)
+        if isinstance(score, (int, float)) and (self.best_score is None or score > self.best_score):
+            self.best_score, self.best_donor = score, donor
         self.last = reason
         if self.first_refused is None and reason is not None and not isinstance(reason, EngineFailure):
             self.first_refused = reason
@@ -418,7 +444,7 @@ def process_episode(
                     for ep in all_episodes:
                         _mark_episode_done(zip_cache_dir, season, ep, extract_dir, zip_path)
                     return True, reason
-                reasons.add(reason)
+                reasons.add(reason, audio_path.name)
                 if not isinstance(reason, EngineFailure):
                     refused_from.append(_AUDIOVAULT_LABEL)
             logger.info("Candidate %r below threshold — trying next.", candidate["name"])
@@ -462,7 +488,7 @@ def process_episode(
                         for ep in all_episodes:
                             _mark_episode_done(zip_cache_dir, season, ep)
                         return True, reason
-                    reasons.add(reason)
+                    reasons.add(reason, audio_path.name)
                     if not isinstance(reason, EngineFailure):
                         refused_from.append(_source_label(source))
             finally:
@@ -473,7 +499,12 @@ def process_episode(
         # a neighbouring number, with a title that names another episode too.
         # Only a single-episode file, only packs already on disk, nearest
         # numbers first, and the same gate for each.
-        if len(all_episodes) == 1 and refused_from:
+        own_matched = (reasons.best_score is not None
+                       and reasons.best_score >= _NEIGHBOUR_MAX_OWN_SCORE)
+        if len(all_episodes) == 1 and refused_from and own_matched:
+            logger.info("%s: its own recording %s matched at %.1f%%; not trying recordings filed "
+                        "near it.", label, reasons.best_donor, reasons.best_score)
+        elif len(all_episodes) == 1 and refused_from:
             for zip_path, extract_dir in visited_packs:
                 try:
                     nearby = neighbour_donors(zip_path, extract_dir, episode)
@@ -610,7 +641,7 @@ def process_movie(
                                                 source=_AUDIOVAULT_LABEL)
             if published:
                 return True, reason
-            reasons.add(reason)
+            reasons.add(reason, audio_path.name)
             if not isinstance(reason, EngineFailure):
                 refused_from.append(_AUDIOVAULT_LABEL)
             logger.info("Candidate %r below threshold — trying next.", candidate["name"])
@@ -630,7 +661,7 @@ def process_movie(
                                                         source=_source_label(source))
                     if published:
                         return True, reason
-                    reasons.add(reason)
+                    reasons.add(reason, audio_path.name)
                     if not isinstance(reason, EngineFailure):
                         refused_from.append(_source_label(source))
             finally:
@@ -684,6 +715,13 @@ _MIXED_RATE_MIN_COVERAGE = 99.0
 # filename names this episode, and the aligned (first) audio track is English.
 # 20 % is describealaign's own "mismatched" line; nothing below it is rescued.
 _CORROBORATED_MIN_SCORE = 20.0
+# An own recording that scores at least this matched the episode, so the
+# neighbour search (for a catalogue that filed the episode under another
+# number) is not run. Like the line above it mirrors describealign's own
+# "likely mismatched" 20 %, but it is a separate decision and tuned apart:
+# measured 2026-10-16, other episodes' recordings scored at most 8.6 % (or the
+# engine refused the pair outright), an episode's own at least 19.7 %.
+_NEIGHBOUR_MAX_OWN_SCORE = 20.0
 # One title-card seam is not a broken line: SVU's LivingAudio recordings run
 # straight at 0.00 % but for a 31 s stretch at +3-5 % where the opening titles
 # differ, 98.7-98.8 % of a 43-minute episode (2026-10-10). Two per cent is one
@@ -1809,7 +1847,7 @@ def _align_and_keep(
             described_trunk=described_trunk, described_rate=described_rate,
             context={**context, **gate},
         )
-        return False, decision_detail
+        return False, _Scored(decision_detail, score)
     logger.info("Accepting %s via %s path — %s", video_path.name, accept_path, decision_detail)
     if note:
         logger.warning("%s: %s", video_path.name, note)

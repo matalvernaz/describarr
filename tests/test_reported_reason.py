@@ -180,12 +180,18 @@ def test_a_refusal_is_not_remembered_as_nothing_out_there(tmp_path, monkeypatch)
         def push(self, item):
             pushed.append(item)
 
+    misses = []
+    monkeypatch.setattr(srv.NoMatchCache, "record_miss", lambda self, key, video_path: misses.append(key))
     srv._worker_handle_retry_episode({"title": "Show", "path": str(video), "season": 1, "episode": 1},
                                      config, Pending())
-    nomatch = config.cache_dir / "shows" / srv._safe_dirname("Show") / srv._NOMATCH_FILENAME
     assert outcomes == ["no_match"]
-    assert not nomatch.exists() or "S01E01" not in nomatch.read_text()
+    assert misses == []
     assert not srv._get_retry_queue(config).load() and not pushed
+    # The control: a walk that found nothing at all IS remembered, so the hook above is live.
+    monkeypatch.setattr(srv, "process_episode", lambda *a, **k: (False, None))
+    srv._worker_handle_retry_episode({"title": "Show", "path": str(video), "season": 1, "episode": 1},
+                                     config, Pending())
+    assert misses == [srv.NoMatchCache.key(1, 1)]
 
 
 # ── AudioVault's "[US]" ──────────────────────────────────────────────────────
