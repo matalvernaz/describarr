@@ -201,6 +201,8 @@ All paths must be paths *inside the describarr container*, which are the same as
 
 For TV, `year` is the year the series began and is what keeps a show apart from a same-titled reboot in the catalogue (`Season 1 (2005)` vs `Season 1 (2024)`). It is read from the series folder suffix (`Archer (2009)`), then from a Sonarr-style filename (`Show (2005) - S01E01 - …`), then from a `tvshow.nfo` in the series folder. If none of those carries it, the log says so — pass `year=` to pin it.
 
+An episode's **title** matters too: the recording named for the episode is tried first, and a recording whose timing is perfect but whose similarity is low (20–30 %) can still be accepted when its file name gives the episode's title exactly. Sonarr's hook sends the title with every import; a retry has to find it. With `SONARR_URL` and `SONARR_API_KEY` set (e.g. `http://sonarr:8989` and the key from Sonarr's Settings → General), a retry asks Sonarr which episode the file is: the series whose folder holds it, the episode file Sonarr has by that name, and the episodes Sonarr maps to that file. Sonarr's answer is used only when it is unambiguous and Sonarr numbers the file as the retry searches it, so a release numbered differently from Sonarr (one episode behind TVDB, say), a special in season 0 or an absolute-numbered show gets no title from Sonarr. Without Sonarr, or when it cannot say, the title comes from a media server's `.nfo` beside the file, then from the release name. A Sonarr that cannot be reached is left alone for ten minutes at a time, and its API key is never logged.
+
 ### Single TV episode
 
 ```

@@ -68,6 +68,7 @@ from .matcher import (
     whole_recording_stem,
 )
 from .retry_queue import RetryQueue
+from .sonarr import episode_title as sonarr_episode_title
 from .sources import episode_candidates_from, load_extra_sources
 from .titles import (
     donor_names_episode,
@@ -298,11 +299,14 @@ def process_episode(
         ep_label = "".join(f"E{e:02d}" for e in all_episodes)
         logger.info("Looking up: %s S%02d%s (multi-episode)", series_title, season, ep_label)
 
-    # Sonarr's title first, then the media server's .nfo (a release named
-    # "Family Guy S12E14 1080p WEB-DL AAC2.0 AVC-TrollHD" carries none, and a
-    # manual retry has no Sonarr title), then the release name's. A
-    # multi-episode file's .nfo holds several titles, so it is not read.
+    # Sonarr's title first: handed in by its hook, or for a retry, asked of
+    # Sonarr (see `sonarr`; it answers only when sure). Then the media server's
+    # .nfo (a release named "Family Guy S12E14 1080p WEB-DL AAC2.0 AVC-TrollHD"
+    # carries none), then the release name's. A multi-episode file's .nfo holds
+    # several titles, so it is not read.
     title, title_from = episode_title, "Sonarr"
+    if not title:
+        title, title_from = sonarr_episode_title(video_path, season, episode), "Sonarr's records"
     if not title and len(all_episodes) == 1:
         title, title_from = episode_title_from_nfo(video_path, season, episode), "its .nfo"
     if not title:
