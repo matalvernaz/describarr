@@ -632,6 +632,14 @@ _RESCUE_MIN_RUNTIME_SEC = 300.0
 _NATIVE_RATE_TOLERANCE = 0.5      # |median_rate| ≤ this ⇒ native-rate (commercial-seam) rescue
 _DRIFT_RATE_MIN = 2.0             # PAL/NTSC rate conversion is ~4.27%
 _DRIFT_RATE_MAX = 6.0             # anything past this is not a standard rate shift → reject
+# Steep-drift rescue: a recording that runs past any standard rate conversion,
+# 7-9 % on a Phineas and Ferb pack (2026-10-15), on one straight line. Its band
+# is (_DRIFT_RATE_MAX, _UNREPLACED_RATE_PCT]: the top is describealaign's own
+# replace limit (MAX_RATE_RATIO_DIFF_ALIGN), past which the engine never
+# replaces a segment, so a steeper recording could only leave the picture
+# undescribed. The line proves the timing; the content is proved as the
+# corroborated rescue proves it, by the donor naming this episode on an
+# English track.
 
 # Mixed-rate rescue: per-act broadcast time compression (see
 # aligner.piecewise_rate_fraction). Same score and runtime floors as the drift
@@ -697,6 +705,10 @@ def _acceptance_decision(
       the aligned first audio track is English (*primary_audio_english*). A
       straight line proves the timing is uniform, not that the content is
       right; those two independent checks are what make it right.
+    * ``steep-drift-rescue`` — the drift rescue's floors over a uniform rate
+      past PAL/NTSC's band and within the engine's replace limit (more than
+      6 %, at most 10 %), with the corroborated rescue's two content checks
+      and its coverage floor.
     """
     if score >= min_score:
         return True, "similarity", f"similarity {score:.1f}% ≥ {min_score:.0f}% (sync confident)"
@@ -717,6 +729,23 @@ def _acceptance_decision(
             f"similarity {score:.1f}% below {min_score:.0f}% but stable trunk "
             f"{stable_fraction:.1f}% at median rate {median_rate:.2f}% with a passing "
             f"sync-quality check — accepting consistent-drift alignment"
+        )
+    if (
+        score >= _RESCUE_MIN_SCORE
+        and sync_ok
+        and stable_fraction >= _RESCUE_MIN_STABLE_FRACTION
+        and total_runtime >= _RESCUE_MIN_RUNTIME_SEC
+        and content_coverage >= _CORROBORATED_MIN_COVERAGE
+        and _DRIFT_RATE_MAX < abs(median_rate) <= _UNREPLACED_RATE_PCT
+        and title_corroborated
+        and primary_audio_english
+    ):
+        return True, "steep-drift-rescue", (
+            f"similarity {score:.1f}% below {min_score:.0f}% but stable trunk "
+            f"{stable_fraction:.1f}% runs at a uniform {median_rate:.2f}%, past PAL/NTSC's "
+            f"{_DRIFT_RATE_MIN:.0f}-{_DRIFT_RATE_MAX:.0f}% and within the engine's "
+            f"{_UNREPLACED_RATE_PCT:.0f}%; the donor names this episode and the aligned "
+            f"track is English — accepting"
         )
     if (
         score >= _RESCUE_MIN_SCORE
@@ -1666,9 +1695,16 @@ def _align_and_keep(
         score < config.min_score and runtime > 0 and not stretch_too_long
         and unreached > _RESCUE_UNCORROBORATED_MAX_UNCOVERED * runtime
     )
+    # A line past PAL/NTSC's band is rescued only on the donor's name and
+    # language (see _acceptance_decision), so they are read for it whatever
+    # the score; kept apart from the flag above, which a long stretch clears.
+    steep_band = (
+        score < config.min_score
+        and _DRIFT_RATE_MAX < abs(described_rate) <= _UNREPLACED_RATE_PCT
+    )
     title_corroborated, primary_english = _corroboration(
         video_path, audio_path, episode_title, score, series_title,
-        aligned_english=result.aligned_english, needed=corroboration_needed,
+        aligned_english=result.aligned_english, needed=corroboration_needed or steep_band,
     )
 
     # similarity is describealaign's match-confidence metric: the fraction of
@@ -1698,7 +1734,7 @@ def _align_and_keep(
     # What the gate read, for the history. None where it never asked: the
     # corroboration probe runs only in its score band (or when a rescue needs
     # it), and the track's language is looked at only once the title agrees.
-    probed = _corroboration_probed(score, corroboration_needed)
+    probed = _corroboration_probed(score, corroboration_needed or steep_band)
     gate = {
         "piecewise": piecewise,
         "sync_ok": described_sync_ok,
