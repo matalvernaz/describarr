@@ -1,4 +1,4 @@
-"""A recording that runs 6-10 % off speed on one straight line, named for the episode.
+"""A recording that runs past 6 % off speed on one straight line, named for the episode.
 
 Phineas and Ferb season 1 (2026-10-15): AudioVault's recordings come at two
 speeds, the PAL 4.27 % and a second batch at 7.2-9.2 %. Above the 60 % floor
@@ -7,8 +7,9 @@ of them (S01E02 at 8.52 %, S01E16 at 8.65 %) in sync. Six more, each the
 recording named for the episode, sat on one straight line just under the floor
 and were refused, because the drift rescue trusts only native speed or 2-6 %.
 These pin the narrow rescue for them: a straight line up to the engine's own
-10 % replace limit, and only when the donor names the episode on an English
-track, the corroborated rescue's two checks of content.
+replace limit (the recording within 10 % of the video's length: +11.11 % or
+-9.09 % in a report's rate), and only when the donor names the episode on an
+English track, the corroborated rescue's two checks of content.
 """
 
 import json
@@ -72,12 +73,15 @@ def test_anything_less_than_a_clean_line_stays_refused(change, why):
 @pytest.mark.parametrize("rate, path", [
     (6.0, "drift-rescue"),            # PAL/NTSC's band still ends at 6 %, inclusive
     (6.01, "steep-drift-rescue"),
-    (10.0, "steep-drift-rescue"),     # the engine replaces up to 10 %, inclusive
-    (10.01, "reject"),                # past it the engine replaces nothing
-    (-8.52, "steep-drift-rescue"),    # a slower recording reads the same
+    (10.0, "steep-drift-rescue"),
+    (10.01, "steep-drift-rescue"),    # the engine replaces up to +11.11 % (P&F S01E07 runs at 10.29 %)
+    (11.11, "steep-drift-rescue"),
+    (11.12, "reject"),                # past it the engine replaces nothing (audio/video 0.899928)
+    (-8.52, "steep-drift-rescue"),    # a slower recording: the engine stops at -9.09 %
+    (-9.5, "reject"),
     (-10.01, "reject"),
 ])
-def test_the_band_is_past_six_up_to_ten(rate, path):
+def test_the_band_is_past_six_up_to_the_engines_limit(rate, path):
     assert _decide(57.3, 100.0, 100.0, rate)[1] == path
 
 

@@ -29,7 +29,7 @@ from typing import Optional
 import requests
 
 from .aligner import (
-    _UNREPLACED_RATE_PCT,
+    engine_replaces_rate,
     _read_metrics,
     OUTPUT_VALIDATION_FAILED,
     EngineFailure,
@@ -695,12 +695,19 @@ _DRIFT_RATE_MIN = 2.0             # PAL/NTSC rate conversion is ~4.27%
 _DRIFT_RATE_MAX = 6.0             # anything past this is not a standard rate shift → reject
 # Steep-drift rescue: a recording that runs past any standard rate conversion,
 # 7-9 % on a Phineas and Ferb pack (2026-10-15), on one straight line. Its band
-# is (_DRIFT_RATE_MAX, _UNREPLACED_RATE_PCT]: the top is describealaign's own
-# replace limit (MAX_RATE_RATIO_DIFF_ALIGN), past which the engine never
-# replaces a segment, so a steeper recording could only leave the picture
-# undescribed. The line proves the timing; the content is proved as the
-# corroborated rescue proves it, by the donor naming this episode on an
-# English track.
+# runs from _DRIFT_RATE_MAX to describealaign's own replace limit (see
+# aligner.engine_replaces_rate: -9.09 % to +11.11 % in a report's rate), past
+# which the engine never replaces a segment, so a steeper recording could only
+# leave the picture undescribed. The line proves the timing; the content is
+# proved as the corroborated rescue proves it, by the donor naming this
+# episode on an English track.
+
+
+def _steep_band(rate_pct: float) -> bool:
+    """A uniform rate past PAL/NTSC's band that the engine still replaces: the
+    steep-drift rescue's band. The gate and the probe for its content checks
+    both ask this one function."""
+    return abs(rate_pct) > _DRIFT_RATE_MAX and engine_replaces_rate(rate_pct)
 
 # Mixed-rate rescue: per-act broadcast time compression (see
 # aligner.piecewise_rate_fraction). Same score and runtime floors as the drift
@@ -804,8 +811,8 @@ def _acceptance_decision(
       right; those two independent checks are what make it right.
     * ``steep-drift-rescue`` — the drift rescue's floors over a uniform rate
       past PAL/NTSC's band and within the engine's replace limit (more than
-      6 %, at most 10 %), with the corroborated rescue's two content checks
-      and its coverage floor.
+      6 % either way, up to +11.11 % or down to -9.09 %), with the corroborated
+      rescue's two content checks and its coverage floor.
     * ``measured-sync`` — whatever the map's shape, the engine's own
       measurement (*measured_sync*, from :func:`aligner.sync_check`) clears
       :func:`_measured_sync_holds`, over the rescues' runtime floor and the
@@ -839,16 +846,15 @@ def _acceptance_decision(
         and stable_fraction >= _RESCUE_MIN_STABLE_FRACTION
         and total_runtime >= _RESCUE_MIN_RUNTIME_SEC
         and content_coverage >= _CORROBORATED_MIN_COVERAGE
-        and _DRIFT_RATE_MAX < abs(median_rate) <= _UNREPLACED_RATE_PCT
+        and _steep_band(median_rate)
         and title_corroborated
         and primary_audio_english
     ):
         return True, "steep-drift-rescue", (
             f"similarity {score:.1f}% below {min_score:.0f}% but stable trunk "
             f"{stable_fraction:.1f}% runs at a uniform {median_rate:.2f}%, past PAL/NTSC's "
-            f"{_DRIFT_RATE_MIN:.0f}-{_DRIFT_RATE_MAX:.0f}% and within the engine's "
-            f"{_UNREPLACED_RATE_PCT:.0f}%; the donor names this episode and the aligned "
-            f"track is English — accepting"
+            f"{_DRIFT_RATE_MIN:.0f}-{_DRIFT_RATE_MAX:.0f}% and within the engine's replace "
+            f"limit; the donor names this episode and the aligned track is English — accepting"
         )
     if (
         score >= _RESCUE_MIN_SCORE
@@ -935,7 +941,8 @@ _UNDESCRIBED_SPANS_SHOWN = 3
 def _uncovered_stretches(report, runtime: float) -> list[tuple[float, float]]:
     """The stretches of a *runtime*-second picture no replaced segment covers.
 
-    The complement of the replaced intervals (|rate| ≤ 10 %), so a hole the
+    The complement of the replaced intervals (segments at a rate the engine
+    replaces, :func:`aligner.engine_replaces_rate`), so a hole the
     engine left between two segments counts as much as an unreplaced segment
     or an uncovered end (roundtable thread 349, 2026-10-11); adjacent pieces
     merge into one stretch. ``(start, end)`` pairs in picture order.
@@ -944,7 +951,7 @@ def _uncovered_stretches(report, runtime: float) -> list[tuple[float, float]]:
     covered = sorted(
         (float(seg["video_start_sec"]), float(seg["video_end_sec"]))
         for seg in metrics.get("segments", [])
-        if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT
+        if engine_replaces_rate(seg.get("rate_pct", 0.0))
         and seg["video_end_sec"] > seg["video_start_sec"]
     )
     stretches: list[tuple[float, float]] = []
@@ -1818,10 +1825,7 @@ def _align_and_keep(
     # A line past PAL/NTSC's band is rescued only on the donor's name and
     # language (see _acceptance_decision), so they are read for it whatever
     # the score; kept apart from the flag above, which a long stretch clears.
-    steep_band = (
-        score < config.min_score
-        and _DRIFT_RATE_MAX < abs(described_rate) <= _UNREPLACED_RATE_PCT
-    )
+    steep_band = score < config.min_score and _steep_band(described_rate)
     # The engine's own sync measurement (describealign >= 2.3.0); a recording it
     # measures in sync is rescued only on the donor's name and language, so they
     # are read for it too.

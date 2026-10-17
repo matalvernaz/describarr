@@ -567,12 +567,12 @@ def content_score(report: Optional[Path]) -> float:
 
 
 def _map_segments(metrics: dict, described_only: bool) -> list[dict]:
-    """The map's segments with a video span; with *described_only*, those the
-    engine replaces (|rate| ≤ 10 %), which is where the description lands."""
+    """The map's segments with a video span; with *described_only*, those at a
+    rate the engine replaces (:func:`engine_replaces_rate`), which is where the
+    description lands."""
     segments = [seg for seg in metrics.get("segments", []) if _segment_duration(seg) > 0]
     if described_only:
-        segments = [seg for seg in segments
-                    if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT]
+        segments = [seg for seg in segments if engine_replaces_rate(seg.get("rate_pct", 0.0))]
     return segments
 
 
@@ -637,10 +637,27 @@ def slope_stability(
     return median_rate, fraction, total_dur
 
 
-# Mirrors describealaign's MAX_RATE_RATIO_DIFF_ALIGN (0.1): a segment whose
-# video/audio rate differs from unity by more than this is never replaced by
-# the engine — the video keeps its original soundtrack there.
-_UNREPLACED_RATE_PCT = 10.0
+# describealaign's MAX_RATE_RATIO_DIFF_ALIGN: the engine replaces a segment
+# only when the recording's length over the video's, audio/video, is within
+# this of 1. A report gives each segment's rate the other way up, rate_pct =
+# (video/audio - 1) * 100, so the band is not +-10 % but -9.09 % to +11.11 %
+# (Phineas and Ferb S01E07's recording runs at +10.29 % and the engine
+# replaced all of it, 2026-10-17, while the old +-10 % here called it
+# undescribed). A JSON report's rate carries full precision, so the test is
+# the engine's own limit, with no margin: a margin would credit segments the
+# engine did not replace.
+ENGINE_MAX_RATE_RATIO_DIFF = 0.1
+
+
+def engine_replaces_rate(rate_pct: float) -> bool:
+    """Whether a segment at *rate_pct* passes the engine's rate test for
+    replacing it with the recording. This is the engine's RATE criterion only:
+    the renderer also skips segments under 2 s that it does not fill, which a
+    report's segments cannot always show."""
+    if rate_pct <= -100.:
+        return False
+    audio_over_video = 1. / (1. + rate_pct / 100.)
+    return abs(1. - audio_over_video) <= ENGINE_MAX_RATE_RATIO_DIFF
 
 
 def undescribed_seconds(report: Optional[Path]) -> tuple[float, float]:
@@ -649,7 +666,7 @@ def undescribed_seconds(report: Optional[Path]) -> tuple[float, float]:
     narration it threw away.
 
     Returns ``(undescribed_video_sec, dropped_audio_sec)``. Both come from the
-    segments the engine does not replace (|rate| > 10 %): the video span of
+    segments at a rate the engine does not replace (:func:`engine_replaces_rate`): the video span of
     such a segment plays the original soundtrack with no description, and any
     audio span inside it is description that was never placed. Near zero for
     a same-cut source; tens of seconds when the video is a longer cut than
@@ -662,7 +679,7 @@ def undescribed_seconds(report: Optional[Path]) -> tuple[float, float]:
     undescribed = 0.0
     dropped = 0.0
     for seg in metrics.get("segments", []):
-        if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT:
+        if engine_replaces_rate(seg.get("rate_pct", 0.0)):
             continue
         undescribed += max(0.0, _segment_duration(seg))
         dropped += max(0.0, seg.get("audio_end_sec", 0.0) - seg.get("audio_start_sec", 0.0))
@@ -685,7 +702,7 @@ def undescribed_spans(report: Optional[Path]) -> list[tuple[float, float]]:
         return []
     spans: list[tuple[float, float]] = []
     for seg in metrics.get("segments", []):
-        if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT:
+        if engine_replaces_rate(seg.get("rate_pct", 0.0)):
             continue
         start, end = float(seg["video_start_sec"]), float(seg["video_end_sec"])
         if end <= start:
@@ -705,7 +722,8 @@ _CREDITS_ALLOWANCE_FRACTION = 0.10
 
 
 def described_seconds(report: Optional[Path]) -> float:
-    """Video time the engine replaced with the recording: the segments within ±10 %.
+    """Video time the engine replaced with the recording: the segments at a
+    rate it replaces (:func:`engine_replaces_rate`).
 
     Everything else in the picture, unreplaced segments, holes between
     segments, and whatever lies before the first or after the last, plays
@@ -716,7 +734,7 @@ def described_seconds(report: Optional[Path]) -> float:
         return 0.0
     return sum(
         max(0.0, _segment_duration(seg)) for seg in metrics.get("segments", [])
-        if abs(seg.get("rate_pct", 0.0)) <= _UNREPLACED_RATE_PCT
+        if engine_replaces_rate(seg.get("rate_pct", 0.0))
     )
 
 
