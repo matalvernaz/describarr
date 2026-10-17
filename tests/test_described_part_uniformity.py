@@ -12,7 +12,7 @@ S01E01-E02) had the same shape with less extra footage: replaced-only trunk
 100 %, all-segments 92.8 % and 94.9 %.
 
 So the rescue now measures the trunk, the rate and the sync check over the
-replaced segments alone (|rate| <= 10 %), and the undescribed gate keeps its
+replaced segments alone (at a rate the engine replaces), and the undescribed gate keeps its
 40 % line (20 % for a whole double). What that gate refuses stays refused:
 half a double, a clip show's scattered matches. What time compression breaks
 stays broken: SVU's AudioVault pack runs its acts at 2.8-4 %, varied, and
