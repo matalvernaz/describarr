@@ -149,8 +149,10 @@ def test_a_counter_left_after_the_clutter_names_nothing(donor):
 
 
 def test_a_release_may_drop_the_leading_article():
+    # For acceptance too since 2026-10-18: SVU's "A Misunderstanding" was refused
+    # against "17.12 Misunderstanding.mp3", measured in sync (test_title_article_part).
     assert titles_agree("Book of Joe", "The Book of Joe", fuzzy=True) is True
-    assert titles_agree("Book of Joe", "The Book of Joe") is False        # never for acceptance
+    assert titles_agree("Book of Joe", "The Book of Joe") is True
 
 
 # ── the title in Jellyfin's .nfo ─────────────────────────────────────────────
