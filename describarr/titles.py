@@ -94,6 +94,18 @@ _SIMILARITY_FLOOR = 0.9
 # "The Book of Joe" (matched against the folded form).
 _LEADING_ARTICLE_RE = re.compile(r"^(?:the|a|an) ")
 
+# A part number closing a folded title, however it was written: Sonarr's
+# "Closure (2)" folds to "closure 2", a catalogue's "Closure (Part 2)" or
+# "Closure, Pt. 2" to "closure part 2" / "closure pt 2". The spellings are
+# matcher._PART_SUFFIX_RE's; the number itself stays, so part 1 never reads as
+# part 2.
+_FOLDED_PART_RE = re.compile(r"\b(?:part|pt)\s*(\d+)$")
+
+# A part number glued on in CamelCase, "ClosurePart2" (AudioVault's SVU season
+# 2, 2026-10-17). Read from the unfolded name, where the capital marks the end
+# of the title, so "Counterpart2" stays one word.
+_GLUED_PART_RE = re.compile(r"(Part|Pt)\.?\s*(\d+)\s*$")
+
 
 def episode_title_from_filename(name: str) -> str:
     """The episode title in a release filename, or ``""`` when it has none.
@@ -150,28 +162,33 @@ def _normalise(title: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", folded).split())
 
 
+def _one_title(folded: str) -> str:
+    """A folded title less a leading article, with a closing part number bare."""
+    return _FOLDED_PART_RE.sub(r"\1", _LEADING_ARTICLE_RE.sub("", folded, count=1))
+
+
 def titles_agree(a: str, b: str, *, fuzzy: bool = False) -> bool | None:
     """Whether two episode titles name the same episode.
 
     ``None`` when either is unknown — absence of a title is not evidence
     either way. Otherwise True for the same words after folding case, accents
-    and punctuation. That exact form is what acceptance uses: "Pilot" and
-    "Pilots" are 0.91 alike and can be two episodes, so a near spelling must
-    never vouch for a low-scoring donor. *fuzzy* also accepts a near-identical
-    spelling with the same numbers, or the same words but for a leading
-    article; it is for choosing which file to align (the positional-fallback
-    guard, the title search), where agreement only decides what is tried,
-    never what is published.
+    and punctuation, but for a leading article and how a closing part number
+    is written ("A Misunderstanding" / "Misunderstanding", "Closure (2)" /
+    "Closure (Part 2)", SVU 2026-10-17). That exact form is what acceptance
+    uses: "Pilot" and "Pilots" are 0.91 alike and can be two episodes, so a
+    near spelling must never vouch for a low-scoring donor. *fuzzy* also
+    accepts a near-identical spelling with the same numbers; it is for
+    choosing which file to align (the positional-fallback guard, the title
+    search), where agreement only decides what is tried, never what is
+    published.
     """
     na, nb = _normalise(a or ""), _normalise(b or "")
     if not na or not nb:
         return None
-    if na == nb:
+    if na == nb or _one_title(na) == _one_title(nb):
         return True
     if not fuzzy or re.findall(r"\d+", na) != re.findall(r"\d+", nb):
         return False
-    if _LEADING_ARTICLE_RE.sub("", na) == _LEADING_ARTICLE_RE.sub("", nb):
-        return True
     return difflib.SequenceMatcher(None, na, nb).ratio() >= _SIMILARITY_FLOOR
 
 
@@ -210,7 +227,9 @@ def donor_title_readings(name: str, series_title: str = "") -> list[str]:
       reads "baking bad";
     * a bare track number: ``16 You Can't Handle the Booth.mp3`` also reads
       "you cant handle the booth", while ``[S12.E21] 3 Acts of God.mp3`` keeps
-      "3 Acts of God" as its literal reading.
+      "3 Acts of God" as its literal reading;
+    * a part number glued on: ``03 ClosurePart2.mp3`` also reads
+      "closure part 2".
     """
     literal = donor_episode_title(name)
     if not literal:
@@ -224,6 +243,12 @@ def donor_title_readings(name: str, series_title: str = "") -> list[str]:
     regionless = _REGION_SUFFIX_RE.sub("", literal, count=1)
     if regionless and regionless != literal:
         readings.append(regionless)
+    # A glued part number, spaced out before the loop below, so the spaced
+    # reading is stripped of a track number like the others.
+    for reading in list(readings):
+        spaced = _GLUED_PART_RE.sub(r" \1 \2", reading)
+        if spaced != reading and spaced not in readings:
+            readings.append(spaced)
     # The list grows while it is walked, so a name with both kinds of clutter
     # ("01 Family Guy - Pilot.mp3") is stripped of each in turn.
     for reading in readings:
