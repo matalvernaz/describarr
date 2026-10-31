@@ -1,11 +1,15 @@
 """
-Notifiers for describarr: Pushover for the operator, and a notifications hub for
-everyone who asked to hear about new descriptions.
+Notifiers for describarr: Pushover for the operator, a notifications hub for
+everyone who asked to hear about new descriptions, and a Jellyfin server that
+sends its own library notices to its users' phones.
 
 Reads PUSHOVER_TOKEN and PUSHOVER_USER from the environment. When unset, send()
 is a no-op so the server still works for users who haven't configured Pushover.
 The hub works the same way with NOTIFY_HUB_URL and NOTIFY_HUB_TOKEN: it takes
 ntfy's JSON form (topic, title, message, click), so an ntfy server fits there too.
+So does Jellyfin with JELLYFIN_URL and JELLYFIN_API_KEY: a server that sends
+library notices takes the described files' paths and one sentence at
+POST /Podcasts/Push/Described, and tells each person who asked and can see them.
 """
 
 from __future__ import annotations
@@ -26,6 +30,10 @@ _API_URL = "https://api.pushover.net/1/messages.json"
 # Pushover's limits on a title and a message, in characters.
 TITLE_LIMIT = 250
 MESSAGE_LIMIT = 1024
+
+# What Jellyfin's described route takes at once: files, and a sentence's characters.
+JELLYFIN_MOST_PATHS = 500
+JELLYFIN_SUMMARY_LIMIT = 600
 
 
 def _creds() -> tuple[str, str] | None:
@@ -116,3 +124,40 @@ def send_hub(category: str, title: str, message: str, click: str | None = None) 
     })
     return _deliver(request, "Notifications hub", retry_unsure=False)
 
+
+def _jellyfin() -> tuple[str, str] | None:
+    url = os.environ.get("JELLYFIN_URL", "").strip().rstrip("/")
+    key = os.environ.get("JELLYFIN_API_KEY", "").strip()
+    if not url or not key:
+        return None
+    return url, key
+
+
+def send_jellyfin_described(paths: list[str], summary: str) -> bool:
+    """Tell Jellyfin these files are described now, in one sentence, so it can
+    tell each of its users who asked and can see them. Logs and swallows any
+    failure; False when it is worth trying again (see `_deliver`).
+
+    A server that does not send library notices answers 404, and one that has
+    none of the files 400 with the reason: both are refused for good, never
+    retried. Only a request that never arrived is tried again, as for the hub:
+    a retry after a lost answer would tell everyone twice."""
+    server = _jellyfin()
+    if server is None or not paths:
+        return True
+    url, key = server
+    unique = list(dict.fromkeys(str(path) for path in paths))
+    if len(unique) > JELLYFIN_MOST_PATHS:
+        logger.warning("Jellyfin is told about the first %d of %d described files.",
+                       JELLYFIN_MOST_PATHS, len(unique))
+    data = json.dumps({
+        "Paths": unique[:JELLYFIN_MOST_PATHS],
+        "Summary": summary[:JELLYFIN_SUMMARY_LIMIT],
+    }).encode()
+    request = Request(f"{url}/Podcasts/Push/Described", data=data, headers={
+        "Content-Type": "application/json",
+        # The only form this server takes; it refuses ?api_key=.
+        "Authorization": f'MediaBrowser Token="{key}"',
+        "User-Agent": "describarr",
+    })
+    return _deliver(request, "Jellyfin", retry_unsure=False)

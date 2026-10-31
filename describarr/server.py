@@ -1310,7 +1310,8 @@ def _notify_outcome(
     held = _held_notifications(config)
     group = group or _notify_group(label)
     now = time.time()
-    if held.offer(group, label, outcome, message, now):
+    described_file = str(path) if path and outcome == "described" else None
+    if held.offer(group, label, outcome, message, now, path=described_file):
         unsent = Due(group, last=now)
         if not notify.send(f"describarr: {label}", message):
             unsent.operator, unsent.operator_since = [entry(label, outcome, message)], now
@@ -1318,7 +1319,10 @@ def _notify_outcome(
         if outcome == "described" and not notify.send_hub(
                 "described", "Audio description added", label):
             unsent.everyone, unsent.everyone_since = [label], now
-        if unsent.operator or unsent.everyone:
+        # And Jellyfin, which tells its own users who asked, finding the file by its path.
+        if described_file and not notify.send_jellyfin_described([described_file], label):
+            unsent.jellyfin, unsent.jellyfin_since = [{"label": label, "path": described_file}], now
+        if unsent.operator or unsent.everyone or unsent.jellyfin:
             held.put_back(unsent)
     _log_terminal_decision(config, label, outcome, reason, path=path)
     if path:
@@ -1361,8 +1365,22 @@ def _send_held_notifications(config: Config, now: Optional[float] = None) -> Non
                 logger.info("Told the hub about %d described for %s.",
                             len(set(due.everyone)), name)
                 due.everyone = []
-        if due.operator or due.everyone:
+        if due.jellyfin:
+            if _tell_jellyfin(due.group, due.jellyfin):
+                due.jellyfin = []
+        if due.operator or due.everyone or due.jellyfin:
             held.put_back(due)
+
+
+def _tell_jellyfin(group: str, items: list[dict]) -> bool:
+    """One group's described files, to Jellyfin, in the sentence the hub gets.
+    False when it is worth trying again."""
+    summary = _everyone_summary(group, [item["label"] for item in items])
+    if not notify.send_jellyfin_described([item["path"] for item in items], summary):
+        return False
+    logger.info("Told Jellyfin about %d described for %s.",
+                len({item["path"] for item in items}), group_name(group))
+    return True
 
 
 # A summary lists problems first, so one cut to Pushover's length keeps them;
@@ -1838,6 +1856,15 @@ def _tell_everyone_drained(config: Config, summary: dict | None) -> None:
         else:
             _held_notifications(config).put_back(
                 Due(group, everyone=group_labels, last=now, everyone_since=now))
+    # Jellyfin too, by each file's path, a message a show as for the hub.
+    items = (summary or {}).get("described_items") or []
+    by_group_items: dict[str, list[dict]] = {}
+    for item in items:
+        by_group_items.setdefault(_notify_group(item["label"]), []).append(item)
+    for group, group_items in by_group_items.items():
+        if not _tell_jellyfin(group, group_items):
+            _held_notifications(config).put_back(
+                Due(group, jellyfin=group_items, last=now, jellyfin_since=now))
 
 
 # How many described titles to name in the drain notification before
