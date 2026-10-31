@@ -54,6 +54,9 @@ def test_capped_season_defers_but_cached_seasons_drain(monkeypatch):
     # Summary drives the drain-completion notification.
     assert summary["described"] == 2
     assert set(summary["described_labels"]) == {"Show S02E01", "Show S02E02"}
+    # Each with its file, for Jellyfin, which finds things by path.
+    assert summary["described_items"] == [
+        {"label": "Show S02E01", "path": __file__}, {"label": "Show S02E02", "path": __file__}]
     assert summary["no_match"] == 0
     assert summary["abandoned"] == 0
     assert summary["deferred"] == 2

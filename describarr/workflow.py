@@ -2226,9 +2226,10 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
     flaky AudioVault response can't silently drop a Sonarr-queued episode;
     items that hit `_MAX_DRAIN_ATTEMPTS` consecutive failures are dropped.
 
-    Returns a summary dict (described / described_labels / no_match /
-    abandoned / deferred / remaining) for the caller to notify on, or None
-    if the queue was empty.
+    Returns a summary dict (described / described_labels / described_items /
+    no_match / abandoned / deferred / remaining) for the caller to notify on,
+    or None if the queue was empty. described_items pairs each described
+    label with its file's path.
     """
     items = queue.load()
     if not items:
@@ -2243,6 +2244,8 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
     # drain-summary notification (the per-item live-webhook path notifies
     # elsewhere; the bulk drain stays notify-agnostic itself).
     described_labels: list[str] = []
+    # Each described title with its file, for whoever finds things by path (Jellyfin).
+    described_items: list[dict] = []
     no_match = 0
     abandoned = 0
     for item in items:
@@ -2301,6 +2304,7 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
             # leaves the queue either way; we only tally which it was.
             if described:
                 described_labels.append(_queue_item_label(item))
+                described_items.append({"label": _queue_item_label(item), "path": str(video_path)})
             else:
                 no_match += 1
             # And keep it as the file's latest, so whoever asked can be told:
@@ -2388,6 +2392,7 @@ def drain_retry_queue(queue: RetryQueue, client: AudioVaultClient, config: Confi
     return {
         "described": len(described_labels),
         "described_labels": described_labels,
+        "described_items": described_items,
         "no_match": no_match,
         "abandoned": abandoned,
         "deferred": deferred,

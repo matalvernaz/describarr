@@ -20,6 +20,12 @@ services:
       # MAX_WAIT minutes during a long run (0: no limit). 0 = send each at once.
       - DESCRIBARR_NOTIFY_QUIET_MINUTES=${DESCRIBARR_NOTIFY_QUIET_MINUTES:-30}
       - DESCRIBARR_NOTIFY_MAX_WAIT_MINUTES=${DESCRIBARR_NOTIFY_MAX_WAIT_MINUTES:-120}
+      # Optional: a Jellyfin server that sends its own library notices (one with
+      # POST /Podcasts/Push/Described) is told what was described, by the files'
+      # paths as it sees them, when the hub would be. An API key from its
+      # Dashboard > API Keys. Unset = not told.
+      - JELLYFIN_URL=${JELLYFIN_URL:-}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
       # Optional: let a manual retry ask Sonarr for the episode's title (the
       # hook already sends it), e.g. http://sonarr:8989 and the key from
       # Sonarr's Settings > General. Unset = the .nfo and the file name only.

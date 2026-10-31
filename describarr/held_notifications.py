@@ -10,7 +10,10 @@ The first outcome for a show is still sent at once, so a single new episode is
 heard as soon as it is ready. What follows is held: the operator gets one
 summary when the show has gone quiet, or after a longer wait while a long run
 is still going; everyone else hears once the show goes quiet, since they asked
-what is new, not how a backfill is getting on. Films share one group.
+what is new, not how a backfill is getting on. Films share one group. Jellyfin,
+which tells its own users, hears when everyone does, with the files' paths; it
+is a part of its own, so that one of the two being down never holds up or
+repeats the other.
 
 Kept in the cache directory, so a restart does not lose what is held. A summary
 is taken out of the file before it is sent, never after, so it cannot be sent
@@ -43,6 +46,9 @@ EVERYONE_MAX_WAIT_SECONDS = 12 * 3600
 #: A summary that could not be sent is given up after this many tries, one
 #: per check: about an hour.
 RETRY_LIMIT = 120
+
+#: Who a group holds for: the operator, everyone through the hub, and Jellyfin.
+PARTS = ("operator", "everyone", "jellyfin")
 
 
 def show_group(title: str) -> str:
@@ -78,12 +84,16 @@ class Due:
     operator: list[dict] = field(default_factory=list)
     #: For everyone: the labels of what was described, in arrival order.
     everyone: list[str] = field(default_factory=list)
+    #: For Jellyfin: ``{"label", "path"}`` of what was described, in arrival order.
+    jellyfin: list[dict] = field(default_factory=list)
     # How things stood when these were taken, so they can be put back so.
     last: float = 0.0
     operator_since: float | None = None
     everyone_since: float | None = None
+    jellyfin_since: float | None = None
     operator_tries: int = 0
     everyone_tries: int = 0
+    jellyfin_tries: int = 0
 
 
 class HeldNotifications:
@@ -122,20 +132,20 @@ class HeldNotifications:
             return False
         return True
 
-    def offer(self, group: str, label: str, outcome: str, message: str, now: float) -> bool:
+    def offer(self, group: str, label: str, outcome: str, message: str, now: float,
+              path: str | None = None) -> bool:
         """Whether to send this outcome now. False means it is held for the
-        group's summary. Never holds what it could not write down."""
+        group's summary (and, when it was described and its file is known,
+        for Jellyfin's). Never holds what it could not write down."""
         if self._quiet <= 0:
             return True
         with _LOCK:
             state = self._load()
             held = state.get(group)
-            if held is None or (not held.get("operator") and not held.get("everyone")
-                                and now - held["last"] >= self._quiet):
+            if held is None or (not _holds_any(held) and now - held["last"] >= self._quiet):
                 # Nothing heard from this show lately: this one goes now and
                 # opens a window for whatever follows it.
-                state[group] = {"last": now, "operator": [], "operator_since": None,
-                                "everyone": [], "everyone_since": None}
+                state[group] = _empty(now)
                 send_now = True
             else:
                 held.setdefault("operator", []).append(entry(label, outcome, message))
@@ -145,6 +155,10 @@ class HeldNotifications:
                     held.setdefault("everyone", []).append(label)
                     if held.get("everyone_since") is None:
                         held["everyone_since"] = now
+                    if path:
+                        held.setdefault("jellyfin", []).append({"label": label, "path": str(path)})
+                        if held.get("jellyfin_since") is None:
+                            held["jellyfin_since"] = now
                 # A show that has already gone quiet has its summary due: this
                 # one joins it at the next check rather than holding it up for
                 # a window of its own.
@@ -174,17 +188,18 @@ class HeldNotifications:
                     due.operator_since = held.get("operator_since")
                     due.operator_tries = held.pop("operator_tries", 0)
                     held["operator"], held["operator_since"] = [], None
-                if held.get("everyone") and (
-                        quiet or held.get("everyone_tries")
-                        or _waited(held.get("everyone_since"), self._everyone_max_wait, now)):
-                    due.everyone = held["everyone"]
-                    due.everyone_since = held.get("everyone_since")
-                    due.everyone_tries = held.pop("everyone_tries", 0)
-                    held["everyone"], held["everyone_since"] = [], None
-                if due.operator or due.everyone:
+                for part in ("everyone", "jellyfin"):
+                    if held.get(part) and (
+                            quiet or held.get(f"{part}_tries")
+                            or _waited(held.get(f"{part}_since"), self._everyone_max_wait, now)):
+                        setattr(due, part, held[part])
+                        setattr(due, f"{part}_since", held.get(f"{part}_since"))
+                        setattr(due, f"{part}_tries", held.pop(f"{part}_tries", 0))
+                        held[part], held[f"{part}_since"] = [], None
+                if due.operator or due.everyone or due.jellyfin:
                     ready.append(due)
                     changed = True
-                if quiet and not held.get("operator") and not held.get("everyone"):
+                if quiet and not _holds_any(held):
                     del state[group]
                     changed = True
             if changed and not self._save(state):
@@ -201,10 +216,8 @@ class HeldNotifications:
         with _LOCK:
             state = self._load()
             created = due.group not in state
-            held = state.setdefault(due.group, {
-                "last": due.last, "operator": [], "operator_since": None,
-                "everyone": [], "everyone_since": None})
-            for part in ("operator", "everyone"):
+            held = state.setdefault(due.group, _empty(due.last))
+            for part in PARTS:
                 taken = getattr(due, part)
                 if not taken:
                     continue
@@ -218,7 +231,7 @@ class HeldNotifications:
                          if t is not None]
                 held[f"{part}_since"] = min(since) if since else due.last
                 held[f"{part}_tries"] = tries
-            if created and not held["operator"] and not held["everyone"]:
+            if created and not _holds_any(held):
                 del state[due.group]
             if not self._save(state):
                 logger.error("Lost the unsent notifications for %s.", group_name(due.group))
@@ -226,3 +239,17 @@ class HeldNotifications:
 
 def _waited(since: float | None, limit: float, now: float) -> bool:
     return limit > 0 and since is not None and now - since >= limit
+
+
+def _empty(last: float) -> dict:
+    """A group with nothing held, last heard from at *last*."""
+    held: dict = {"last": last}
+    for part in PARTS:
+        held[part], held[f"{part}_since"] = [], None
+    return held
+
+
+def _holds_any(held: dict) -> bool:
+    """Whether a group holds anything for anybody. A file from before Jellyfin
+    had a part simply has none."""
+    return any(held.get(part) for part in PARTS)
