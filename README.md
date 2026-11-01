@@ -299,6 +299,10 @@ A published file inherits the owner, group and permission bits of the file it re
 
 **Green tick on Test but nothing happens on import** — Check that the hook script is executable and that the `describarr` container is on the same Docker network as Sonarr/Radarr.
 
+**"stopped from outside the container while the server was short of memory"** — An alignment holds a few gigabytes for most of an hour on a feature film (about 0.3 MB for each second of video, plus 300 MB). If something outside the container kills it for memory (a watchdog on a shared host, the kernel's out-of-memory handling for the whole machine), that says nothing about the file or the recording, so describarr waits until the server has kept that much free, plus `DESCRIBARR_MEMORY_RESERVE_MB` (default 2000), for ten minutes in a row, and runs the same recording again; twice at most, then the file is reported as failed. It tells the two kinds of kill apart by the container's own count of out-of-memory kills (cgroup v2's `memory.events`): a kill by the container's memory limit would happen again, so that one still ends the file's turn at once, as does any kill when the count can't be read. One worker means the queue waits with it; `/status` says what it is waiting for, and the log says so every ten minutes. A wait that lasts six hours gives up.
+
+**"alignment timed out after N minutes"** — The engine may run for an hour or one and a half times the video's length, whichever is longer, before it is taken for hung. A 142-minute remux takes about an hour with its sound already decoded.
+
 ---
 
 ## Adjusting the score threshold

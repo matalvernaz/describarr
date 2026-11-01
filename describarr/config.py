@@ -115,6 +115,12 @@ class Config:
     # minutes but for two pauses in 18 hours. 0 notifies every outcome at once.
     notify_quiet_minutes: int = 30
     notify_max_wait_minutes: int = 120
+    # When something outside the container stops an alignment for memory (a
+    # host watchdog), the same recording is tried again once the machine has
+    # this much free on top of what the alignment itself needs (see
+    # host_memory). Matt's host kills an alignment under 1500 MB free; the
+    # default leaves 500 MB beyond that.
+    memory_reserve_mb: int = 2000
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -176,6 +182,16 @@ class Config:
         notify_quiet_minutes = _parse_minutes("DESCRIBARR_NOTIFY_QUIET_MINUTES", 30)
         notify_max_wait_minutes = _parse_minutes("DESCRIBARR_NOTIFY_MAX_WAIT_MINUTES", 120)
 
+        raw_reserve = os.environ.get("DESCRIBARR_MEMORY_RESERVE_MB", "2000").strip()
+        try:
+            memory_reserve_mb = int(raw_reserve)
+        except ValueError:
+            raise ValueError(
+                f"DESCRIBARR_MEMORY_RESERVE_MB must be a whole number of megabytes; got {raw_reserve!r}"
+            )
+        if memory_reserve_mb < 0:
+            raise ValueError("DESCRIBARR_MEMORY_RESERVE_MB must be ≥ 0.")
+
         return cls(
             email=email,
             password=password,
@@ -191,4 +207,5 @@ class Config:
             nomatch_ttl_days=nomatch_ttl_days,
             notify_quiet_minutes=notify_quiet_minutes,
             notify_max_wait_minutes=notify_max_wait_minutes,
+            memory_reserve_mb=memory_reserve_mb,
         )

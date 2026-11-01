@@ -32,6 +32,7 @@ from .aligner import (
     engine_replaces_rate,
     _read_metrics,
     OUTPUT_VALIDATION_FAILED,
+    AlignResult,
     EngineFailure,
     described_seconds,
     run as align,
@@ -55,6 +56,13 @@ from .aligner import (
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter
 from .config import Config
 from .decision_log import DecisionLog
+from .host_memory import (
+    MAX_WAIT_SECONDS,
+    engine_need_mb,
+    oom_kills,
+    stopped_from_outside,
+    wait_for_room,
+)
 from .log_files import history_dir
 from .outcome_log import OutcomeLog
 from .matcher import (
@@ -109,11 +117,21 @@ _MAX_MOVIE_CANDIDATES = 3
 
 
 class AlignmentResourceKill(Exception):
-    """The alignment subprocess was killed by a signal — under the container
-    memory cap, the memcg OOM SIGKILL on an oversized decode. The kill is a
-    property of the video file's decode footprint, not of the AD candidate:
-    every further candidate for the same file dies the same way, each attempt
-    costing a download slot, so candidate loops abort instead of iterating."""
+    """The alignment subprocess was killed by a signal and will not be run again.
+
+    Either the container's memory limit killed it (the memcg OOM SIGKILL on an
+    oversized decode, a property of the video file's footprint rather than of
+    the AD candidate), or something outside the container kept stopping it for
+    memory and the machine never freed enough (see :func:`_align_with_room`).
+    Every further candidate for the same file would meet the same end, each
+    attempt costing a download slot, so candidate loops abort instead of
+    iterating."""
+
+
+# How many times one recording is aligned again after something outside the
+# container, not its own memory limit, stopped the run for memory. Each try
+# waits first until the machine has the memory back (host_memory.wait_for_room).
+_HOST_KILL_RETRIES = 2
 
 
 class SourceVanished(Exception):
@@ -1655,6 +1673,67 @@ def _corroboration(
     return agree is True, english
 
 
+def _align_with_room(
+    config: Config,
+    video_path: Path,
+    audio_path: Path,
+    tmp_output_dir: Path,
+    alignment_dir: Path,
+    *,
+    entry_title: str,
+    context: dict,
+) -> tuple[Optional[AlignResult], Optional[str]]:
+    """Align *audio_path* to *video_path*, and again if the machine stops the run for memory.
+
+    A run killed by a signal that the container's own OOM-kill count did not
+    count was stopped from outside the container. Forrest Gump (2026-11-01)
+    was killed twice that way by the host's memory watchdog
+    while a build loop on the same host held 2-4 GB, and each kill was
+    reported as the film failing. Such a kill says nothing about the file or
+    the recording, so the same recording is aligned again, up to
+    ``_HOST_KILL_RETRIES`` times, each time once the machine has kept enough
+    memory free for a while (:func:`host_memory.wait_for_room`). The
+    candidate walk keeps its place: recordings it already refused are not run
+    a second time.
+
+    Returns ``(result, stopped_for_memory)``: the last run's result, and None
+    unless that run was stopped from outside too, when it is the phrase the
+    failure reason carries.
+    """
+    retries = 0
+    while True:
+        oom_before = oom_kills()
+        result = align(video_path, audio_path, tmp_output_dir, alignment_dir, config.stretch_audio)
+        if result is not None and result.output is not None:
+            return result, None
+        returncode = result.returncode if result is not None else None
+        if not stopped_from_outside(returncode, oom_before, oom_kills()):
+            return result, None
+        if retries >= _HOST_KILL_RETRIES:
+            return result, (
+                f"the server stopped it {retries + 1} times for lack of memory; "
+                "ask for it again when the server is quieter"
+            )
+
+        # Wait for the memory to come back, then run the same recording again.
+        retries += 1
+        runtime = _audio_duration(video_path)
+        need = config.memory_reserve_mb + engine_need_mb(runtime)
+        detail = (
+            f"stopped from outside the container while the server was short of memory "
+            f"(describealaign exit {returncode}; the container's own memory limit was "
+            f"not reached); this recording runs again once {need} MB is free "
+            f"({retries} of {_HOST_KILL_RETRIES})"
+        )
+        logger.warning("%s: %s", video_path.name, detail)
+        _log_decision(config, entry_title, "interrupted", detail, context=context)
+        if not wait_for_room(need, label=video_path.name):
+            return result, (
+                f"the server stopped it for lack of memory and did not free {need} MB "
+                f"within {round(MAX_WAIT_SECONDS / 3600)} hours; ask for it again later"
+            )
+
+
 def _align_and_keep(
     config: Config,
     video_path: Path,
@@ -1723,14 +1802,23 @@ def _align_and_keep(
                       context=context)
         return False, "source file vanished before alignment"
 
-    result = align(video_path, audio_path, tmp_output_dir, alignment_dir, config.stretch_audio)
+    result, stopped_for_memory = _align_with_room(
+        config, video_path, audio_path, tmp_output_dir, alignment_dir,
+        entry_title=entry_title, context=context,
+    )
     if result is None or result.output is None:
         reason = (result.failure_reason if result is not None else None) \
             or EngineFailure("alignment produced no validated output")
+        if stopped_for_memory:
+            reason = EngineFailure(f"{reason}: {stopped_for_memory}")
         logger.error("Alignment produced no validated output file: %s", reason)
         _log_decision(config, entry_title, "failed", reason, context={
             **context, "diagnostic": getattr(result, "diagnostic", None),
         })
+        if stopped_for_memory:
+            raise AlignmentResourceKill(
+                f"{reason}; further recordings for this file would wait the same way"
+            )
         if result is not None and result.returncode is not None and result.returncode < 0:
             raise AlignmentResourceKill(
                 f"{reason} — killed by signal, likely the container memory cap; "

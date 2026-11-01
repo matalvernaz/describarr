@@ -72,6 +72,26 @@ def fake_config(tmp_path=None, **overrides):
         # As deployed: a show's later notifications are held for its summary.
         "notify_quiet_minutes": _Config.notify_quiet_minutes,
         "notify_max_wait_minutes": _Config.notify_max_wait_minutes,
+        "memory_reserve_mb": _Config.memory_reserve_mb,
     }
     base.update(overrides)
     return _types.SimpleNamespace(**base)
+
+
+import pytest  # noqa: E402  (after the stubs above, which must come first)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_cgroup_reads(monkeypatch):
+    """Tests never read the test machine's own cgroup.
+
+    A signal-killed alignment is run again only when describarr can read its
+    cgroup's OOM-kill count, and a test machine's cgroup (a systemd
+    service's, a CI runner's) is readable: a test handing _align_and_keep a
+    -9 would then wait, for real, for the machine's memory. The count reads
+    as unknown here, which is the old behaviour; a test of the wait sets its
+    own fakes.
+    """
+    import describarr.workflow as _workflow
+
+    monkeypatch.setattr(_workflow, "oom_kills", lambda: None)

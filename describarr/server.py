@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from . import notify
+from . import host_memory, notify
 from .audiovault import AudioVaultClient, DailyLimitReached, DownloadLimiter, LoginError
 from .config import Config
 from .decision_log import DecisionLog
@@ -657,6 +657,9 @@ class _HookHandler(BaseHTTPRequestHandler):
             "pending_queue": pending,
             "next_drain": next_drain.strftime("%Y-%m-%dT%H:%M:%S"),
             "current_job": _current_job,
+            # Set while the current job waits for the server to free memory
+            # before running an alignment again (see host_memory).
+            "waiting_for_memory": host_memory.current_wait(),
             "recent_decisions": recent,
         }
 
@@ -801,6 +804,15 @@ class _HookHandler(BaseHTTPRequestHandler):
                 pending.push(item)
                 label = f"S{s:02d}E{e:02d} of {title!r}"
             else:
+                # A title that carries its own year, as a film's label does
+                # ("Forrest Gump (1994)", sent so by the host monitor on
+                # 2026-11-01), was searched as "Forrest Gump (1994) (1994)" once
+                # the folder's year was added. The year moves to where it
+                # belongs; a title whose year disagrees with year= is kept whole.
+                bare_title, title_year = _split_title_year(title)
+                if title_year and year_str in ("", title_year):
+                    title = bare_title
+                    year_str = title_year
                 pending.push({
                     "type": "retry_movie",
                     "title": title,
@@ -935,6 +947,12 @@ def _render_status_html(data: dict) -> str:
             f"{html.escape(job_label)} — running for "
             f"{html.escape(_elapsed(job['started_at']))}"
         )
+        waiting = data.get("waiting_for_memory")
+        if waiting:
+            current += (
+                f", waiting for the server to free {int(waiting['need_mb'])} MB "
+                "of memory before it tries again"
+            )
     else:
         current = "Idle"
 
