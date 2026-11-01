@@ -59,9 +59,14 @@ _TRUNK_RE = re.compile(r"Stable Trunk Fraction:\s+([-\d.]+)%")
 # implementations stay in lockstep.
 _STABLE_RATE_TOLERANCE_PP = 0.3
 
-# Subprocess timeout: 1 hour is enough for everything Matt has thrown at
-# describealaign so far (3-hour PAL BluRay films come in under 30 minutes).
-_SUBPROCESS_TIMEOUT_SEC = 3600
+# How long the engine may run before it is taken for hung: the longer of an
+# hour and one and a half times the video's length (see _engine_timeout). A
+# flat hour was enough before describealign 2.3.0's third pass, when 3-hour PAL
+# BluRay films came in under 30 minutes. On 2026-11-01 a 142-minute remux
+# (Forrest Gump, 33 GB) took 59 min 34 s with its sound already decoded, 26 s
+# short of the hour; decoding it first had taken another 23 minutes.
+_SUBPROCESS_TIMEOUT_MIN_SEC = 3600
+_SUBPROCESS_TIMEOUT_PER_VIDEO_SECOND = 1.5
 # Grace window between SIGTERM and SIGKILL when we kill a runaway subprocess.
 _SUBPROCESS_KILL_GRACE_SEC = 15
 # How many trailing stderr lines to surface at ERROR when the engine exits
@@ -156,8 +161,10 @@ class AlignResult:
 
     *returncode* is the describealaign exit status when the subprocess ran to
     an exit (None when it never launched or timed out). Negative means killed
-    by a signal — under the container memory cap that's the memcg OOM SIGKILL,
-    a property of the video's decode footprint rather than of the AD candidate.
+    by a signal: under the container memory cap that's the memcg OOM SIGKILL,
+    a property of the video's decode footprint rather than of the AD candidate;
+    from outside the container it is a host short of memory (see
+    ``host_memory.stopped_from_outside``), which says nothing about either.
     """
 
     __slots__ = ("output", "report", "failure_reason", "returncode", "aligned_english",
@@ -234,18 +241,22 @@ def run(
         "--alignment_dir", str(alignment_dir),
         "--ad_language", AD_LANGUAGE,
     ]
-    tracks = _audio_tracks(video_path)
+    # One probe of the video gives both the track to align against and the
+    # length the engine's time limit is measured from.
+    probe = _ffprobe_json(video_path)
+    tracks = _tracks_of(probe) if probe is not None else None
     audio_stream = _reference_stream(tracks) if tracks is not None else 0
     if audio_stream:
         cmd += ["--audio_stream", str(audio_stream)]
     aligned_english = _aligned_english(tracks, audio_stream or 0)
     if stretch_audio:
         cmd.append("--stretch_audio")
+    timeout = _engine_timeout(_container_duration(probe) if probe is not None else None)
 
     logger.info("Running describealaign: %s", " ".join(cmd))
 
     try:
-        returncode, stdout, stderr = _run_subprocess(cmd)
+        returncode, stdout, stderr = _run_subprocess(cmd, timeout=timeout)
     except FileNotFoundError:
         logger.error(
             "describealaign not found. Install it with: pip install describealaign"
@@ -255,12 +266,12 @@ def run(
     except subprocess.TimeoutExpired:
         logger.error(
             "describealaign timed out after %d seconds — process group killed.",
-            _SUBPROCESS_TIMEOUT_SEC,
+            timeout,
         )
         _cleanup_run_dir(run_output_dir)
         return AlignResult(
             None, None,
-            EngineFailure(f"alignment timed out after {_SUBPROCESS_TIMEOUT_SEC // 60} minutes"),
+            EngineFailure(f"alignment timed out after {timeout // 60} minutes"),
         )
 
     if stdout:
@@ -312,14 +323,24 @@ def run(
     return AlignResult(output=output, report=report, aligned_english=aligned_english)
 
 
-def _run_subprocess(cmd: list[str]) -> tuple[int, str, str]:
+def _engine_timeout(video_duration: Optional[float]) -> int:
+    """Seconds the engine may run on a video *video_duration* seconds long
+    before it is taken for hung; the hour floor when the length is unknown."""
+    if video_duration is None or not math.isfinite(video_duration) or video_duration <= 0:
+        return _SUBPROCESS_TIMEOUT_MIN_SEC
+    scaled = math.ceil(video_duration * _SUBPROCESS_TIMEOUT_PER_VIDEO_SECOND)
+    return max(_SUBPROCESS_TIMEOUT_MIN_SEC, scaled)
+
+
+def _run_subprocess(cmd: list[str], timeout: int = _SUBPROCESS_TIMEOUT_MIN_SEC) -> tuple[int, str, str]:
     """
     Run describealaign in its own session so a timeout can kill the *whole*
     process group (describealaign + every ffmpeg child it spawned).
 
     Returns ``(returncode, stdout, stderr)``. Raises
-    :class:`subprocess.TimeoutExpired` if the overall budget is exceeded
-    after the kill-grace window — the caller treats that as a failed run.
+    :class:`subprocess.TimeoutExpired` if the run outlasts *timeout* seconds
+    and the kill-grace window after it — the caller treats that as a failed
+    run.
     """
     proc = subprocess.Popen(
         cmd,
@@ -329,7 +350,7 @@ def _run_subprocess(cmd: list[str]) -> tuple[int, str, str]:
         start_new_session=True,  # new session => unique process group
     )
     try:
-        stdout, stderr = proc.communicate(timeout=_SUBPROCESS_TIMEOUT_SEC)
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         # SIGTERM the whole tree; if it hasn't exited after the grace window,
         # SIGKILL it. Either way reap the child so we don't leak a zombie.
@@ -351,7 +372,7 @@ def _run_subprocess(cmd: list[str]) -> tuple[int, str, str]:
                 # the caller reports a timeout (the kernel will eventually
                 # reap the orphan).
                 raise
-        raise subprocess.TimeoutExpired(cmd, _SUBPROCESS_TIMEOUT_SEC, output=stdout, stderr=stderr)
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
     return proc.returncode, stdout or "", stderr or ""
 
 
@@ -905,6 +926,11 @@ def _audio_tracks(path: Path) -> Optional[list[tuple[str, bool]]]:
     probe = _ffprobe_json(path)
     if probe is None:
         return None
+    return _tracks_of(probe)
+
+
+def _tracks_of(probe: dict) -> list[tuple[str, bool]]:
+    """:func:`_audio_tracks` read from an ffprobe result already in hand."""
     tracks = []
     for stream in probe.get("streams", []):
         if stream.get("codec_type") != "audio":

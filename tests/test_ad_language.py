@@ -75,7 +75,7 @@ def test_the_engine_is_asked_for_english(tmp_path, monkeypatch):
     audio.write_bytes(b"a")
     seen = {}
 
-    def fake_run(cmd):
+    def fake_run(cmd, timeout=None):
         seen["cmd"] = cmd
         return 1, "", ""
 

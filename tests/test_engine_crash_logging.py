@@ -12,7 +12,7 @@ def test_engine_crash_traceback_is_logged_at_error(tmp_path, monkeypatch, caplog
     audio.write_bytes(b"a")
     stderr = "\n".join(["  memorizing video...", "Traceback (most recent call last):",
                         '  File "describealaign.py", line 1, in <module>', "ValueError: boom"])
-    monkeypatch.setattr(aligner, "_run_subprocess", lambda cmd: (1, "", stderr))
+    monkeypatch.setattr(aligner, "_run_subprocess", lambda cmd, timeout=None: (1, "", stderr))
     monkeypatch.setattr(aligner, "_conform_pal_audio", lambda v, a, d: a)
 
     with caplog.at_level(logging.INFO, logger="describarr.aligner"):
@@ -29,7 +29,7 @@ def test_engine_rejection_with_sidecar_does_not_dump_stderr(tmp_path, monkeypatc
     video.write_bytes(b"v")
     audio = tmp_path / "ad.mp3"
     audio.write_bytes(b"a")
-    monkeypatch.setattr(aligner, "_run_subprocess", lambda cmd: (1, "", "some engine noise"))
+    monkeypatch.setattr(aligner, "_run_subprocess", lambda cmd, timeout=None: (1, "", "some engine noise"))
     monkeypatch.setattr(aligner, "_conform_pal_audio", lambda v, a, d: a)
     monkeypatch.setattr(aligner, "_read_failure_sidecar", lambda *a, **k: "AD audio is 95% silence")
 

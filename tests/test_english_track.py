@@ -117,7 +117,7 @@ def test_the_run_records_whether_it_aligned_english(monkeypatch, tmp_path):
     audio.write_bytes(b"a")
     out = tmp_path / "out"
 
-    def fake_run(cmd):
+    def fake_run(cmd, timeout=None):
         run_dir = Path(cmd[cmd.index("--output_dir") + 1])
         (run_dir / "ad_v.mkv").write_bytes(b"x")
         return 0, "", ""
@@ -144,7 +144,7 @@ def _engine_command(monkeypatch, tmp_path):
     audio.write_bytes(b"a")
     seen = {}
 
-    def fake_run(cmd):
+    def fake_run(cmd, timeout=None):
         seen["cmd"] = cmd
         return 1, "", ""
 

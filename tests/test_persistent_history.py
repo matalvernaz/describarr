@@ -543,7 +543,7 @@ def test_an_engine_refusal_hands_back_its_figures(monkeypatch, tmp_path):
     audio = tmp_path / "ad.mp3"
     audio.write_bytes(b"a")
 
-    def engine(cmd):
+    def engine(cmd, timeout=None):
         _sidecar(tmp_path / "align", "Show.S05E08.fail.json", {
             "error": "alignment_mismatch",
             "summary": "No obvious cause from energy analysis.",
