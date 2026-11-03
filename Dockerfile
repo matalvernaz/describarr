@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.15-slim
 
 # tzdata lets the TZ env var resolve to a real zone (the slim base is UTC-only),
 # so the daily-limit reset and the midnight drain run on local time, not UTC.
