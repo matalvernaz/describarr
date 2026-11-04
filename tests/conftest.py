@@ -95,3 +95,17 @@ def _no_real_cgroup_reads(monkeypatch):
     import describarr.workflow as _workflow
 
     monkeypatch.setattr(_workflow, "oom_kills", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_services(monkeypatch):
+    """Tests never reach a real Jellyfin, Pushover or notifications hub.
+
+    Every publish now tells Jellyfin its file changed, and a publish is what
+    most workflow tests drive. A shell that carries the production settings
+    (inside the server's own container, say) would otherwise send one real
+    report per test. Tests of a notifier set the settings they need.
+    """
+    for name in ("JELLYFIN_URL", "JELLYFIN_API_KEY", "PUSHOVER_TOKEN", "PUSHOVER_USER",
+                 "NOTIFY_HUB_URL", "NOTIFY_HUB_TOKEN"):
+        monkeypatch.delenv(name, raising=False)

@@ -28,6 +28,7 @@ from typing import Optional
 
 import requests
 
+from . import notify
 from .aligner import (
     engine_replaces_rate,
     _read_metrics,
@@ -2030,6 +2031,9 @@ def _align_and_keep(
         # Cleaning it here keeps the per-run isolation tidy and prevents a
         # ~1-2 GB orphan sitting in the cache forever.
         _cleanup_combined(combined)
+
+    # Jellyfin cannot see this write for itself; tell it now, not at its next scan.
+    notify.tell_jellyfin_file_changed(str(video_path))
 
     # The rescue path already required sync_ok, so this only fires on the
     # high-similarity path — where a wobbly rate is unusual but worth flagging.
