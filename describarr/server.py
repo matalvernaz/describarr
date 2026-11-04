@@ -1436,11 +1436,19 @@ def _held_summary(group: str, entries: list[dict]) -> tuple[str, str]:
         title = f"describarr: {len(entries)} more films"
     else:
         title = f"describarr: {group_name(group)}, {len(entries)} more"
+    # A note several episodes share collapses into one line; one episode's
+    # keeps its detail. Call the Midwife's summaries listed every episode's
+    # "different cut" spans on a line of its own, and Pushover's limit cut
+    # them off before the line saying two files held other episodes
+    # (2026-11-04).
+    shared = {kind for kind, pattern in _SHARED_NOTES.items()
+              if sum(1 for entry in entries if _only_note(entry["message"], pattern)) >= 2}
     lines: dict[tuple[str, str], list[str]] = {}
     for entry in entries:
-        lines.setdefault((entry["outcome"], _summary_message(entry)), []).append(entry["label"])
+        message = _summary_message(entry, shared)
+        lines.setdefault((entry["outcome"], message), []).append(entry["label"])
     rank = {outcome: i for i, outcome in enumerate(_HELD_LINE_ORDER)}
-    ordered = sorted(lines.items(), key=lambda line: rank.get(line[0][0], -1))
+    ordered = sorted(lines.items(), key=lambda line: (rank.get(line[0][0], -1), _line_weight(line[0][1])))
     body = "\n".join([_held_counts(entries)] + [
         f"{_held_names(group, labels)}: {message}" for (_, message), labels in ordered])
     return title, _cut(body, notify.MESSAGE_LIMIT)
@@ -1452,24 +1460,64 @@ def _held_summary(group: str, entries: list[dict]) -> tuple[str, str]:
 # times (Friends Seasons 6, 9 and 10, 2026-10-04); in a summary they share a
 # line that says what the files have in common.
 _FILED_AS_RE = re.compile(
-    r"^Described\. \(matched the recording filed as (['\"])(?P<name>.+)\1, so the "
+    r"(?:^Described\. \(|; )matched the recording filed as (['\"])(?P<name>.+)\1, so the "
     r"catalogue, or this file, names a different episode\)$")
+_FILED_AS_NOTE = ("Described. (matched the recording filed as {quote}{name}{quote}, so the "
+                  "catalogue, or this file, names a different episode)")
+# Notes whose wording differs per file only in where the gaps fall, and the
+# line several episodes share instead.
+_SHARED_NOTES = {
+    "different_cut": re.compile(r"^Described\. \(AD source is a different cut: "),
+    "partial": re.compile(r"^Described\. \(description covers only part of the picture: "),
+}
+_SHARED_LINES = {
+    "different_cut": ("Described, but each recording comes from a different cut, so a few "
+                      "minutes of each picture have no description."),
+    "partial": "Described, but each description covers only part of the picture.",
+}
 # "S06E01" or "S01 E03", or the "6.01 Title" numbering some catalogues use
 # (a two-digit episode with nothing before the season but a separator, so
 # Mr. Robot's "eps1.1_..." is not read as a code).
-_RECORDING_CODE_RE = re.compile(r"S(\d+)\s*E(\d+)|(?<![\w.])(\d{1,2})\.(\d{2})(?![\d.])", re.IGNORECASE)
+_RECORDING_CODE_RE = re.compile(
+    r"S(\d+)[\s._-]*E(\d+)|(?<![\w.])(\d{1,2})\.(\d{2})(?![\d.])", re.IGNORECASE)
 # A refusal's own words count the recordings tried, which differ from file to
 # file; in a summary refusals share a line per cause instead.
 _REFUSAL_CAUSE_RE = re.compile(
     r"^(?:Found an audio description|Tried \d+ audio description).*\((?P<cause>[^()]*)\)$")
 
 
-def _summary_message(entry: dict) -> str:
+def _only_note(message: str, pattern: re.Pattern) -> bool:
+    """Whether *message* carries *pattern*'s note and no wrong-episode note."""
+    return bool(pattern.match(message)) and not _FILED_AS_RE.search(message)
+
+
+def _line_weight(message: str) -> int:
+    """Where a line goes among its outcome's: a file that may hold another
+    episode first, then gaps in the description, then the rest."""
+    if "names a different episode" in message or "may hold the episode" in message:
+        return 0
+    if message == _SHARED_LINES["partial"] or _SHARED_NOTES["partial"].match(message):
+        return 1
+    if message == _SHARED_LINES["different_cut"] or _SHARED_NOTES["different_cut"].match(message):
+        return 2
+    return 3
+
+
+def _summary_message(entry: dict, shared: frozenset | set = frozenset()) -> str:
     """What a held outcome is listed under in a summary: its own message,
-    unless it is one of the kinds whose wording differs per file only in detail."""
+    unless it is one of the kinds whose wording differs per file only in detail.
+
+    *shared* names the kinds of note (see _SHARED_NOTES) that several of the
+    summary's episodes carry, and so share a line."""
     message = entry["message"]
-    filed = _FILED_AS_RE.match(message)
+    for kind in shared:
+        if _only_note(message, _SHARED_NOTES[kind]):
+            return _SHARED_LINES[kind]
+    filed = _FILED_AS_RE.search(message)
     if filed:
+        # A note ahead of it (a different cut, say) is dropped: which episode
+        # the file holds is what the operator has to act on.
+        message = _FILED_AS_NOTE.format(quote=filed.group(1), name=filed.group("name"))
         mine = _EPISODE_LABEL_RE.match(entry["label"])
         theirs = _RECORDING_CODE_RE.search(filed.group("name"))
         code = _EPISODE_CODE_RE.match(mine.group(2)) if mine else None

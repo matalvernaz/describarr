@@ -138,10 +138,12 @@ def test_a_note_on_one_episode_stays_with_that_episode(tmp_path, monkeypatch):
     _land(config, clock, "Friends S04E04")
     _go_quiet(config, clock)
 
+    # Kept whole when only one episode has it, and listed ahead of the plain
+    # ones: a gap in the description is worth reading before the rest.
     assert pushes[1][1] == "\n".join([
         "3 described.",
-        "S04E02, S04E04: Described.",
         f"S04E03: Described. ({note})",
+        "S04E02, S04E04: Described.",
     ])
 
 
@@ -691,3 +693,75 @@ def test_the_overnight_drain_tells_the_hub(tmp_path, monkeypatch):
 
     assert hub == ["Friends: 2 episodes, S04E01 to E02"]
     assert pushes[-1][0] == "describarr: described 2 queued title(s)"
+
+
+# Call the Midwife, 2026-11-04: every episode's recording was a shorter cut,
+# so every line was a different list of gaps, and Pushover's limit cut the
+# summary before the two files YELLOWBiRD had numbered one episode late.
+_CUT = ("AD source is a different cut: {m} min of the picture has no description at "
+        "17:55–18:28, 19:38–20:50, 27:19–28:04 and 15 shorter, 15 s of narration could not be placed")
+_LATE = ("; matched the recording filed as '[S06.E0{n}] Episode #6.{n}', so the catalogue, "
+         "or this file, names a different episode")
+
+
+def test_files_holding_other_episodes_lead_a_summary_of_cut_recordings(tmp_path, monkeypatch):
+    config, clock, pushes, _ = _wire(monkeypatch, tmp_path)
+
+    _land(config, clock, "Call the Midwife S05E08", reason=_CUT.format(m=6))
+    _land(config, clock, "Call the Midwife S06E02", reason=_CUT.format(m=7) + _LATE.format(n=1))
+    _land(config, clock, "Call the Midwife S06E03", reason=_CUT.format(m=7) + _LATE.format(n=2))
+    for episode in range(4, 9):
+        _land(config, clock, f"Call the Midwife S06E{episode:02d}", reason=_CUT.format(m=episode % 3 + 5))
+    for episode in range(1, 9):
+        _land(config, clock, f"Call the Midwife S07E{episode:02d}", reason=_CUT.format(m=episode % 4 + 4))
+    _land(config, clock, "Call the Midwife S08E01")
+    _go_quiet(config, clock)
+
+    title, body = pushes[-1]
+    assert title == "describarr: Call the Midwife, 16 more"
+    assert body == "\n".join([
+        "16 described.",
+        "S06E02 to E03: Described, each with the recording filed one episode earlier: "
+        "each file may hold the episode before the one its name says.",
+        "S06E04 to E08, S07E01 to E08: Described, but each recording comes from a different "
+        "cut, so a few minutes of each picture have no description.",
+        "S08E01: Described.",
+    ])
+
+
+def test_a_recording_named_with_a_dotted_code_is_read_as_its_episode():
+    entry = {"label": "Call the Midwife S06E02", "outcome": "described",
+             "message": "Described. (" + _CUT.format(m=7) + _LATE.format(n=1) + ")"}
+    assert "one episode earlier" in srv._summary_message(entry)
+    for code in ("S06 E01", "S06_E01", "S06-E01", "s06.e01"):
+        dotted = dict(entry, message=entry["message"].replace("S06.E01", code))
+        assert "one episode earlier" in srv._summary_message(dotted), code
+
+
+def test_a_wrong_episode_note_keeps_only_itself_when_no_shift_can_be_read():
+    unreadable = "Described. (" + _CUT.format(m=7) + "; matched the recording filed as 'Episode #6.1', so the catalogue, or this file, names a different episode)"
+    entry = {"label": "Call the Midwife S06E02", "outcome": "described", "message": unreadable}
+    assert srv._summary_message(entry) == ("Described. (matched the recording filed as 'Episode #6.1', "
+                                           "so the catalogue, or this file, names a different episode)")
+    # The shared cut line is not offered a file that may hold another episode.
+    assert "names a different episode" in srv._summary_message(entry, {"different_cut"})
+
+
+def test_one_partial_description_keeps_its_detail_and_several_share_a_line(tmp_path, monkeypatch):
+    partial = "description covers only part of the picture: 9 min of 22 min has no description at 0:00–9:12"
+    config, clock, pushes, _ = _wire(monkeypatch, tmp_path)
+    _land(config, clock, "Friends S01E01")
+    _land(config, clock, "Friends S01E02", reason=partial)
+    _land(config, clock, "Friends S01E03")
+    _go_quiet(config, clock)
+    assert f"S01E02: Described. ({partial})" in pushes[-1][1]
+
+    config, clock, pushes, _ = _wire(monkeypatch, tmp_path / "again")
+    _land(config, clock, "Friends S02E01")
+    _land(config, clock, "Friends S02E02", reason=partial)
+    _land(config, clock, "Friends S02E03", reason=partial.replace("9 min", "8 min"))
+    _go_quiet(config, clock)
+    assert pushes[-1][1] == "\n".join([
+        "2 described.",
+        "S02E02 to E03: Described, but each description covers only part of the picture.",
+    ])
