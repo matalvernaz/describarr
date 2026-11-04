@@ -10,6 +10,8 @@ ntfy's JSON form (topic, title, message, click), so an ntfy server fits there to
 So does Jellyfin with JELLYFIN_URL and JELLYFIN_API_KEY: a server that sends
 library notices takes the described files' paths and one sentence at
 POST /Podcasts/Push/Described, and tells each person who asked and can see them.
+The same server is also told, at once, that each rewritten file changed, so it
+reads the new track list (see `tell_jellyfin_file_changed`).
 """
 
 from __future__ import annotations
@@ -161,3 +163,37 @@ def send_jellyfin_described(paths: list[str], summary: str) -> bool:
         "User-Agent": "describarr",
     })
     return _deliver(request, "Jellyfin", retry_unsure=False)
+
+
+def tell_jellyfin_file_changed(path: str) -> bool:
+    """Tell Jellyfin that a library file was rewritten, so it reads it again.
+
+    A published file carries one more audio track than the one Jellyfin read.
+    Jellyfin hears of changed files through inotify, which never reports a
+    write made by another machine sharing the library over NFS, so the item
+    kept its old track list until the next scheduled scan, up to twelve hours
+    later: no description to pick, and every stream number after it off by
+    one. This is the report Sonarr and Radarr make after an import; Jellyfin
+    reads the file again about a minute later.
+
+    Logs and swallows any failure: the scheduled scan still finds the file, so
+    nothing is tried again. True only when Jellyfin took the report."""
+    server = _jellyfin()
+    if server is None:
+        return False
+    url, key = server
+    data = json.dumps({"Updates": [{"Path": str(path), "UpdateType": "Modified"}]}).encode()
+    request = Request(f"{url}/Library/Media/Updated", data=data, headers={
+        "Content-Type": "application/json",
+        "Authorization": f'MediaBrowser Token="{key}"',
+        "User-Agent": "describarr",
+    })
+    try:
+        # urlopen raises HTTPError for any status from 400 up.
+        with urlopen(request, timeout=10):
+            pass
+    except Exception as exc:
+        logger.warning("Jellyfin was not told that %s changed (%s); its next scan will find it.", path, exc)
+        return False
+    logger.info("Told Jellyfin that %s changed.", path)
+    return True
