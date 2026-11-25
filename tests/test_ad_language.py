@@ -37,6 +37,8 @@ def _validate(monkeypatch, out, output_name):
     monkeypatch.setattr(aligner, "_ffprobe_json",
                         lambda p, *a, **k: _src_probe() if "src" in str(p) else out)
     monkeypatch.setattr(aligner, "_video_packet_count", lambda *a, **k: 1000)
+    monkeypatch.setattr(aligner, "_stream_end", lambda path, stream, duration: duration or 0.0)
+    monkeypatch.setattr(aligner, "_video_origin", lambda path, probe: 0.0)
     return aligner._validate_media_output(Path("/tv/src.mkv"), Path(f"/tv/{output_name}"))
 
 

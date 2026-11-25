@@ -27,6 +27,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import sys
 import time
 import uuid
@@ -1059,6 +1060,16 @@ def _find_output(video_path: Path, run_output_dir: Path, min_mtime: float = 0.0)
 # Container/codec validation thresholds.
 _PACKET_RATIO_FLOOR = 0.95          # max fractional packet loss tolerated
 _MAX_MISSING_SECONDS_OF_VIDEO = 10  # absolute floor — never lose more than ~10 s of video
+# The description track may stop at most this long before the source's own
+# sound does. Players end a file when the track they are playing ends:
+# EchoFin treats an ending more than 5 s short as a broken stream, so an
+# episode never moves on and a film ends in "Playback failed" (2026-11-11: 99
+# described files, mostly recordings the engine copied in whole that stop
+# before the video does; Captain Underpants 53 s short on 37 of 39 episodes).
+_MAX_AD_SHORTFALL_SECONDS = 5.0
+# Where a track ends is read from its last packets, so only this much of the
+# end of the file is read, not the whole thing.
+_TRACK_END_READ_SECONDS = 120.0
 _FFPROBE_TIMEOUT_SEC = 120          # metadata probes read only headers — fast at any size
 # -count_packets reads the WHOLE file: a 2160p UHD REMUX is 60-80 GB and the
 # source sits on NFS, so the scan runs for minutes. With the metadata budget
@@ -1324,6 +1335,112 @@ def _parse_fps(stream: dict) -> float:
     return 24.0  # film-rate default; conservative for the absolute-loss floor
 
 
+def _parse_seconds(raw) -> Optional[float]:
+    """A finite number of seconds from an ffprobe field, or None ("N/A", missing, junk)."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _last_packet_end(
+    path: Path, stream: str, duration: Optional[float], *, from_start: bool = False,
+) -> Optional[float]:
+    """Where stream *stream* ("a:0", "v:0") of *path* stops: its last timestamped
+    packet's time plus that packet's length, on the file's own timeline.
+
+    A container's duration does not say this: it is the longest track's, so a
+    short track hides behind it. Only the last ``_TRACK_END_READ_SECONDS`` of the
+    file (by *duration*) are read, or all of it with *from_start*. ffprobe's
+    lines are read as they come and only the latest end is kept, so a whole
+    two-hour file costs no memory. None when nothing timestamped was read or
+    the probe fails.
+    """
+    start = 0.0 if from_start else max(0.0, (duration or 0.0) - _TRACK_END_READ_SECONDS)
+    window = ["-read_intervals", f"{start:.3f}%"] if start > 0 else []
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", stream,
+        *window,
+        "-show_entries", "packet=pts_time,duration_time",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except FileNotFoundError as exc:
+        logger.warning("ffprobe packet read failed on %s: %s", path, exc)
+        return None
+    timeout = _FFPROBE_COUNT_TIMEOUT_SEC if from_start else _FFPROBE_TIMEOUT_SEC
+    timer = threading.Timer(timeout, proc.kill)
+    timer.start()
+    end: Optional[float] = None
+    try:
+        # Each line is "pts_time,duration_time"; ffprobe prints them in that order.
+        for line in proc.stdout:
+            fields = line.strip().split(",")
+            pts = _parse_seconds(fields[0]) if fields else None
+            if pts is None:
+                continue
+            length = _parse_seconds(fields[1]) if len(fields) > 1 else None
+            packet_end = pts + (length or 0.0)
+            if end is None or packet_end > end:
+                end = packet_end
+        returncode = proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    if returncode != 0:
+        logger.warning("ffprobe packet read of %s in %s returned %d", stream, path, returncode)
+        return None
+    return end
+
+
+def _stream_end(path: Path, stream: str, duration: Optional[float]) -> Optional[float]:
+    """Where *stream* of *path* stops, or None when that cannot be established.
+    The tail of the file is read first; a stream that stops before the tail,
+    or has no timestamps there, is read again from the start, since a short
+    description track is exactly what this is for.
+    """
+    end = _last_packet_end(path, stream, duration)
+    tail_reads_everything = max(0.0, (duration or 0.0) - _TRACK_END_READ_SECONDS) == 0.0
+    if end is None and not tail_reads_everything:
+        end = _last_packet_end(path, stream, duration, from_start=True)
+    return end
+
+
+def _video_origin(path: Path, probe: dict) -> Optional[float]:
+    """Where the primary video starts on *path*'s own timeline: the stream's
+    start_time, else the container's, else its first packet's time. A remux
+    usually moves a file's whole timeline (a broadcast capture starting at 10 s
+    comes out starting at 0), so ends in two files are compared from here.
+    """
+    video, video_index = _primary_video_stream(probe)
+    for raw in ((video or {}).get("start_time"), (probe.get("format") or {}).get("start_time")):
+        origin = _parse_seconds(raw)
+        if origin is not None:
+            return origin
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", f"v:{max(video_index, 0)}",
+        "-read_intervals", "%+#1",
+        "-show_entries", "packet=pts_time",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_FFPROBE_TIMEOUT_SEC, check=False)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("ffprobe first-packet read failed on %s: %s", path, exc)
+        return None
+    first = proc.stdout.strip().splitlines()
+    return _parse_seconds(first[0].split(",")[0]) if proc.returncode == 0 and first else None
+
+
 def _video_packet_count(path: Path, video_specifier_index: int = 0) -> Optional[int]:
     """Number of packets in video stream ``v:N`` of *path*, where N is
     *video_specifier_index*.
@@ -1369,6 +1486,46 @@ def _video_packet_count(path: Path, video_specifier_index: int = 0) -> Optional[
         return None
 
 
+def _description_shortfall(
+    source: Path, output: Path, src_probe: dict, out_probe: dict,
+    src_duration: Optional[float], out_duration: Optional[float],
+) -> Optional[tuple[float, float, float]]:
+    """How long before the source ends the output's AD track (a:0) stops:
+    ``(shortfall, description_ends, source_ends)`` in seconds from each file's
+    own video origin, or None (logged) when an end or an origin cannot be read.
+
+    The source ends at the earlier of its own sound (the track the engine
+    aligned against and built the description on, so an AD track rendered
+    from it ends with it) and its picture. A source whose sound stops before
+    its picture already ends early in every player, whatever track plays
+    (EchoFin finding D-1, 2026-11-11, seen on files describarr never touched),
+    so the description is not held to more than its source; one whose sound
+    runs on past its picture is done when the picture is. Each file counts from
+    its own video origin, since a remux can move the whole timeline (a capture
+    starting at 10 s comes out starting at 0).
+    """
+    reference = _reference_stream(_tracks_of(src_probe)) or 0
+    src_origin = _video_origin(source, src_probe)
+    out_origin = _video_origin(output, out_probe)
+    src_sound_end = _stream_end(source, f"a:{reference}", src_duration)
+    ad_end = _stream_end(output, "a:0", out_duration)
+    if None in (src_origin, out_origin, src_sound_end, ad_end):
+        logger.error(
+            "Could not establish where the audio ends (source a:%d end %r origin %r, output AD end %r "
+            "origin %r) — refusing to publish.", reference, src_sound_end, src_origin, ad_end, out_origin,
+        )
+        return None
+    source_ends = src_sound_end - src_origin
+    # The picture's end only ever lowers the bar, so when it cannot be read the
+    # sound's end, the stricter of the two, stands.
+    _, src_video_idx = _primary_video_stream(src_probe)
+    src_picture_end = _stream_end(source, f"v:{max(src_video_idx, 0)}", src_duration)
+    if src_picture_end is not None:
+        source_ends = min(source_ends, src_picture_end - src_origin)
+    description_ends = ad_end - out_origin
+    return source_ends - description_ends, description_ends, source_ends
+
+
 def _validate_media_output(source: Path, output: Path) -> bool:
     """
     Validate that *output* is structurally sound enough to overwrite *source*.
@@ -1387,6 +1544,10 @@ def _validate_media_output(source: Path, output: Path) -> bool:
          worth of frames). Catches truncation that duration alone misses
          (e.g. a container header that claims the right duration but only
          has 3 s of video packets in it).
+      6. The AD track (a:0) ends no more than ``_MAX_AD_SHORTFALL_SECONDS``
+         before the source does (the earlier of its own sound and its
+         picture), so a player does not stop the file early while the AD
+         track plays.
     """
     src_probe = _ffprobe_json(source)
     if src_probe is None:
@@ -1495,6 +1656,20 @@ def _validate_media_output(source: Path, output: Path) -> bool:
             "ratio floor %.2f, absolute loss floor %ds=%d packets).",
             out_packets, required, src_packets, fps,
             _PACKET_RATIO_FLOOR, _MAX_MISSING_SECONDS_OF_VIDEO, abs_loss_packets,
+        )
+        return False
+
+    # Gate 6: where the AD track stops, against where the source already stops
+    # (see _description_shortfall).
+    measured = _description_shortfall(source, output, src_probe, out_probe, src_duration, out_duration)
+    if measured is None:
+        return False
+    shortfall, description_ends, source_ends = measured
+    if shortfall > _MAX_AD_SHORTFALL_SECONDS:
+        logger.error(
+            "Output AD track ends at %.1fs, %.1fs before the source does (%.1fs); a player "
+            "would stop the file there — refusing to publish.",
+            description_ends, shortfall, source_ends,
         )
         return False
 
