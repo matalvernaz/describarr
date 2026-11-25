@@ -82,6 +82,7 @@ from .sonarr import episode_title as sonarr_episode_title
 from .sources import episode_candidates_from, load_extra_sources
 from .titles import (
     donor_names_episode,
+    donor_names_movie,
     donor_says_undescribed,
     says_undescribed,
     donor_title_readings,
@@ -658,7 +659,8 @@ def process_movie(
                 same_from.append(_AUDIOVAULT_LABEL)
                 continue
             published, reason = _align_and_keep(config, video_path, audio_path, label=label,
-                                                source=_AUDIOVAULT_LABEL)
+                                                source=_AUDIOVAULT_LABEL,
+                                                movie_title=movie_title, movie_year=movie_year)
             if published:
                 return True, reason
             reasons.add(reason, audio_path.name)
@@ -678,7 +680,8 @@ def process_movie(
                         same_from.append(_source_label(source))
                         continue
                     published, reason = _align_and_keep(config, video_path, audio_path, label=label,
-                                                        source=_source_label(source))
+                                                        source=_source_label(source),
+                                                        movie_title=movie_title, movie_year=movie_year)
                     if published:
                         return True, reason
                     reasons.add(reason, audio_path.name)
@@ -798,6 +801,7 @@ def _acceptance_decision(
     title_corroborated: bool = False,
     primary_audio_english: bool = False,
     measured_sync: Optional[dict] = None,
+    movie_corroborated: bool = False,
 ) -> tuple[bool, str, str]:
     """Decide whether an alignment is good enough to overwrite the original.
 
@@ -837,7 +841,14 @@ def _acceptance_decision(
       :func:`_measured_sync_holds`, over the rescues' runtime floor and the
       corroborated rescue's coverage floor and two content checks. None (an
       engine before 2.3.0, or a measurement that cannot be read) never takes
-      this path.
+      this path. For a film, *movie_corroborated* (the recording is named
+      exactly for the film and its year) stands in for the episode title,
+      on this path only: an episode's title is evidence the matcher never
+      used, since it matched on numbers, but a film's title and year are
+      what its recording was chosen by, so here the engine's measurement is
+      the evidence and the exact name only rules out a sequel, a remake or
+      a near name (Other Mommy, 2026-11-25: 29.6 % over one native-rate
+      line, 39 % of the film confirmed, every anchor within 40 ms).
     """
     if score >= min_score:
         return True, "similarity", f"similarity {score:.1f}% ≥ {min_score:.0f}% (sync confident)"
@@ -905,15 +916,17 @@ def _acceptance_decision(
         _measured_sync_holds(measured_sync)
         and total_runtime >= _RESCUE_MIN_RUNTIME_SEC
         and content_coverage >= _CORROBORATED_MIN_COVERAGE
-        and title_corroborated
+        and (title_corroborated or movie_corroborated)
         and primary_audio_english
     ):
+        named = ("the donor names this episode" if title_corroborated
+                 else "the recording is named for this film and year")
         return True, "measured-sync", (
             f"similarity {score:.1f}% below {min_score:.0f}%, but the engine measured "
             f"{measured_sync['confirmed_pct']:.0f}% of the video in sync "
             f"({measured_sync['within_pct']:.1f}% of its anchors within 40 ms, "
-            f"{measured_sync['over_pct']:.2f}% over 120 ms); the donor names this "
-            f"episode and the aligned track is English — accepting"
+            f"{measured_sync['over_pct']:.2f}% over 120 ms); {named} "
+            f"and the aligned track is English — accepting"
         )
     return False, "reject", (
         f"similarity {score:.1f}% (coverage {content_coverage:.1f}%, stable trunk "
@@ -1631,7 +1644,7 @@ def _cache_relative(path: Path, cache_dir: Path) -> str:
 def _corroboration(
     video_path: Path, audio_path: Path, episode_title: str, score: float,
     series_title: str = "", aligned_english: Optional[bool] = None,
-    needed: bool = False,
+    needed: bool = False, movie_title: str = "", movie_year: str = "",
 ) -> tuple[bool, bool]:
     """Title and language evidence for the corroborated rescue.
 
@@ -1647,15 +1660,23 @@ def _corroboration(
     be read by the rest. Sonarr titles a two-parter's episodes "(1)" and "(2)",
     and a recording joined from its halves is named as the whole, so a part-1
     title also agrees with the title less its marker.
+    For a film (*movie_title*), the first answer is instead whether the
+    donor is named exactly for the film and its year (:func:`donor_names_movie`).
     """
     if not _corroboration_probed(score, needed):
         return False, False
-    readings = donor_title_readings(audio_path.name, series_title)
-    agree = donor_names_episode(episode_title, audio_path.name, series_title=series_title)
-    if agree is not True:
-        whole, part = _title_less_part(episode_title)
-        if part == 1:
-            agree = donor_names_episode(whole, audio_path.name, series_title=series_title)
+    if movie_title:
+        agree = donor_names_movie(movie_title, movie_year, audio_path.name)
+        what = f"film {movie_title!r} ({movie_year})"
+        readings = [audio_path.name]
+    else:
+        readings = donor_title_readings(audio_path.name, series_title)
+        agree = donor_names_episode(episode_title, audio_path.name, series_title=series_title)
+        if agree is not True:
+            whole, part = _title_less_part(episode_title)
+            if part == 1:
+                agree = donor_names_episode(whole, audio_path.name, series_title=series_title)
+        what = f"episode title {episode_title!r}"
     # The run's own answer when there is one: a second probe could disagree
     # with the one that chose the track (an NFS blip), and grant the rescue to
     # an alignment made against a dub.
@@ -1666,9 +1687,9 @@ def _corroboration(
     else:
         english = primary_audio_is_english(video_path)
     logger.info(
-        "Corroboration for %s: episode title %r vs donor read as %s → %s; "
+        "Corroboration for %s: %s vs donor read as %s → %s; "
         "first audio track English: %s",
-        video_path.name, episode_title, " / ".join(repr(r) for r in readings) or "''",
+        video_path.name, what, " / ".join(repr(r) for r in readings) or "''",
         agree, english,
     )
     return agree is True, english
@@ -1744,13 +1765,16 @@ def _align_and_keep(
     series_title: str = "",
     max_undescribed_fraction: float = _UNDESCRIBED_MAJOR_FRACTION,
     source: str = "",
+    movie_title: str = "",
+    movie_year: str = "",
 ) -> tuple[bool, Optional[str]]:
     """Run alignment and either keep or discard the combined output.
 
     *episode_title* (episodes only) is compared with the title in the donor's
     filename for the corroborated rescue; empty means no title evidence.
     *series_title* lets that comparison read past the show's own name in front
-    of the donor's title.
+    of the donor's title. *movie_title* and *movie_year* (films only) are
+    compared with the donor's name the same way, for the measured-sync rescue.
 
     Returns ``(published, reason)``. On success *reason* is None or an
     informational note (see :func:`_undescribed_note`); on failure it is a
@@ -1920,11 +1944,19 @@ def _align_and_keep(
     # are read for it too.
     measured = sync_check(report)
     measured_band = score < config.min_score and _measured_sync_holds(measured)
-    title_corroborated, primary_english = _corroboration(
+    names_item, primary_english = _corroboration(
         video_path, audio_path, episode_title, score, series_title,
         aligned_english=result.aligned_english,
         needed=corroboration_needed or steep_band or measured_band,
+        movie_title=movie_title, movie_year=movie_year,
     )
+    # An episode's title opens every rescue that asks for it and vouches for a
+    # recording that leaves more than a tenth uncovered; a film's exact name opens
+    # the measured-sync rescue only, and never the uncovered allowance below: in a
+    # film that much undescribed is a different cut (Big, 2026-10-25: the extended
+    # cut against the theatrical recording, 31 of 130 minutes with no narration).
+    title_corroborated = names_item and not movie_title
+    movie_corroborated = names_item and bool(movie_title)
 
     # similarity is describealaign's match-confidence metric: the fraction of
     # the AD release's embedded program audio that aligned against the video.
@@ -1950,6 +1982,7 @@ def _align_and_keep(
         title_corroborated=title_corroborated,
         primary_audio_english=primary_english,
         measured_sync=measured,
+        movie_corroborated=movie_corroborated,
     )
     # What the gate read, for the history. None where it never asked: the
     # corroboration probe runs only in its score band, when a rescue needs it,
@@ -1960,8 +1993,9 @@ def _align_and_keep(
         "piecewise": piecewise,
         "sync_ok": described_sync_ok,
         "described_runtime": described_runtime,
-        "title_corroborated": title_corroborated if probed else None,
-        "english_track": primary_english if probed and title_corroborated else None,
+        "title_corroborated": title_corroborated if probed and not movie_title else None,
+        "movie_corroborated": movie_corroborated if probed and movie_title else None,
+        "english_track": primary_english if probed and names_item else None,
         "uncovered": unreached,
         "longest_gap": (longest[1] - longest[0]) if longest is not None else 0.0,
         # The engine's measurement of the map it rendered (None before 2.3.0, or
@@ -1990,6 +2024,12 @@ def _align_and_keep(
                 f"{_fmt_duration(longest[1] - longest[0])} of the picture at "
                 f"{_fmt_clock(longest[0])}–{_fmt_clock(longest[1])} has no recording, more than "
                 f"a tenth of it; the recording may be placed that far off after such a gap"
+            )
+        elif unreached > _RESCUE_UNCORROBORATED_MAX_UNCOVERED * runtime and movie_title:
+            accepted, decision_detail = False, (
+                f"{_fmt_duration(unreached)} of {_fmt_duration(runtime)} has no description, "
+                f"more than a tenth of the film; that much usually means the recording is of "
+                f"another cut"
             )
         elif unreached > _RESCUE_UNCORROBORATED_MAX_UNCOVERED * runtime \
                 and not (title_corroborated and primary_english):

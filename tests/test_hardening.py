@@ -151,6 +151,8 @@ def test_validate_rejects_dropped_subtitles(monkeypatch):
     monkeypatch.setattr(aligner, "_ffprobe_json",
                         lambda p, *a, **k: src if "src" in str(p) else out)
     monkeypatch.setattr(aligner, "_video_packet_count", lambda *a, **k: 1000)
+    monkeypatch.setattr(aligner, "_stream_end", lambda path, stream, duration: duration or 0.0)
+    monkeypatch.setattr(aligner, "_video_origin", lambda path, probe: 0.0)
 
     from pathlib import Path
     assert aligner._validate_media_output(Path("/tv/src.mkv"), Path("/tv/out.mkv")) is False
@@ -163,6 +165,8 @@ def test_validate_accepts_preserved_subtitles(monkeypatch):
     monkeypatch.setattr(aligner, "_ffprobe_json",
                         lambda p, *a, **k: src if "src" in str(p) else out)
     monkeypatch.setattr(aligner, "_video_packet_count", lambda *a, **k: 1000)
+    monkeypatch.setattr(aligner, "_stream_end", lambda path, stream, duration: duration or 0.0)
+    monkeypatch.setattr(aligner, "_video_origin", lambda path, probe: 0.0)
 
     from pathlib import Path
     assert aligner._validate_media_output(Path("/tv/src.mkv"), Path("/tv/out.mkv")) is True

@@ -264,6 +264,31 @@ def donor_title_readings(name: str, series_title: str = "") -> list[str]:
     return readings
 
 
+# A catalogue's note about the recording in square brackets is not part of the
+# film's name: "Forrest Gump [New Description] (1994).mp3" (AudioVault, 2026-11-01).
+_BRACKETED_NOTE_RE = re.compile(r"\[[^\]]*\]")
+
+
+def donor_names_movie(movie_title: str, movie_year: str, donor_name: str) -> bool | None:
+    """Whether the donor file *donor_name* is named exactly for the film *movie_title* (*movie_year*).
+
+    The movie matcher ranks recordings by a scored likeness of title and year,
+    so a sequel, a remake or a near name can be among the candidates it tries.
+    This asks for the film's own title words and its year, the way AudioVault
+    and LivingAudio name a film's recording ("Other Mommy (2026).mp3"): case,
+    accents, punctuation, "&" for "and", a leading article and a bracketed
+    note may differ, nothing else. None when the title, the year or the
+    donor's name is unknown.
+    """
+    if not (movie_title or "").strip() or not (movie_year or "").strip():
+        return None
+    donor = _normalise(_BRACKETED_NOTE_RE.sub(" ", Path(donor_name).stem))
+    if not donor:
+        return None
+    wanted = _normalise(f"{movie_title} ({movie_year})")
+    return donor == wanted or _LEADING_ARTICLE_RE.sub("", donor, count=1) == _LEADING_ARTICLE_RE.sub("", wanted, count=1)
+
+
 def donor_names_episode(
     episode_title: str, donor_name: str, *, series_title: str = "", fuzzy: bool = False,
 ) -> bool | None:
